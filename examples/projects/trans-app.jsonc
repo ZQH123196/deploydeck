@@ -1,0 +1,24 @@
+// 项目清单。它随被部署的项目走，不进 deploydeck 仓库。
+{
+  "id": "trans-app",
+  "workdir": "/root/trans_app",
+  "steps": [
+    {
+      "id": "sync-code",
+      "run": "git -C /root/trans_app fetch --all --prune && git -C /root/trans_app checkout --force \"$DEPLOYDECK_COMMIT\"",
+      "timeoutSeconds": 300,
+      "verify": "git -C /root/trans_app rev-parse HEAD | grep -qx \"$DEPLOYDECK_COMMIT\""
+    },
+    {
+      "id": "install",
+      "run": "cd /root/trans_app && pnpm install --frozen-lockfile",
+      "timeoutSeconds": 1200
+    },
+    {
+      "id": "build",
+      "run": "cd /root/trans_app && pnpm build",
+      "timeoutSeconds": 1800,
+      "verify": "test -s /root/trans_app/apps/server/dist/build-info.json"
+    }
+  ]
+}

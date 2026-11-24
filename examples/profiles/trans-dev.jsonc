@@ -1,0 +1,19 @@
+// 开发配置。
+// gpuPreference 是优先级链：从左往右尝试，第一个能创建的规格即用。
+// 全部失败则整体失败，报出每一档的原因。不跳档，不先建低配再升级。
+{
+  "id": "trans-dev",
+  "project": "trans-app",
+  "provider": "autodl",
+  "gpuPreference": ["v-48g", "v-32g-p", "5090-p"],
+  "regionPreference": [],
+  "ttlMinutes": 60,
+  "budgetCapYuan": 6,
+
+  // 部署失败后容器保留。人可 SSH 进容器查现场。
+  // 容器到计划过期时刻自动销毁。期间继续计费。
+  "onDeployFailure": "keep-container",
+
+  // 开发允许使用容器里的当前工作区。
+  "requirePinnedCommit": false
+}

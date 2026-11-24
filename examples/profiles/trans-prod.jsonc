@@ -1,0 +1,17 @@
+// 生产配置。
+// 与开发配置的差别全部写在这里，引擎不按“开发/生产”分支判断。
+{
+  "id": "trans-prod",
+  "project": "trans-app",
+  "provider": "autodl",
+  "gpuPreference": ["pro6000-p", "v-48g"],
+  "regionPreference": [],
+  "ttlMinutes": 480,
+  "budgetCapYuan": 200,
+
+  // 部署失败后容器立即销毁。依次关机、释放、验证消失。
+  "onDeployFailure": "destroy-container",
+
+  // 生产必须锁定 commit。线上跑的是哪份代码必须可追溯。
+  "requirePinnedCommit": true
+}

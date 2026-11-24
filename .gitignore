@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+
+# 本机状态与运行产物。一律不进入版本库。
+.deploydeck/
+*.log
