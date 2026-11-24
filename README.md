@@ -78,6 +78,10 @@ pnpm dev -- --help
 
 ## 文档
 
+- [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 本期的设计与验收标准
+- [施工工单](docs/tickets/) —— 按依赖序编号
+- [AutoDL 文档快照](docs/refs/autodl/) —— 离线可查的平台口径
+- [术语表](GLOSSARY.md)
 - [架构与分层判据](docs/architecture.md)
 - [provider 能力契约](docs/provider-contract.md)
 - [计划、预算与关机](docs/plan-and-budget.md)

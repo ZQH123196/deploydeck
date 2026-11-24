@@ -1,5 +1,9 @@
 # 计划、预算与关机
 
+> **部分内容已被取代。** 本文假设单价来自 API、平台定时关机由 API 设置。实测表明两者都必须从控制台取得。以 [Phase 2 spec](specs/deploydeck-phase2.md) 为准。
+>
+> 仍然有效的部分：Profile 字段语义、`onDeployFailure` 与 `requirePinnedCommit` 两条开关互相独立、预算熔断判据、日志保留判据。
+
 ## 1. 为什么需要计划
 
 云端 GPU 按小时计费。忘记关机是最贵的错误。
