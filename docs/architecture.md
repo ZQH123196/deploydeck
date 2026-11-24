@@ -103,6 +103,6 @@ TUI 与 Web 都调用与 CLI 相同的命令实现。
 
 deploydeck 是一个独立仓库。
 
-它当前以 git submodule 形式挂在主仓的 `apps/deploydeck`，只为了方便开发期同目录修改。
+它当前以 git submodule 形式挂在主仓的 `apps/supportProject/deploydeck`，只为了方便开发期同目录修改。
 
 它不进入主仓的 pnpm workspace。它有自己的依赖与锁文件。
