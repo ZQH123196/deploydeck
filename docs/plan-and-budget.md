@@ -30,13 +30,18 @@ Run      计划下的一次动作。记录每一步结果。
 |---|---|---|
 | `id` | 是 | 配置标识 |
 | `project` | 是 | 被部署的项目标识 |
-| `provider` | 是 | 使用的 provider |
+| `provider` | 否 | 控制面实现。默认 `autodl` |
+| `instanceNamePattern` | 是 | 实例命名。控制台有同名实例时复用它，没有时用它创建 |
 | `gpuPreference` | 是 | 算力规格优先级。左端优先级最高 |
 | `regionPreference` | 否 | 地区优先级 |
+| `cloneDataDisk` | 否 | 克隆实例时是否一起拷贝数据盘。默认是 |
+| `cloneSourceInstanceName` | 否 | 克隆源实例的名字或 ID。走克隆路径时必填 |
 | `ttlMinutes` | 是 | 本次计划的默认可用分钟数 |
 | `budgetCapYuan` | 是 | 本次计划的预算上限，单位元 |
 | `onDeployFailure` | 是 | 部署失败后容器怎么办。取值见 3.1 |
 | `requirePinnedCommit` | 是 | 是否强制指定 commit。取值见 3.2 |
+| `deployScript` | 是 | 项目仓库内的部署脚本相对路径 |
+| `startScript` | 是 | 项目仓库内的启动脚本相对路径 |
 
 ### 3.1 onDeployFailure
 
@@ -59,7 +64,7 @@ Run      计划下的一次动作。记录每一步结果。
 
 | 取值 | 含义 |
 |---|---|
-| 是 | 部署前必须给出 commit sha。部署器把容器里的仓库切到该 commit 再构建。 |
+| 是 | 部署前必须给出 commit sha。部署器把容器里的仓库切到该 commit 再构建。仓库不存在时先按 Project 的 `repository` 克隆；切完回验 `git rev-parse HEAD` 等于该 sha，不等即失败。 |
 | 否 | 允许使用容器里的当前工作区。 |
 
 生产配置取“是”。开发配置取“否”。
@@ -84,6 +89,26 @@ for spec of gpuPreference:
 
 理由：先建再升会产生两次计费窗口和一次中间状态。
 
+### 3.4 克隆源实例
+
+控制台的克隆功能以一台**已关机实例**为模板。没有源实例，克隆不出任何东西。
+
+这决定了「取实例」的判定表：
+
+```text
+1. 计划已绑定的实例仍在列表里            → 用它
+2. 列表里有且只有一台同名实例            → 用它
+3. 列表里有多台同名实例                  → 报错，让人先清理
+4. 没有同名实例                          → 按 cloneSourceInstanceName 找源实例克隆
+   ├ 配置里没写源实例                    → 报错，列出可用的已关机实例供人选
+   ├ 找到多台同名源实例                  → 报错，列出 ID
+   └ 源实例不是已关机                    → 先关机，再克隆
+```
+
+判据：第 3 步与第 4 步只报错与列清单，不替人挑。挑错就是部署到别人的机器上。
+
+判据：克隆出来的实例名继承源实例名，不是 `instanceNamePattern`。下一次执行靠计划里的实例 ID 命中第 1 步。
+
 ## 4. Plan 生命周期
 
 ```mermaid
@@ -106,7 +131,7 @@ stateDiagram-v2
 | `budgetCapYuan` | 预算上限 |
 | `spentYuan` | 已花费。按容器运行时长累加 |
 | `state` | 见上图 |
-| `resourceId` | 当前占用的容器。可为空 |
+| `instanceId` | 当前占用的实例。可为空 |
 
 判据：`expiresAt` 过期后，任何创建容器的请求一律拒绝。
 
@@ -117,8 +142,8 @@ stateDiagram-v2
 | 层 | 触发者 | 动作 |
 |---|---|---|
 | 平台层 | provider | 创建容器时设置平台定时关机（`timedShutdown` 能力为是时） |
-| 计划层 | deploydeck 守护 | 到 `expiresAt` 主动执行销毁链 |
-| 兜底层 | deploydeck 守护 | 周期扫描全部容器，发现在运行但没有生效计划的容器，立即销毁 |
+| 计划层 | `deploydeck guard` | 到 `expiresAt` 主动执行销毁链 |
+| 兜底层 | `deploydeck guard` | 周期扫描全部容器，发现在运行但没有生效计划的容器，立即销毁 |
 
 判据：第三层不可省略。
 
@@ -128,9 +153,13 @@ stateDiagram-v2
 
 | 参数 | 建议值 | 说明 |
 |---|---|---|
-| 扫描间隔 | 5 分钟 | 与“分钟级管理”一致 |
+| 扫描间隔 | 5 分钟 | 与“分钟级管理”一致。`guard` 的 `--interval-minutes` 默认值就是它 |
 | 单次扫描超时 | 60 秒 | 超时记失败，不阻塞下一轮 |
 | 连续失败阈值 | 3 次 | 超过则告警，转人工 |
+
+浏览器不可用时，守护层降级为告警：记 error 日志、下一轮重试，不退出进程，
+不影响已有实例。余额层的告警阈值必须显式配置（`DEPLOYDECK_BALANCE_WARN_BELOW_YUAN`），
+不设默认值。系统级自启动（pm2 / systemd）属 Phase 3。
 
 判据：扫描本身失败不得影响已有容器。
 
@@ -156,21 +185,37 @@ spentYuan = Σ over 容器 (pricePerHourYuan × runningHours)
 
 ## 7. 账本
 
-每次容器生命周期写一行账。
+每次容器生命周期写一行账。字段以 `LedgerEntrySchema`（`src/state/ledger.ts`）为准：
 
 | 字段 | 含义 |
 |---|---|
 | `planId` / `runId` | 归属 |
-| `resourceId` | 容器标识 |
-| `providerId` | 厂商 |
-| `gpuSpecId` | 规格 |
-| `startedAt` / `stoppedAt` | 起止时刻 |
-| `pricePerHourYuan` | 单价 |
-| `amountYuan` | 金额 |
+| `instanceId` | 实例标识 |
+| `gpuSpec` | 规格 |
+| `startedAt` / `stoppedAt` | 起止时刻。`startedAt` 是实例到手时刻，不是执行开始时刻 |
+| `unitPriceYuanPerHour` | 单价，元/小时 |
+| `amountYuan` | 金额，元 |
 
 判据：账本只追加，不修改。
 
 理由：事后核对费用时，任何改写都会让账对不上。
+
+账本不记录 provider id：一份计划引用一份 Profile，Profile 只属于一个 provider，
+事后从 Profile 或执行记录能定位厂商。多写一份就多一处会漂的事实。
+
+### 7.1 金额记回计划
+
+账本是事实，计划上的 `spentYuan` 是它的投影。账本封口一行后，把该行金额加到 `plan.spentYuan`：
+
+| 时机 | 动作 |
+|---|---|
+| `teardown` 确认实例消失 | 写账本行 → 金额加到计划 → 计划转 `closed` |
+| `run` 失败收尾并确认实例消失 | 写账本行 → 金额加到计划 |
+
+判据：先读、加、再写，整段在状态锁内完成；同一实例生命周期只允许一行账，重复执行不重复记。
+
+理由：不投影时预算复核永远从 0 起算，同一份计划跑第二次时第一次烧掉的钱在预算里看不见，
+`budgetCapYuan` 就只是个摆设。
 
 ## 8. 日志保留
 

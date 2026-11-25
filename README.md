@@ -26,19 +26,40 @@ deploydeck 把这些收敛成一条链路：
 
 ## 当前状态
 
-骨架阶段。
+Phase 2 命令面已接通，真机全链路已实测通过（2026-11-25，AutoDL 标准容器实例）：
+开关机、平台定时关机、克隆、改名、`run` 十一步全绿、`teardown` 释放并确认消失。
+实测结论与踩到的坑见 `docs/refs/autodl/console-selectors.md`。
+
+真机测试现在是可复跑的套件，见下文「测试」。
 
 | 能力 | 状态 |
 |---|---|
-| 部署清单与 Profile 校验 | 可用 |
+| 部署清单（Profile / Project）校验 | 可用 |
 | `profile list` | 可用 |
-| `plan create` / `plan show` / `plan extend` | 未实现 |
-| `run` 部署执行 | 未实现 |
-| `teardown` 销毁与终态验证 | 未实现 |
-| AutoDL provider | 只有能力声明，未接入 API |
-| local provider | 只有能力声明 |
+| `plan create` / `plan show`（`--balance` 可读账户余额） | 可用 |
+| `run` 部署执行：开机复用或克隆、锁定 commit（可选）、预算复核、平台定时关机、脚本与健康检查、逐步日志 | 可用 |
+| `status`：生效计划、实例状态、单价、花费、账本摘要 | 可用 |
+| `teardown`：销毁、终态验证、账本结算、计划关闭 | 可用 |
+| `login`：打开专用 Chrome 等人登录 | 可用 |
+| `guard`：计划层守护（过期计划销毁、预算熔断、余额告警） | 可用；系统级自启动属 Phase 3 |
+| AutoDL provider：控制台动作 + SSH 数据面 | 已接入 |
+| 首批接入样例：asyncProxyServer | 配置就绪；部署脚本与真机未验证 |
+| `plan extend` / `ledger` | 未实现（Phase 3） |
 
 未实现的命令打印 `[NOT IMPLEMENTED]`，退出码 2。
+
+## 测试
+
+两套测试，分开跑，不混在一起。
+
+| 套件 | 入口 | 跑什么 | 花钱 |
+|---|---|---|---|
+| 常规单测 | `pnpm test` | `src/**/*.spec.ts`，全部假通道，几百毫秒 | 否 |
+| 真机测试 | `pnpm test:e2e` | `e2e/**/*.e2e.test.ts`，连真实控制台与 SSH | **是** |
+
+真机测试会开关机、克隆、释放真实实例。它默认不跑，且必须过授权闸门：三个环境变量
+（开关、源实例 ID、批准的元数）缺一个就拒绝，不做任何控制台动作。
+预计花费与授权命令见 `e2e/README.md`。
 
 ## 快速开始
 
@@ -58,10 +79,52 @@ pnpm dev -- --help
 
 | 变量 | 默认值 | 用途 |
 |---|---|---|
-| `DEPLOYDECK_CONFIG_DIR` | `~/.config/deploydeck` | 存放 profiles |
+| `DEPLOYDECK_CONFIG_DIR` | `~/.config/deploydeck` | 存放 `profiles/` 与 `projects/` |
 | `DEPLOYDECK_STATE_DIR` | `~/.local/state/deploydeck` | 存放计划、运行记录、账本、日志 |
+| `DEPLOYDECK_CDP_PORT` | `9222` | 专用 Chrome 的 CDP 端口 |
+| `DEPLOYDECK_CHROME_PROFILE_DIR` | `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir。落状态目录：Chrome 会往里写登录态，配置目录机器只读 |
+| `DEPLOYDECK_CHROME_EXECUTABLE` | 按平台自动查找 | 专用 Chrome 可执行文件绝对路径。自动查找失败时用它指定 |
+| `DEPLOYDECK_BALANCE_WARN_BELOW_YUAN` | 无默认值 | 余额告警阈值，元。只有 `guard` 需要；不配置时 `guard` 启动即报错 |
 
-仓库里的 `examples/` 是一份配置样例。把它复制到配置目录后即可被识别。
+仓库里的 `examples/` 是一份配置样例。把 `examples/profiles/` 与 `examples/projects/`
+复制到配置目录后即可被识别（目录名必须分别是 `profiles` 与 `projects`）。
+
+### 首次真机运行前的准备
+
+真机验证会产生费用，由人工发起。跑之前先确认这四件事：
+
+1. **专用 Chrome 已登录**：执行 `deploydeck login`，在打开的窗口里完成控制台登录。
+   登录态存在专用 user-data-dir 里，与日常浏览互不干扰。未登录时 `run`、`teardown`
+   返回退出码 2，且不改动任何实例；`status` 在需要读控制台（有生效计划）时同样返回 2。
+2. **配置目录里有 Profile 与 Project**：`profiles/<id>.jsonc` 与 `projects/<id>.jsonc`。
+   从 `examples/` 复制后按实际环境改 `workdir`、`gpuPreference`、`ttlMinutes`、`budgetCapYuan`
+   与 `cloneSourceInstanceName`。
+3. **控制台里有一台已关机实例作为克隆源**：Profile 的 `cloneSourceInstanceName` 必须指向它
+   （写名字或实例 ID）。走克隆路径时以它为模板；没有同名实例时才会用克隆。
+   源实例不合适时 `run` 会在动手前报错并列出可用的已关机实例。
+4. **状态目录可写且不在配置目录内**：默认 `~/.local/state/deploydeck`。状态目录落在配置目录内时，
+   构造状态存储即报错（配置目录由人写，机器只读）。
+
+### 一次部署
+
+```bash
+deploydeck login
+deploydeck profile list
+deploydeck plan create --profile asyncproxy-dev
+deploydeck run --plan <planId>
+deploydeck status
+deploydeck teardown <planId>
+```
+
+计划过期后的兜底是 `deploydeck guard`：它每 5 分钟巡检一次过期计划并销毁绑定实例，
+同时做预算熔断与余额告警。系统级自启动（pm2 / systemd）属 Phase 3，本期需要人把它挂在
+终端或自管的常驻进程里。余额告警阈值必须显式配置：
+
+```bash
+DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard --once
+```
+
+完整命令、参数与 `--json` 输出形状见 [CLI 命令面](docs/cli.md)。
 
 ## 分层
 
@@ -80,7 +143,10 @@ pnpm dev -- --help
 
 - [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 本期的设计与验收标准
 - [施工工单](docs/tickets/) —— 按依赖序编号
+- [CLI 命令面](docs/cli.md) —— 命令、参数、`--json` 输出形状、退出码、例行操作
+- [状态目录布局](docs/state-layout.md) —— 计划、执行记录、账本、日志、锁的落点与格式
 - [AutoDL 文档快照](docs/refs/autodl/) —— 离线可查的平台口径
+- [AutoDL 控制台选择器清单](docs/refs/autodl/console-selectors.md) —— 页面结构与点击规则
 - [术语表](GLOSSARY.md)
 - [架构与分层判据](docs/architecture.md)
 - [provider 能力契约](docs/provider-contract.md)
@@ -91,8 +157,10 @@ pnpm dev -- --help
 | 退出码 | 含义 |
 |---|---|
 | 0 | 成功 |
-| 1 | 业务失败。部署失败、计划无效、预算不足 |
-| 2 | 需要人工介入。配置错误、未实现、容器未确认消失 |
+| 1 | 业务失败。部署失败、计划无效、预算不足、脚本或健康检查失败 |
+| 2 | 需要人工介入。配置错误、未登录、命令未实现、实例未确认消失、克隆超时 |
+
+退出码由错误类自带（`src/errors.ts`），CLI 只透传。逐条说明见 [CLI 命令面](docs/cli.md) 第 5 节。
 
 ## License
 

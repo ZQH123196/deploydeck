@@ -29,3 +29,19 @@ Phase 2 的控制面全部依赖 AutoDL 控制台 DOM。已实测：实例列表
 ## 依赖
 
 无。
+
+## 产出
+
+- 选择器与交互清单：`docs/refs/autodl/console-selectors.md`
+- 选择器常量：`src/console/selectors.ts`
+- 页内脚本构造工具：`src/console/dom.ts`
+- 截图目录：`docs/refs/autodl/screenshots/`
+  - `instance-list.png`：实例列表页
+  - `more-menu.png`：「更多」下拉菜单
+  - `timed-shutdown-dialog.png`：定时关机对话框（已填时间，显示预计消费）
+  - `clone-dialog.png`：克隆实例对话框
+  - `clone-host-page.png`：选主机页
+- 平台事实补充：`docs/refs/autodl/facts.md` 第 11 节
+
+实测日期 2026-11-25。未实测项（SSH 登录列展开、开机、设置定时关机、
+克隆创建、释放）在清单第 4 节逐条列出原因。
