@@ -1,19 +1,29 @@
-// 开发配置。
-// gpuPreference 是优先级链：从左往右尝试，第一个能创建的规格即用。
-// 全部失败则整体失败，报出每一档的原因。不跳档，不先建低配再升级。
+// 部署配置：本机开发用。
+// gpuPreference 是优先级链：从左往右尝试，第一个可用的规格即用，不跳档。
+// instanceNamePattern 是实例名：控制台已有同名实例时直接复用它，没有时用它创建。
 {
   "id": "trans-dev",
   "project": "trans-app",
   "provider": "autodl",
+  "instanceNamePattern": "trans-dev",
   "gpuPreference": ["v-48g", "v-32g-p", "5090-p"],
   "regionPreference": [],
+  "cloneDataDisk": true,
+
+  // 克隆源实例：走克隆路径时以这台已关机实例为模板。
+  // 写名字或实例 ID 都可以。没有同名实例时按它克隆。
+  "cloneSourceInstanceName": "trans-dev",
   "ttlMinutes": 60,
   "budgetCapYuan": 6,
 
-  // 部署失败后容器保留。人可 SSH 进容器查现场。
-  // 容器到计划过期时刻自动销毁。期间继续计费。
+  // 部署失败后容器保留。人可以 SSH 进去查现场。
+  // 容器到计划过期时刻被销毁。期间继续计费。
   "onDeployFailure": "keep-container",
 
-  // 开发允许使用容器里的当前工作区。
-  "requirePinnedCommit": false
+  // 开发允许使用实例里的当前工作区。
+  "requirePinnedCommit": false,
+
+  // 两个脚本都在被部署的项目仓库里，路径相对于仓库根。
+  "deployScript": "scripts/deploy.sh",
+  "startScript": "scripts/start.sh"
 }

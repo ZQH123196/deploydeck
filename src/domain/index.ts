@@ -5,13 +5,26 @@ export {
   type Profile,
 } from './profile.js'
 
-export {
-  DeployStepSchema,
-  ProjectManifestSchema,
-  type DeployStep,
-  type ProjectManifest,
-} from './project.js'
+export { ProjectSchema, RepositorySchema, type Project, type Repository } from './project.js'
 
 export { PlanSchema, PlanStateSchema, type Plan, type PlanState } from './plan.js'
 
-export { RunSchema, RunStateSchema, StepResultSchema, type Run, type RunState, type StepResult } from './run.js'
+export {
+  RunModeSchema,
+  RunSchema,
+  RunStateSchema,
+  StepKindSchema,
+  StepResultSchema,
+  type Run,
+  type StepKind,
+  type RunMode,
+  type RunState,
+  type StepResult,
+} from './run.js'
+
+export {
+  ConsoleInstanceSnapshotSchema,
+  InstanceStatusSchema,
+  type ConsoleInstanceSnapshot,
+  type InstanceStatus,
+} from './instance.js'

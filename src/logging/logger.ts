@@ -46,6 +46,37 @@ export function createLogger(sink: LogSink): Logger {
   }
 }
 
+/**
+ * 把同一条日志同时写给多个 logger。
+ *
+ * 控制台动作模块既要写自己的动作证据文件（落 run 目录），也要进本次运行的日志。
+ * 两条出口共用一份事件，避免各写一份文案。
+ */
+export function createFanoutLogger(...loggers: readonly Logger[]): Logger {
+  const emit = (level: LogLevel, event: string, fields?: Record<string, unknown>): void => {
+    for (const logger of loggers) {
+      if (level === 'info') {
+        logger.info(event, fields)
+      } else if (level === 'warn') {
+        logger.warn(event, fields)
+      } else {
+        logger.error(event, fields)
+      }
+    }
+  }
+  return {
+    info: (event, fields) => {
+      emit('info', event, fields)
+    },
+    warn: (event, fields) => {
+      emit('warn', event, fields)
+    },
+    error: (event, fields) => {
+      emit('error', event, fields)
+    },
+  }
+}
+
 /** 写到 stderr。用于人读的即时反馈。 */
 export function createStderrLogger(): Logger {
   return createLogger({

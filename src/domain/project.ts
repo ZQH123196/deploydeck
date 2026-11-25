@@ -1,24 +1,28 @@
 import { z } from 'zod'
 
-/** 一个部署步骤。`run` 必须有；`verify` 用于部署后的产物校验。 */
-export const DeployStepSchema = z.object({
-  id: z.string().min(1),
-  run: z.string().min(1),
-  timeoutSeconds: z.number().int().positive().default(600),
-  verify: z.string().min(1).optional(),
+/** 代码来源。代码走 git clone，不走文件传输。 */
+export const RepositorySchema = z.object({
+  /** git 地址。实例内用部署密钥或公开地址 clone。 */
+  url: z.string().min(1),
+  /** 默认分支。部署时先切到该分支，再切到 commit。 */
+  branch: z.string().min(1).default('main'),
 })
 
-export type DeployStep = z.infer<typeof DeployStepSchema>
+export type Repository = z.infer<typeof RepositorySchema>
 
 /**
  * 项目清单。它随被部署的项目走，不进 deploydeck 仓库。
- * 多个项目共用一个 deploydeck，各自带自己的清单。
+ *
+ * 字段含义见 docs/specs/deploydeck-phase2.md 第 3.2 节。
+ * 步骤不写在清单里：引擎按 Profile 的两个脚本与 healthCheck 生成内置步骤。
  */
-export const ProjectManifestSchema = z.object({
+export const ProjectSchema = z.object({
   id: z.string().min(1),
-  /** 容器内的项目目录。 */
+  repository: RepositorySchema,
+  /** 实例内的项目目录。 */
   workdir: z.string().min(1),
-  steps: z.array(DeployStepSchema).min(1),
+  /** 部署后的健康检查命令。判据是退出码 0。 */
+  healthCheck: z.string().min(1),
 })
 
-export type ProjectManifest = z.infer<typeof ProjectManifestSchema>
+export type Project = z.infer<typeof ProjectSchema>

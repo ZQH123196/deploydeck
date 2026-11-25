@@ -9,3 +9,7 @@ coverage/
 # 本机状态与运行产物。一律不进入版本库。
 .deploydeck/
 *.log
+
+# 本地施工区与临时产物。不入版本库。
+.scratch/
+.tmp/

@@ -1,24 +1,14 @@
-// 项目清单。它随被部署的项目走，不进 deploydeck 仓库。
+// 项目清单：trans_app。
+// 它随被部署的项目走，不进 deploydeck 仓库。
+// 步骤不写在这里：引擎按 Profile 的两个脚本与本文件的 healthCheck 生成内置步骤。
 {
   "id": "trans-app",
+  "repository": {
+    "url": "git@github.com:ZQH123196/trans_app.git",
+    "branch": "main"
+  },
   "workdir": "/root/trans_app",
-  "steps": [
-    {
-      "id": "sync-code",
-      "run": "git -C /root/trans_app fetch --all --prune && git -C /root/trans_app checkout --force \"$DEPLOYDECK_COMMIT\"",
-      "timeoutSeconds": 300,
-      "verify": "git -C /root/trans_app rev-parse HEAD | grep -qx \"$DEPLOYDECK_COMMIT\""
-    },
-    {
-      "id": "install",
-      "run": "cd /root/trans_app && pnpm install --frozen-lockfile",
-      "timeoutSeconds": 1200
-    },
-    {
-      "id": "build",
-      "run": "cd /root/trans_app && pnpm build",
-      "timeoutSeconds": 1800,
-      "verify": "test -s /root/trans_app/apps/server/dist/build-info.json"
-    }
-  ]
+
+  // 部署后的健康检查。退出码 0 即通过。
+  "healthCheck": "curl -fsS http://127.0.0.1:6006/health"
 }

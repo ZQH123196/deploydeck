@@ -1,0 +1,36 @@
+// 部署配置：asyncProxyServer 开发用。首批接入目标。
+//
+// 它是异步 TTS 代理服务，无外部资产、无凭据、无端口冲突（工单 12 的背景）。
+// 与 trans-dev 的差别只有项目引用；引擎不按「哪个项目」分支，全部差异写在这里。
+{
+  "id": "asyncproxy-dev",
+  "project": "asyncproxy-server",
+  "provider": "autodl",
+  "instanceNamePattern": "asyncproxy-dev",
+
+  // 规格优先级：左端最高，第一个可用规格即用，不跳档。
+  // 这几个 id 取自仓库里已验证存在的配置；asyncProxyServer 实际需要哪档规格，
+  // 首次真机运行前需在克隆选主机页面按可用列表核对（spec 第 14 节的待实测项）。
+  "gpuPreference": ["v-32g-p", "5090-p"],
+  "regionPreference": [],
+  "cloneDataDisk": true,
+
+  // 克隆源实例：走克隆路径时以这台已关机实例为模板。写名字或实例 ID 都可以。
+  // 首次运行前，控制台里必须已经有一台同名、已关机的实例。
+  "cloneSourceInstanceName": "asyncproxy-dev",
+  "ttlMinutes": 60,
+  "budgetCapYuan": 6,
+
+  // 开发环境部署失败后保留容器，人可以进去查现场。期间继续计费，到计划过期时销毁。
+  "onDeployFailure": "keep-container",
+
+  // 开发允许使用实例里的当前工作区，不强制锁定 commit。
+  "requirePinnedCommit": false,
+
+  // 两个脚本在被部署的项目仓库里，路径相对于仓库根。
+  // 它们属于 asyncProxyServer 仓库，不在 deploydeck 仓库内：
+  //   scripts/deploy.sh  拉代码、uv sync 装依赖
+  //   scripts/start.sh   跑 start_asyncProxyServer.sh 拉起 pm2 托管进程
+  "deployScript": "scripts/deploy.sh",
+  "startScript": "scripts/start.sh"
+}
