@@ -90,6 +90,7 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
 | `instanceNamePattern` | 是 | 实例名。控制台已有同名实例时复用它，没有时用它创建 |
 | `gpuPreference` | 是 | 算力规格优先级，左端最高。克隆时按它选主机，不跳档 |
 | `regionPreference` | 否 | 地区优先级，空数组表示不限制 |
+| `powerOnMode` | 否 | 开机形态：`gpu`（缺省）或 `no-gpu` |
 | `cloneDataDisk` | 否 | 克隆时是否一起拷贝数据盘，缺省 `true` |
 | `cloneSourceInstanceName` | 否 | 克隆源实例的名字或 ID。走克隆路径时必须有 |
 | `ttlMinutes` | 是 | 计划默认可用分钟数 |
@@ -106,6 +107,7 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
   "provider": "autodl",
   "instanceNamePattern": "my-project-dev",
   "gpuPreference": ["v-32g-p", "5090-p"],
+  "powerOnMode": "no-gpu",
   "cloneSourceInstanceName": "my-project-dev",
   "ttlMinutes": 60,
   "budgetCapYuan": 6,
@@ -130,6 +132,22 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
 | `4090D` | RTX 4090D |
 
 表外取值原样当作页面型号名匹配。匹配失败时 deploydeck 报错并列出页面可选型号，不猜。
+
+### 2.3.1 `powerOnMode`：开发测试用无卡，需要算力才用有卡
+
+| 取值 | 行为 | 代价 |
+|---|---|---|
+| `gpu` | 租用算力开机。主机没有空闲 GPU 时开不了机，引擎改走克隆 | 贵 |
+| `no-gpu` | 无卡模式开机。不占 GPU，主机没有空闲 GPU 也能开机 | 便宜，几乎可忽略 |
+
+判据：
+
+1. **开发与测试环境写 `no-gpu`。** 无卡模式几乎不花钱，且不会因为主机没卡而失败。
+2. **真的需要算力时才写 `gpu`。** 例如要在容器里跑模型。
+3. 引擎不会自行降级到无卡模式，也不会从无卡模式升到有卡模式。写什么就做什么。
+4. 实例已经以有卡形态运行时，`run` 不会为了走无卡模式去关机重开。它报错要人决定。
+
+老配置不写 `powerOnMode` 时按 `gpu` 处理，行为不变。
 
 `onDeployFailure` 只管容器，不管代码。`requirePinnedCommit` 只管代码，不管容器。两者互不影响。
 
@@ -361,7 +379,67 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard
 2. `guard` 的退出码不因 `escalated` 或降级而改变。
 3. Phase 2 不做系统级自启动。要常驻，得人自己把它挂在终端或自管的进程里。
 
-## 6. 命令速查
+## 6. 进容器：交互式终端
+
+部署只是链路的一半。观察进度、处理需要确认的安装、出问题查现场都要进容器。
+
+### 6.1 进入交互式 shell
+
+```bash
+deploydeck shell <instanceId>
+```
+
+它分配 PTY 并进入远端登录 shell。方向键、`Ctrl-C`、`top` 这类交互工具都能用。
+窗口尺寸跟随本地终端，改窗口大小会通知远端。
+
+退出：输入 `exit`，或按 `Ctrl-D`。
+
+判据：
+
+1. 只连**运行中**的实例。已关机时报 `INSTANCE_NOT_RUNNING`，退出码 1。
+2. 不自动开机。要连已关机实例，先自己把它开起来。
+3. 不校验计划。计划外手工开机的实例照样能连。
+4. 必须在真终端里跑。管道、重定向、CI 里没有 tty，报 `INTERACTIVE_TERMINAL_REQUIRED`，退出码 2。
+
+### 6.2 在 PTY 里跑一条命令
+
+```bash
+deploydeck shell <instanceId> -- apt-get update
+```
+
+它在同一个 PTY 里执行这条命令，然后断开。适合三件事：
+
+1. 需要看进度的长任务。
+2. 需要确认的步骤，例如 `apt install`。
+3. 在脚本里跑一条命令并拿到退出码。
+
+判据：
+
+1. `--` 之后的全部参数拼成一条命令。命令里的引号、空格原样保留。
+2. 远端退出码就是本命令的退出码。
+3. 没拿到远端退出码时报 `SHELL_FAILED`，退出码 2。后台任务、连接中断都会走到这里。
+4. 这一步不落盘、不进执行记录、不写账本。它的输出直接进你的终端。
+
+### 6.3 终端不改任何状态
+
+| 项 | 终端会话是否改变 |
+|---|---|
+| 计划状态 | 否 |
+| 执行记录 | 否 |
+| 账本 | 否 |
+| 实例开关机状态 | 否 |
+
+判据：开终端不等于开始计费，关终端不等于结束计费。计费只跟实例是否存在有关。
+
+所以用完终端必须自己处理实例：`teardown` 或等平台定时关机。
+
+### 6.4 安全边界
+
+1. 密码取自控制台 SSH 登录列，只用一次。不落盘、不进日志、不进错误消息。
+2. 主机密钥指纹照样校验。首次记录，变化即 `HOST_KEY_CHANGED`，退出码 2。
+3. 终端输出直接进你的屏幕，不经 deploydeck 的 stdout 抽象，因此不进 `--json`。
+
+## 7. 命令速查
 
 | 命令 | 作用 | 需要控制台 |
 |---|---|---|
@@ -373,6 +451,8 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard
 | `teardown <planId>` | 销毁实例、记账、关闭计划 | 是 |
 | `login` | 打开专用 Chrome 等人登录 | 是 |
 | `guard [--once]` | 前台常驻守护 | 是 |
+| `shell <instanceId>` | 进入交互式终端 | 是 |
+| `shell <instanceId> -- <cmd>` | 在 PTY 里跑一条命令 | 是 |
 | `plan extend` | 未实现，退出码 2 | — |
 | `ledger` | 未实现，退出码 2 | — |
 
@@ -380,11 +460,11 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard
 
 全部命令都支持 `--json`。它既可写在命令前面，也可写在命令后面。
 
-## 7. 机器读者约定
+## 8. 机器读者约定
 
 外部项目接 deploydeck 时按这一节写集成代码。
 
-### 7.1 用 `--json`，不看人读输出
+### 8.1 用 `--json`，不看人读输出
 
 ```bash
 deploydeck status --json
@@ -398,7 +478,7 @@ deploydeck status --json
 
 因此解析 stdin/stdout 时按整行 `JSON.parse` 即可，不需要剥离前缀。
 
-### 7.2 按退出码分叉，不按错误文本分叉
+### 8.2 按退出码分叉，不按错误文本分叉
 
 | 退出码 | 含义 | 集成方该做什么 |
 |---|---|---|
@@ -411,7 +491,7 @@ deploydeck status --json
 
 参数解析错误（缺必填参数、未知命令）统一映射为退出码 1。
 
-### 7.3 错误码
+### 8.3 错误码
 
 错误信息在 stderr。需要按错误类型分支时，读 stderr 首行的行首方括号内容。
 
@@ -444,8 +524,11 @@ deploydeck status --json
 | `INSTANCE_NOT_GONE` | 2 | 实例未确认消失。钱可能还在烧 |
 | `BROWSER_CHANNEL_FAILED` / `CHROME_LAUNCH_FAILED` | 1 / 2 | 浏览器通道不可用 / 专用 Chrome 起不来 |
 | `NOT_IMPLEMENTED` | 2 | 命令未实现 |
+| `INSTANCE_NOT_RUNNING` | 1 | 目标实例不在运行中，SSH 连不上 |
+| `INTERACTIVE_TERMINAL_REQUIRED` | 2 | 需要交互式终端，但当前进程没有 tty |
+| `SHELL_FAILED` | 2 | 终端会话失败：没拿到远端退出码、通道断开、参数冲突 |
 
-### 7.4 典型集成流程
+### 8.4 典型集成流程
 
 ```bash
 set -e
@@ -468,7 +551,7 @@ deploydeck teardown "$plan_id" --json
 
 判据：第 5 步必须执行。`run` 成功后实例仍在运行并计费，只有 `teardown` 或计划过期才会销毁。
 
-### 7.5 agent 使用的额外约束
+### 8.5 agent 使用的额外约束
 
 1. 不要自动执行 `plan create --ttl` 超过用户声明的总时长。计划就是花钱授权。
 2. 不要自动执行 `teardown` 之外的重试。`teardown` 返回退出码 2 时停下，把实例 ID 报给用户。
@@ -476,9 +559,9 @@ deploydeck teardown "$plan_id" --json
 4. 不要用 `--create-plan` 绕过计划。它是人工授权开关，不是默认行为。
 5. 关掉浏览器窗口不影响平台定时关机，但会让 `guard` 与后续命令全部降级。
 
-## 8. 文件落点
+## 9. 文件落点
 
-### 8.1 状态目录
+### 9.1 状态目录
 
 ```text
 <状态目录>/
@@ -500,7 +583,7 @@ deploydeck teardown "$plan_id" --json
 2. 需要改状态时用命令，不用编辑器。
 3. 实例销毁后，`runs/<runId>/logs/` 仍在本机，是唯一现场。
 
-### 8.2 执行步骤 id
+### 9.2 执行步骤 id
 
 `runs/<runId>.jsonc` 的 `steps[].stepId` 取值固定：
 
@@ -524,9 +607,9 @@ deploydeck teardown "$plan_id" --json
 | `health-check` | 健康检查 |
 | `destroy` | 销毁实例 |
 
-## 9. 出问题时
+## 10. 出问题时
 
-### 9.1 未登录（退出码 2）
+### 10.1 未登录（退出码 2）
 
 ```text
 请在专用 Chrome 窗口重新登录 AutoDL 控制台，然后重试。
@@ -540,7 +623,7 @@ deploydeck login
 
 未登录时 deploydeck 不点任何按钮、不动任何实例。
 
-### 9.2 实例未确认消失（退出码 2，`ESCALATED`）
+### 10.2 实例未确认消失（退出码 2，`ESCALATED`）
 
 含义：钱可能还在烧。处理：
 
@@ -550,7 +633,7 @@ deploydeck login
 
 deploydeck 不自动重试。计划状态停在 `escalated`，`guard` 只巡检 `active` 计划，不会再处理它。
 
-### 9.3 部署失败但实例保留（`run` 状态 `stray`）
+### 10.3 部署失败但实例保留（`run` 状态 `stray`）
 
 含义：按 `onDeployFailure=keep-container` 保留了容器，人该进去查现场。
 
@@ -566,7 +649,7 @@ deploydeck teardown <planId>
 
 判据：`stray` 不是 `failed`。实例仍在列表里并在计费。
 
-### 9.4 锁超时（退出码 2）
+### 10.4 锁超时（退出码 2）
 
 上一个进程崩溃后留下了锁文件。处理：
 
@@ -574,13 +657,13 @@ deploydeck teardown <planId>
 2. 删除 `<状态目录>/locks/<name>.lock`。
 3. 重试。
 
-### 9.5 控制台页面改版
+### 10.5 控制台页面改版
 
 deploydeck 靠页面结构定位。页面改版会让全部控制面动作失效，报 `CONSOLE_PARSE_FAILED`。
 
 判据：deploydeck 在解析失败时直接报错，不返回空列表冒充结果。遇到这个错误，升级 deploydeck。
 
-### 9.6 检查清单
+### 10.6 检查清单
 
 出问题时按顺序查：
 
@@ -590,7 +673,7 @@ deploydeck 靠页面结构定位。页面改版会让全部控制面动作失效
 4. 跑 `deploydeck status` 看实例是否还在、在计费。
 5. 看 `<状态目录>/runs/<runId>/logs/` 里失败那一步的完整输出。
 
-## 10. 限制与边界
+## 11. 限制与边界
 
 | 限制 | 说明 |
 |---|---|
@@ -601,6 +684,8 @@ deploydeck 靠页面结构定位。页面改版会让全部控制面动作失效
 | 连续关机释放 | 15 天。超过未处理会被平台回收 |
 | `guard` 自启动 | Phase 2 不做，需人自行常驻 |
 | `plan extend` / `ledger` | 未实现 |
+| 交互式终端 | 只支持本地有 tty 的交互形态；不做跳板机、端口转发、文件传输 |
+| 无卡模式 | 只由部署配置显式指定；已有卡运行的实例不会被自动关机重开 |
 | 账本对账 | 按量计费不是逐秒结算，余额差额可能小于真实花费。以账本为准 |
 
 判据：deploydeck 不替代 AutoDL 控制台。控制台仍是唯一事实源。

@@ -100,6 +100,7 @@ function makeInstance(overrides: Partial<ConsoleInstanceSnapshot> = {}): Console
     balanceWarning: null,
     timedShutdownAt: null,
     sshCommand: null,
+    noGpuMode: null,
     ...overrides,
   }
 }
@@ -329,6 +330,9 @@ async function createFixture(options: FixtureOptions = {}): Promise<CliFixture> 
     },
     openConsoleSession: async () => {
       throw new Error('测试不应打开真实控制台通道')
+    },
+    openShell: async () => {
+      throw new Error('测试不应打开真实终端通道')
     },
     readProviderCapabilities: () => ({ id: 'autodl', capabilities: DEFAULT_CAPABILITIES }),
     createStateStore: stateStoreFactory,

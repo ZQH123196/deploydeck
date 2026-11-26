@@ -41,10 +41,13 @@ Phase 2 命令面已接通，真机全链路已实测通过（2026-11-25，AutoD
 | `status`：生效计划、实例状态、单价、花费、账本摘要 | 可用 |
 | `teardown`：销毁、终态验证、账本结算、计划关闭 | 可用 |
 | `login`：打开专用 Chrome 等人登录 | 可用 |
-| `guard`：计划层守护（过期计划销毁、预算熔断、余额告警） | 可用；系统级自启动属 Phase 3 |
+| `shell`：连到运行中实例的交互式终端（PTY），也支持在 PTY 里跑单条命令 | 可用；真机未验证 |
+| 无卡模式开机（`powerOnMode: no-gpu`） | 可用；真机未验证 |
+| `guard`：计划层守护（过期计划销毁、预算熔断、余额告警） | 可用；系统级自启动未实现 |
 | AutoDL provider：控制台动作 + SSH 数据面 | 已接入 |
 | 首批接入样例：asyncProxyServer | 配置就绪；部署脚本与真机未验证 |
-| `plan extend` / `ledger` | 未实现（Phase 3） |
+| `plan extend` / `ledger` | 未实现 |
+| `guard` 系统级自启动 | 未实现 |
 
 未实现的命令打印 `[NOT IMPLEMENTED]`，退出码 2。
 
@@ -142,7 +145,8 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard --once
 ## 文档
 
 - [操作手册](docs/OPERATIONS.md) —— 外部项目怎么接入、怎么跑、机器读者怎么调。**只看一份就从这里开始**
-- [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 本期的设计与验收标准
+- [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 部署链路的设计与验收标准
+- [Phase 3 spec](docs/specs/deploydeck-phase3-shell.md) —— 交互式终端与无卡模式开机
 - [施工工单](docs/tickets/) —— 按依赖序编号
 - [CLI 命令面](docs/cli.md) —— 命令、参数、`--json` 输出形状、退出码、例行操作
 - [状态目录布局](docs/state-layout.md) —— 计划、执行记录、账本、日志、锁的落点与格式

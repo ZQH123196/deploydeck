@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import type { InstanceStatus } from '../domain/instance.js'
-import { ConfigError, ConsoleParseError } from '../errors.js'
+import { ConfigError, ConsoleParseError, InstanceNotFoundError } from '../errors.js'
 import type { ParseInstanceListOptions, RawInstanceRow } from './instance-list.js'
-import { createInstanceListActions, parseInstanceList, readInstanceRows } from './instance-list.js'
+import {
+  createInstanceListActions,
+  detectNoGpuMode,
+  parseInstanceList,
+  readInstanceRows,
+  readInstanceStatus,
+} from './instance-list.js'
 import type { ConsoleChannel } from './ports.js'
 
 /** 固定基准时刻。倒计时换算由调用方给时刻，判定不读时钟。 */
@@ -37,6 +43,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusText: '已关机',
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
+    gpuTipsText: '',
     diskLines: ['系统盘 37.98%', '数据盘 57.93%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -62,6 +69,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusText: '已关机',
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
+    gpuTipsText: '',
     diskLines: ['系统盘 35.81%', '数据盘 55.97%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -87,6 +95,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusText: '已关机',
     statusProgressText: null,
     gpuSpecText: 'RTX PRO 6000 * 1卡',
+    gpuTipsText: '',
     diskLines: ['系统盘 80.74%', '数据盘 80.00%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -112,6 +121,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusText: '已关机',
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
+    gpuTipsText: '',
     diskLines: ['系统盘 35.81%', '数据盘 55.90%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -137,6 +147,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusText: '克隆锁定中',
     statusProgressText: null,
     gpuSpecText: 'vGPU-48GB * 1卡',
+    gpuTipsText: '',
     diskLines: ['系统盘 3.79%', '数据盘 68.16%'],
     billingText: '按量计费 余额不足24小时',
     billingWarning: '余额不足24小时',
@@ -163,6 +174,7 @@ function makeRow(overrides: Partial<RawInstanceRow>): RawInstanceRow {
     statusText: '已关机',
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
+    gpuTipsText: '',
     diskLines: ['系统盘 37.98%', '数据盘 57.93%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -191,6 +203,7 @@ describe('真实样本解析', () => {
         balanceWarning: null,
         timedShutdownAt: null,
         sshCommand: null,
+        noGpuMode: null,
       },
       {
         instanceId: '6a9f428e64-c7771049',
@@ -206,6 +219,7 @@ describe('真实样本解析', () => {
         balanceWarning: null,
         timedShutdownAt: null,
         sshCommand: null,
+        noGpuMode: null,
       },
       {
         instanceId: '9235478639-ca87bec6',
@@ -221,6 +235,7 @@ describe('真实样本解析', () => {
         balanceWarning: null,
         timedShutdownAt: null,
         sshCommand: null,
+        noGpuMode: null,
       },
       {
         instanceId: '43474eae3d-4feb6a96',
@@ -236,6 +251,7 @@ describe('真实样本解析', () => {
         balanceWarning: null,
         timedShutdownAt: null,
         sshCommand: null,
+        noGpuMode: null,
       },
       {
         instanceId: 'b1hcx779z3-6abbac9b',
@@ -251,6 +267,7 @@ describe('真实样本解析', () => {
         balanceWarning: '余额不足24小时',
         timedShutdownAt: null,
         sshCommand: null,
+        noGpuMode: null,
       },
     ])
   })
@@ -496,3 +513,86 @@ function makeChannel(
     close: async (): Promise<void> => undefined,
   }
 }
+
+describe('detectNoGpuMode：无卡模式判定', () => {
+  it('运行中且标记为「GPU充足」时有卡', () => {
+    expect(detectNoGpuMode('GPU充足', 'running', 0, '')).toBe(false)
+  })
+
+  it('运行中且标记不是「GPU充足」时按无卡模式', () => {
+    expect(detectNoGpuMode('无卡模式', 'running', 0, '')).toBe(true)
+  })
+
+  it('已关机时判不出无卡模式，返回 null', () => {
+    expect(detectNoGpuMode('', 'stopped', 0, '')).toBeNull()
+  })
+
+  it('运行中但没有标记时返回 null，不猜', () => {
+    expect(detectNoGpuMode('', 'running', 0, '')).toBeNull()
+  })
+
+  it('标记文字里的空白不影响判定', () => {
+    expect(detectNoGpuMode('GPU 充足', 'running', 0, '')).toBe(false)
+  })
+})
+
+describe('readInstanceStatus：只读状态', () => {
+  it('实例不在列表里抛 InstanceNotFoundError，不返回空状态', async () => {
+    const channel: ConsoleChannel = {
+      goto: async () => {},
+      currentUrl: async () => 'https://www.autodl.com/console/instance/list',
+      evaluate: async <Result>(): Promise<Result> =>
+        ({ found: false, statusText: '', progressText: '' }) as unknown as Result,
+      click: async () => {},
+      type: async () => {},
+      waitFor: async () => {},
+      waitForGone: async () => {},
+      screenshot: async () => {},
+      close: async () => {},
+    }
+
+    await expect(readInstanceStatus(channel, 'af9c49bd44-8ee624d7')).rejects.toBeInstanceOf(
+      InstanceNotFoundError,
+    )
+  })
+
+  it('状态格为空时抛 ConsoleParseError，不把空状态当运行中', async () => {
+    const channel: ConsoleChannel = {
+      goto: async () => {},
+      currentUrl: async () => 'https://www.autodl.com/console/instance/list',
+      evaluate: async <Result>(): Promise<Result> =>
+        ({ found: true, statusText: '', progressText: '' }) as unknown as Result,
+      click: async () => {},
+      type: async () => {},
+      waitFor: async () => {},
+      waitForGone: async () => {},
+      screenshot: async () => {},
+      close: async () => {},
+    }
+
+    await expect(readInstanceStatus(channel, 'af9c49bd44-8ee624d7')).rejects.toBeInstanceOf(
+      ConsoleParseError,
+    )
+  })
+
+  it('读运行中实例得到 running 与原文', async () => {
+    const channel: ConsoleChannel = {
+      goto: async () => {},
+      currentUrl: async () => 'https://www.autodl.com/console/instance/list',
+      evaluate: async <Result>(): Promise<Result> =>
+        ({ found: true, statusText: '运行中', progressText: '' }) as unknown as Result,
+      click: async () => {},
+      type: async () => {},
+      waitFor: async () => {},
+      waitForGone: async () => {},
+      screenshot: async () => {},
+      close: async () => {},
+    }
+
+    await expect(readInstanceStatus(channel, 'af9c49bd44-8ee624d7')).resolves.toEqual({
+      instanceId: 'af9c49bd44-8ee624d7',
+      status: 'running',
+      statusRaw: '运行中',
+    })
+  })
+})
