@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { openAutodlProvider } from '../../src/providers/autodl/runtime.js'
 import { CONSOLE_INSTANCE_LIST_URL } from '../../src/console/selectors.js'
 import type { Provider } from '../../src/providers/provider.js'
+import type { SshShellPort } from '../../src/ssh/ports.js'
 
 /**
  * 真机测试的运行时装配。
@@ -22,6 +23,8 @@ export interface E2eWorkDir {
 
 export interface E2eRuntime {
   readonly provider: Provider
+  /** 交互式终端端口。只有终端用例用它。 */
+  readonly shell: SshShellPort
   readonly workDir: E2eWorkDir
   close(): Promise<void>
 }
@@ -64,6 +67,7 @@ export async function openE2eRuntime(workDir: E2eWorkDir, cdpPort: number): Prom
   })
   return {
     provider: runtime.provider,
+    shell: runtime.shell,
     workDir,
     close: async () => {
       await runtime.close()

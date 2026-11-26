@@ -14,6 +14,8 @@ import { ConfigError } from '../../errors.js'
 import type { Logger } from '../../logging/logger.js'
 import type { Provider, ProviderCapabilities } from '../provider.js'
 import { createSshPort } from '../../ssh/channel.js'
+import { createShellPort, DEFAULT_SHELL_CONNECT_TIMEOUT_MS } from '../../ssh/shell-channel.js'
+import type { SshShellPort } from '../../ssh/ports.js'
 import type { Clock } from '../../util/clock.js'
 import { assertPositiveInteger, isInsideOrEqual } from '../../util/validate.js'
 
@@ -89,6 +91,13 @@ export interface AutodlProviderOptions {
 
 export interface AutodlRuntime {
   readonly provider: Provider
+  /**
+   * 交互式终端端口。
+   *
+   * 它不进 `Provider`：`Provider` 是执行引擎的依赖，引擎只跑非交互命令。
+   * 终端是给人用的入口，走自己的端口，引擎拿不到它也就不会误用。
+   */
+  readonly shell: SshShellPort
   readonly session: ConsoleSession
   /** 关闭通道。不关闭浏览器：登录态要留到下一次运行。 */
   close(): Promise<void>
@@ -127,8 +136,23 @@ export async function openAutodlProvider(options: AutodlProviderOptions): Promis
     ...(options.logger === undefined ? {} : { logger: options.logger }),
   })
 
+  const shellContext: ConsoleActionContext = {
+    channel: session.channel,
+    logDir: options.logDir,
+    timeoutMs: options.timeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+  }
+  const shell = createShellPort({
+    context: { ...shellContext, instances: createInstanceListActions(shellContext) },
+    knownHostsPath: options.knownHostsPath,
+    connectTimeoutMs: DEFAULT_SHELL_CONNECT_TIMEOUT_MS,
+  })
+
   return {
     provider,
+    shell,
     session,
     close: async () => {
       await session.close()

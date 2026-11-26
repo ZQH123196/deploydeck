@@ -353,14 +353,18 @@ export function createPowerActions(context: ConsoleRuntimeContext): PowerPort {
         `实例 ${instanceId} 当前状态为「${initial.statusRaw}」，无法执行开机。请在控制台确认后重试。`,
       )
     }
-    if (mode === 'no-gpu' && initial.status === 'running' && !initial.noGpuMode) {
-      // 实例已经是「有卡开机」的运行态。deploydeck 不在这里关机重开：
-      // 那会把一条本来能用的实例按更贵的形态重开一次，且会打断正在跑的服务。
+    // 形态判定看状态格标记，不看状态词：无卡开机中的状态词是「开机中」，与有卡相同。
+    const wantedNoGpu = mode === 'no-gpu'
+    if (initial.status === 'running' && initial.noGpuMode !== null && initial.noGpuMode !== wantedNoGpu) {
+      // 运行中但形态不对。切换形态要先关机再开机，会打断正在跑的服务。
       throw new HumanRequiredError(
-        `实例 ${instanceId} 正在以有卡形态运行，无卡模式要求先关机再开机。` +
-          '当前形态不会自己变，deploydeck 不会替你关机重开。请人工决定：接受有卡形态，或先关机重试。',
+        `实例 ${instanceId} 正在以${initial.noGpuMode ? '无卡' : '有卡'}形态运行，` +
+          `与配置要求的${wantedNoGpu ? '无卡' : '有卡'}模式不一致。` +
+          '切换形态要先关机再开机，会打断正在跑的服务，deploydeck 不会替你重开。' +
+          '请人工决定：接受当前形态，或先关机后重试。',
       )
     }
+    // 已经在开机且形态正确：不重复点，直接等它起来。
 
     await screenshot(SCREENSHOT.powerOnBefore)
     if (initial.status === 'stopped') {
@@ -389,9 +393,10 @@ export function createPowerActions(context: ConsoleRuntimeContext): PowerPort {
         const snapshot = await findSnapshot(instanceId)
         lastStatusRaw = snapshot.statusRaw
         if (snapshot.status === 'running') {
-          if (mode === 'no-gpu' && snapshot.noGpuMode !== true) {
-            // 无卡模式开机后控制台仍写「运行中」，差别只在 GPU 列。
-            // 读不到无卡标记就不算成功：否则调用方会以为拿到了便宜形态。
+          // 判据：形态要对着配置。有卡配置遇到无卡实例、无卡配置遇到有卡实例都不算成功。
+          // 形态要和配置一致。标记读不到（null）时按状态词判：控制台改文案时
+          // 不能静默当成「形态正确」，但也不该把一条真在跑的实例永远判成失败。
+          if (snapshot.noGpuMode !== null && snapshot.noGpuMode !== wantedNoGpu) {
             return undefined
           }
           return { kind: 'running' }

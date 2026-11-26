@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { ConsoleInstanceSnapshot } from '../src/domain/instance.js'
 import type { Provider } from '../src/providers/provider.js'
@@ -313,6 +314,80 @@ describe('真机端到端（耗费测试）', () => {
       })
     },
     12 * 60 * 1000,
+  )
+
+  it(
+    '【耗费·UI·慢】无卡模式开机 → 关机',
+    async () => {
+      await runCase('无卡模式开机 → 关机', async () => {
+        const before = await runtime.provider.listInstances({ refresh: true })
+        const source = findInstance(before, config.sourceInstanceId)
+        if (source === undefined) {
+          throw new Error(`实例列表里找不到源实例 ${config.sourceInstanceId}`)
+        }
+        expect(source.status).toBe('stopped')
+
+        const on = await runtime.provider.powerOn(config.sourceInstanceId, 'no-gpu')
+        expect(on).toEqual({ ok: true, instanceId: config.sourceInstanceId })
+
+        // 判据：无卡模式成功的标志不只是「运行中」。状态词与有卡相同，
+        // 差别在状态格标记。读不到无卡标记就算失败，不能当成成功。
+        const running = await runtime.provider.listInstances({ refresh: true })
+        const after = findInstance(running, config.sourceInstanceId)
+        expect(after?.status).toBe('running')
+        expect(after?.noGpuMode).toBe(true)
+
+        await runtime.provider.powerOff(config.sourceInstanceId)
+        const stopped = await runtime.provider.listInstances({ refresh: true })
+        expect(findInstance(stopped, config.sourceInstanceId)?.status).toBe('stopped')
+
+        return `无卡开机成功，规格读到「${after?.gpuSpec ?? ''}」，已关机`
+      })
+    },
+    12 * 60 * 1000,
+  )
+
+  it(
+    '【耗费·UI·慢】无卡实例上的 SSH 与终端会话',
+    async () => {
+      await runCase('无卡模式下的 SSH 与终端会话', async () => {
+        const on = await runtime.provider.powerOn(config.sourceInstanceId, 'no-gpu')
+        expect(on.ok).toBe(true)
+        try {
+          await runtime.provider.waitUntilReady(config.sourceInstanceId, 5 * 60 * 1000)
+
+          // 一、非交互 exec：跑一条命令并核对退出码与输出。
+          const exec = await runtime.provider.exec(config.sourceInstanceId, 'id -un', {
+            timeoutSeconds: 60,
+            logPath: join(runtime.workDir.logDir, 'e2e-exec-id.log'),
+          })
+          expect(exec.exitCode).toBe(0)
+          expect(exec.stdoutTail.trim()).toBe('root')
+
+          // 二、PTY shell：在真 PTY 里跑一条命令，核对输出与退出码。
+          const chunks: string[] = []
+          const shellSession = await runtime.shell.openShell(
+            config.sourceInstanceId,
+            { onData: (chunk: Buffer) => chunks.push(chunk.toString('utf8')) },
+            { size: { columns: 100, rows: 30 }, term: 'xterm-256color' },
+          )
+          shellSession.write(Buffer.from('echo pty-ok && exit 7\n', 'utf8'))
+          const outcome = await shellSession.wait()
+          await shellSession.close()
+
+          const output = chunks.join('')
+          // 判据：PTY 会回显输入，所以输出里同时有命令与结果。
+          expect(output).toContain('pty-ok')
+          // 判据：退出码必须拿到。拿不到就是 SHELL_FAILED 那条路径，不是这里。
+          expect(outcome.exitCode).toBe(7)
+
+          return `exec 退出码 ${String(exec.exitCode)}，PTY 会话退出码 ${String(outcome.exitCode)}，输出 ${String(output.length)} 字节`
+        } finally {
+          await runtime.provider.powerOff(config.sourceInstanceId)
+        }
+      })
+    },
+    15 * 60 * 1000,
   )
 
   it(

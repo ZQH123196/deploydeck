@@ -59,12 +59,18 @@ export interface RawInstanceRow {
   /** 第 2 列按结构位置取出的规格文本，不含「查看详情」按钮文字。 */
   readonly gpuSpecText: string
   /**
-   * 第 1 列 `.gpuTips` 补充文字。
+   * 第 1 列 `.gpuTips` 补充文字。已关机实例为空。
    *
-   * 实测两种取值：`GPU充足`（有卡、有空闲 GPU），或者无卡模式的标记。
-   * 空字符串表示该元素不存在。
+   * 注意：它不承载形态标记。形态标记在 `modeMarkText`。
    */
   readonly gpuTipsText: string
+  /**
+   * 第 1 列形态标记文字（2026-11-26 真机实测）。
+   *
+   * 无卡模式实例写 `无卡模式`，有卡写 `GPU充足`，已关机为空。
+   * 它是 `.status` 的兄弟节点，与 `.gpuTips` 是两个不同的元素。
+   */
+  readonly modeMarkText: string
   /** 第 3 列两条盘占用原文，形如「系统盘 37.98%」。 */
   readonly diskLines: readonly string[]
   /** 第 5 列 `.chargeType` 原文。余额不足时告警文字跟在付费方式后面。 */
@@ -150,6 +156,7 @@ function buildReadInstanceRowsScript(): string {
     statusText: INSTANCE_STATUS_CELL.statusText,
     progressText: INSTANCE_STATUS_CELL.progressText,
     gpuTips: INSTANCE_STATUS_CELL.gpuTips,
+    modeIcon: INSTANCE_STATUS_CELL.modeIcon,
     billingText: INSTANCE_BILLING_CELL.billingText,
     billingWarning: INSTANCE_BILLING_CELL.warningText,
     releaseText: INSTANCE_RELEASE_CELL.releaseText,
@@ -191,6 +198,8 @@ function buildReadInstanceRowsScript(): string {
     const specDivs = textDivsOf(columns.gpuSpec)
     const diskDivs = textDivsOf(columns.disk)
     const statusCell = cellAt(columns.status)
+    // 形态标记（无卡模式 / GPU充足）在 .status 的兄弟节点里，不在 .gpuTips 里。
+    const modeMark = statusCell === null ? null : statusCell.querySelector(selectors.modeIcon)
     const billingCell = cellAt(columns.billing)
     const releaseCell = cellAt(columns.release)
     const releaseRoot = releaseCell === null ? null : releaseCell.querySelector(selectors.releaseText)
@@ -206,6 +215,7 @@ function buildReadInstanceRowsScript(): string {
       billingText: textOf(billingCell === null ? null : billingCell.querySelector(selectors.billingText)),
       billingWarning: textOf(billingCell === null ? null : billingCell.querySelector(selectors.billingWarning)),
       gpuTipsText: textOf(statusCell === null ? null : statusCell.querySelector(selectors.gpuTips)),
+    modeMarkText: textOf(modeMark === null ? null : modeMark.parentElement),
     releaseText: releaseRoot === null ? null : textOf(releaseRoot.querySelector('span')),
       // 只取时刻那个 span：容器里还嵌着「修改」「关闭」两个操作文字。
       timedShutdownText:
@@ -303,7 +313,7 @@ function parseInstanceRow(
       balanceWarning: billing.balanceWarning,
       timedShutdownAt: parseTimedShutdownAt(row.timedShutdownText, row.rowIndex),
       sshCommand: emptyToNull(cellText(row, INSTANCE_LIST_COLUMN.sshLogin).trim()),
-      noGpuMode: detectNoGpuMode(row.gpuTipsText, status, row.rowIndex, rowDescription),
+      noGpuMode: detectNoGpuMode(`${row.gpuTipsText} ${row.modeMarkText}`),
     },
     row,
   )
@@ -598,41 +608,31 @@ export async function readInstanceStatus(
 /**
  * 无卡模式的标记文字。
  *
- * 实测（2026-11-25 真机）：有卡实例的状态格 `.gpuTips` 写「GPU充足」，
- * 已关机实例没有这个元素。无卡模式实例的 `.gpuTips` 写什么本轮未实测。
- *
- * 判据：认得的只有「GPU充足」这一种有卡标记。其余非空取值一律按无卡模式处理并记原文。
- * 这条判定只在实例运行中时成立：已关机实例本来就没有 GPU，不构成无卡模式。
+ * 实测（2026-11-26 真机）：无卡模式实例的状态格 `.gpuTips` 写 `无卡模式`。
+ * 有卡实例写 `GPU充足`；已关机实例该元素存在但为空。
  */
+export const NO_GPU_TIP_TEXT = '无卡模式'
+
+/** 有卡实例的标记文字。 */
 export const GPU_AVAILABLE_TIP_TEXT = 'GPU充足'
 
 /**
  * 判定实例是否以无卡模式运行。
  *
- * 返回 `null` 表示本次页面事实不足以判定。三种情况：
- * 1. 实例不在运行中：已关机实例没有 GPU 是常态，不是无卡模式。
- * 2. `.gpuTips` 为空：页面没给标记，不猜。
- * 3. 标记是「GPU充足」：有卡运行。
+ * 返回 `null` 表示本次页面事实不足以判定。两种情况：
+ * 1. `.gpuTips` 为空：已关机、创建中，或页面没给标记。不猜。
+ * 2. 标记既不是 `无卡模式` 也不是 `GPU充足`：认不出，不猜。
+ *
+ * 判据（实测）：看的是标记文字，不是状态词。无卡模式实例开机中的状态词是 `开机中`，
+ * 与有卡开机完全相同，所以「运行中」既不是必要条件也不是充分条件。
  */
-export function detectNoGpuMode(
-  gpuTipsText: string,
-  status: InstanceStatus,
-  rowIndex: number,
-  rowDescription: string,
-): boolean | null {
-  if (status !== 'running') {
-    return null
-  }
+export function detectNoGpuMode(gpuTipsText: string): boolean | null {
   const tips = gpuTipsText.replace(/\s+/g, '')
-  if (tips.length === 0) {
-    return null
+  if (tips.includes(NO_GPU_TIP_TEXT)) {
+    return true
   }
   if (tips.includes(GPU_AVAILABLE_TIP_TEXT)) {
     return false
   }
-  // 页面给了非空标记，而它不是「GPU充足」。这是无卡模式的唯一可观测证据。
-  // 记录原文便于事后核对：控制台改文案时，日志里能看到当时读到了什么。
-  void rowIndex
-  void rowDescription
-  return true
+  return null
 }

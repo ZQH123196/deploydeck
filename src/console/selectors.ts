@@ -76,6 +76,14 @@ export const INSTANCE_STATUS_CELL = {
   statusText: '.status',
   gpuTips: '.gpuTips',
   /**
+   * 形态标记的图标与文字（2026-11-26 真机实测）。
+   *
+   * 无卡模式实例的状态格里，`.status` 下面还有一个 div：
+   * `<div><span class="iconfont icon-wukamoshi"></span><span class="twelveSize">无卡模式</span></div>`。
+   * 有卡实例则写 `GPU充足`。它不是 `.gpuTips` —— 那是另一套元素，这里读不到无卡标记。
+   */
+  modeIcon: '.icon-wukamoshi',
+  /**
    * 创建中实例的状态区。
    *
    * 实测（2026-11-25 真机）：新克隆出来的实例在创建过程中，状态格里没有 `.status`，

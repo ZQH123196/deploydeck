@@ -44,6 +44,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
     gpuTipsText: '',
+    modeMarkText: '',
     diskLines: ['系统盘 37.98%', '数据盘 57.93%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -70,6 +71,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
     gpuTipsText: '',
+    modeMarkText: '',
     diskLines: ['系统盘 35.81%', '数据盘 55.97%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -96,6 +98,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusProgressText: null,
     gpuSpecText: 'RTX PRO 6000 * 1卡',
     gpuTipsText: '',
+    modeMarkText: '',
     diskLines: ['系统盘 80.74%', '数据盘 80.00%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -122,6 +125,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
     gpuTipsText: '',
+    modeMarkText: '',
     diskLines: ['系统盘 35.81%', '数据盘 55.90%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -148,6 +152,7 @@ const REAL_ROWS: readonly RawInstanceRow[] = [
     statusProgressText: null,
     gpuSpecText: 'vGPU-48GB * 1卡',
     gpuTipsText: '',
+    modeMarkText: '',
     diskLines: ['系统盘 3.79%', '数据盘 68.16%'],
     billingText: '按量计费 余额不足24小时',
     billingWarning: '余额不足24小时',
@@ -175,6 +180,7 @@ function makeRow(overrides: Partial<RawInstanceRow>): RawInstanceRow {
     statusProgressText: null,
     gpuSpecText: 'vGPU-32GB * 1卡',
     gpuTipsText: '',
+    modeMarkText: '',
     diskLines: ['系统盘 37.98%', '数据盘 57.93%'],
     billingText: '按量计费',
     billingWarning: '',
@@ -515,24 +521,25 @@ function makeChannel(
 }
 
 describe('detectNoGpuMode：无卡模式判定', () => {
-  it('运行中且标记为「GPU充足」时有卡', () => {
-    expect(detectNoGpuMode('GPU充足', 'running', 0, '')).toBe(false)
+  it('标记为「无卡模式」时是无卡实例', () => {
+    expect(detectNoGpuMode('无卡模式')).toBe(true)
   })
 
-  it('运行中且标记不是「GPU充足」时按无卡模式', () => {
-    expect(detectNoGpuMode('无卡模式', 'running', 0, '')).toBe(true)
+  it('标记为「GPU充足」时是有卡实例', () => {
+    expect(detectNoGpuMode('GPU充足')).toBe(false)
   })
 
-  it('已关机时判不出无卡模式，返回 null', () => {
-    expect(detectNoGpuMode('', 'stopped', 0, '')).toBeNull()
+  it('没有标记时返回 null，不猜', () => {
+    expect(detectNoGpuMode('')).toBeNull()
   })
 
-  it('运行中但没有标记时返回 null，不猜', () => {
-    expect(detectNoGpuMode('', 'running', 0, '')).toBeNull()
+  it('认不出的标记返回 null，不猜', () => {
+    expect(detectNoGpuMode('其他标记')).toBeNull()
   })
 
   it('标记文字里的空白不影响判定', () => {
-    expect(detectNoGpuMode('GPU 充足', 'running', 0, '')).toBe(false)
+    expect(detectNoGpuMode('GPU 充足')).toBe(false)
+    expect(detectNoGpuMode('无卡 模式')).toBe(true)
   })
 })
 
@@ -594,5 +601,67 @@ describe('readInstanceStatus：只读状态', () => {
       status: 'running',
       statusRaw: '运行中',
     })
+  })
+})
+
+describe('parseInstanceList：无卡模式快照', () => {
+  /**
+   * 2026-11-26 真机样本：无卡模式开机的实例。
+   *
+   * 判据（实测）：状态词是「开机中」，`.gpuTips` 是「无卡模式」。
+   * 状态词与有卡开机完全相同，所以形态只能从标记读。
+   */
+  const NOGPU_ROW: RawInstanceRow = {
+    rowIndex: 0,
+    cellTexts: [
+      '西北B区 / 722机 af9c49bd44-8ee624d7 app+asr',
+      '开机中 无卡模式',
+      'vGPU-32GB * 1卡 查看详情',
+      '系统盘 37.98% 数据盘 57.93%',
+      '正常 CPU 0% 内存 1%',
+      '按量计费',
+      '关机15天后释放 设置定时关机',
+      '登录指令 ssh****** 密码 *********',
+      'JupyterLab',
+      '关机更多',
+    ],
+    instanceId: 'af9c49bd44-8ee624d7',
+    instanceName: 'app+asr',
+    statusText: '开机中',
+    statusProgressText: null,
+    gpuSpecText: 'vGPU-32GB * 1卡',
+    gpuTipsText: '无卡模式',
+    modeMarkText: '',
+    diskLines: ['系统盘 37.98%', '数据盘 57.93%'],
+    billingText: '按量计费',
+    billingWarning: '',
+    releaseText: '关机15天后释放',
+    timedShutdownText: '',
+  }
+
+  it('无卡实例的 noGpuMode 是 true，状态词仍是「开机中」', () => {
+    const [snapshot] = parseInstanceList([NOGPU_ROW], OPTIONS)
+
+    expect(snapshot?.noGpuMode).toBe(true)
+    expect(snapshot?.status).toBe('starting')
+  })
+
+  it('有卡运行实例的 noGpuMode 是 false', () => {
+    const [snapshot] = parseInstanceList(
+      [{ ...NOGPU_ROW, statusText: '运行中', gpuTipsText: 'GPU充足' }],
+      OPTIONS,
+    )
+
+    expect(snapshot?.noGpuMode).toBe(false)
+    expect(snapshot?.status).toBe('running')
+  })
+
+  it('已关机实例没有标记时 noGpuMode 是 null，不猜', () => {
+    const [snapshot] = parseInstanceList([NOGPU_ROW], OPTIONS)
+
+    // 同一条行换成已关机：标记消失，形态未知。
+    const stopped = parseInstanceList([{ ...NOGPU_ROW, statusText: '已关机', gpuTipsText: '' }], OPTIONS)
+    expect(stopped[0]?.noGpuMode).toBeNull()
+    expect(snapshot).toBeDefined()
   })
 })
