@@ -38,6 +38,7 @@ deploydeck status --json
 | `DEPLOYDECK_CDP_PORT` | `9222` | 专用 Chrome 的 CDP 端口 |
 | `DEPLOYDECK_CHROME_PROFILE_DIR` | WSL 下 `%LOCALAPPDATA%\deploydeck\chrome-profile`，其余 `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir |
 | `DEPLOYDECK_CHROME_EXECUTABLE` | 按平台查找 | 专用 Chrome 可执行文件绝对路径 |
+| `DEPLOYDECK_WINDOWS_PROFILE_ROOT` | `%LOCALAPPDATA%` | WSL 下 Chrome profile 的 Windows 根目录 |
 | `DEPLOYDECK_BALANCE_WARN_BELOW_YUAN` | 无 | 余额告警阈值（元）。`guard` 必填，不配则启动报错 |
 
 配置目录下 `profiles/<id>.jsonc` 与 `projects/<id>.jsonc` 分别放部署配置与项目清单。
