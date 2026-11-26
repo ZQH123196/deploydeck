@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { ChromeLaunchError, ConfigError } from '../errors.js'
 import {
   assertLaunchableProfileDir,
+  createChromeEnvironment,
+  looksLikeWindowsPath,
   buildChromeLaunchArgs,
   chromeExecutableCandidates,
   ensureChromeRunning,
@@ -241,3 +243,63 @@ describe('拒绝对 WSL 网络路径启动 Chrome', () => {
     expect(() => assertLaunchableProfileDir('/home/me/.local/state/deploydeck/chrome-profile')).not.toThrow()
   })
 })
+
+describe('已经是 Windows 路径时不再交给 wslpath', () => {
+  it('盘符式路径原样返回，反斜杠不被吃掉', async () => {
+    // 判据：wslpath -w 会把 C:\Users\... 当 Linux 相对路径，输出 CUsersZQH12AppData...
+    // Chrome 拿到这个畸形路径后静默失败，CDP 端口永远不就绪。
+    const environment = createChromeEnvironmentWithFakeWslpath()
+    const translated = await environment.translatePath(
+      '/mnt/c/Program Files/Google/Chrome/Application/chrome.exe',
+      'C:\\Users\\me\\AppData\\Local\\deploydeck\\chrome-profile',
+    )
+
+    expect(translated).toBe('C:\\Users\\me\\AppData\\Local\\deploydeck\\chrome-profile')
+    expect(environment.wslpathCalls).toBe(0)
+  })
+
+  it('UNC 路径原样返回', async () => {
+    const environment = createChromeEnvironmentWithFakeWslpath()
+    const translated = await environment.translatePath(
+      '/mnt/c/Program Files/Google/Chrome/Application/chrome.exe',
+      '\\\\server\\share\\profile',
+    )
+
+    expect(translated).toBe('\\\\server\\share\\profile')
+    expect(environment.wslpathCalls).toBe(0)
+  })
+
+  it('Linux 路径仍然翻译', async () => {
+    const environment = createChromeEnvironmentWithFakeWslpath()
+    const translated = await environment.translatePath(
+      '/mnt/c/Program Files/Google/Chrome/Application/chrome.exe',
+      '/home/me/profile',
+    )
+
+    expect(environment.wslpathCalls).toBe(1)
+    // 发行版名由本机环境决定，只断言形态。
+    expect(translated.startsWith('\\\\wsl.localhost\\')).toBe(true)
+    expect(translated.endsWith('\\home\\me\\profile')).toBe(true)
+  })
+})
+
+/**
+ * 只包一层计数，其余是真实现。
+ *
+ * 断言点是「已经是 Windows 路径时有没有走到 wslpath」，所以必须用真实 translatePath。
+ */
+function createChromeEnvironmentWithFakeWslpath(): ChromeEnvironment & { wslpathCalls: number } {
+  const real = createChromeEnvironment()
+  const state = { calls: 0 }
+  const environment = {
+    ...real,
+    translatePath: async (executablePath: string, path: string): Promise<string> => {
+      if (!looksLikeWindowsPath(path)) {
+        state.calls += 1
+      }
+      return real.translatePath(executablePath, path)
+    },
+  } as unknown as ChromeEnvironment & { readonly wslpathCalls: number }
+  Object.defineProperty(environment, 'wslpathCalls', { get: () => state.calls })
+  return environment
+}

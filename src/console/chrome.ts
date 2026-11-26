@@ -141,6 +141,11 @@ export function resolveChromeExecutable(
   return found
 }
 
+/** 是否已经是 Windows 能直接用的路径：盘符式或 UNC。 */
+export function looksLikeWindowsPath(path: string): boolean {
+  return /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith('\\\\')
+}
+
 /** 从 WSL 调 Windows Chrome 时必须换成 Windows 路径：Windows 进程理解不了 `/home/...`。 */
 export function needsWindowsPathTranslation(
   platform: NodeJS.Platform,
@@ -194,6 +199,11 @@ export function createChromeEnvironment(): ChromeEnvironment {
     },
     translatePath: async (executablePath, path) => {
       if (!needsWindowsPathTranslation(process.platform, executablePath)) {
+        return path
+      }
+      // 已经是 Windows 路径时不能再问 wslpath：它把 `C:\Users\...` 当 Linux 相对路径，
+      // 反斜杠会被逐个吃掉，输出 `CUsersZQH12AppData...`。Chrome 拿到这个路径后静默失败。
+      if (looksLikeWindowsPath(path)) {
         return path
       }
       let stdout: string
