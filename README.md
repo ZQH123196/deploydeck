@@ -85,7 +85,8 @@ pnpm dev -- --help
 | `DEPLOYDECK_CONFIG_DIR` | `~/.config/deploydeck` | 存放 `profiles/` 与 `projects/` |
 | `DEPLOYDECK_STATE_DIR` | `~/.local/state/deploydeck` | 存放计划、运行记录、账本、日志 |
 | `DEPLOYDECK_CDP_PORT` | `9222` | 专用 Chrome 的 CDP 端口 |
-| `DEPLOYDECK_CHROME_PROFILE_DIR` | `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir。落状态目录：Chrome 会往里写登录态，配置目录机器只读 |
+| `DEPLOYDECK_CHROME_PROFILE_DIR` | WSL 下 `%LOCALAPPDATA%\deploydeck\chrome-profile`，其余 `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir。不落配置目录：Chrome 会往里写登录态，配置目录机器只读。WSL 下必须落 Windows 本地磁盘，`\\wsl.localhost` 上的 LevelDB 加锁失败会让登录态写不进磁盘 |
+| `DEPLOYDECK_WINDOWS_PROFILE_ROOT` | `%LOCALAPPDATA%` | WSL 下 Chrome profile 的 Windows 根目录 |
 | `DEPLOYDECK_CHROME_EXECUTABLE` | 按平台自动查找 | 专用 Chrome 可执行文件绝对路径。自动查找失败时用它指定 |
 | `DEPLOYDECK_BALANCE_WARN_BELOW_YUAN` | 无默认值 | 余额告警阈值，元。只有 `guard` 需要；不配置时 `guard` 启动即报错 |
 

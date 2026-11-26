@@ -251,6 +251,7 @@ export async function ensureChromeRunning(options: EnsureChromeOptions): Promise
   }
 
   const launchProfileDir = await environment.translatePath(executablePath, options.profileDir)
+  assertLaunchableProfileDir(launchProfileDir)
   const launchArgs = buildChromeLaunchArgs({
     profileDir: launchProfileDir,
     port: options.port,
@@ -294,6 +295,29 @@ export async function ensureChromeRunning(options: EnsureChromeOptions): Promise
     executablePath,
     profileDir: options.profileDir,
     launchArgs,
+  }
+}
+
+/**
+ * 拒绝对 `\\wsl.localhost\...` 启动 Chrome。
+ *
+ * 实测（2026-11-26，Chrome 158）：Profile 目录落在 9p 上时，LevelDB 打不开锁，
+ * 日志报 `ChromeMethodBFE: 15::LockFile::1`。后果有三条：
+ * Local Storage 写不进磁盘（登录态每次丢）、Cookies 库 0 字节、
+ * 每次启动弹「打开您的个人资料时出了点问题」。
+ *
+ * 在启动前拦住，比让人对着一个「能连上但每次都要求重新登录」的浏览器排查便宜得多。
+ */
+export function assertLaunchableProfileDir(profileDir: string): void {
+  const normalized = profileDir.toLowerCase()
+  const uncPrefixes = ['\\\\wsl$\\', '\\\\wsl.localhost\\']
+  if (uncPrefixes.some((prefix) => normalized.startsWith(prefix))) {
+    throw new ConfigError(
+      `Chrome 的 user-data-dir 不能落在 WSL 网络路径上：${profileDir}。\n` +
+        'Chrome 在该路径上无法给 LevelDB 加锁，登录态写不进磁盘，每次启动都会弹「个人资料错误」。\n' +
+        '请改用 Windows 本地路径，例如 C:\\Users\\<你>\\AppData\\Local\\deploydeck\\chrome-profile。\n' +
+        '可用 DEPLOYDECK_CHROME_PROFILE_DIR 指定。',
+    )
   }
 }
 

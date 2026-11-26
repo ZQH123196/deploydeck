@@ -2,6 +2,11 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { openAutodlProvider } from '../../src/providers/autodl/runtime.js'
 import { CONSOLE_INSTANCE_LIST_URL } from '../../src/console/selectors.js'
+import {
+  probeWindowsProfileRoot,
+  readProcessEnv,
+  resolveChromeProfileDirForChrome,
+} from '../../src/config/paths.js'
 import type { Provider } from '../../src/providers/provider.js'
 import type { SshShellPort } from '../../src/ssh/ports.js'
 
@@ -57,7 +62,13 @@ export async function openE2eRuntime(workDir: E2eWorkDir, cdpPort: number): Prom
   const runtime = await openAutodlProvider({
     consoleUrl: CONSOLE_INSTANCE_LIST_URL,
     cdpPort,
-    chromeProfileDir: join(workDir.stateDir, 'chrome-profile'),
+    // 真机测试也要落 Windows 本地磁盘：\\wsl.localhost 上 Chrome 给 LevelDB 加锁失败，
+    // 登录态写不进磁盘，e2e 每次都要人重新登录。
+    chromeProfileDir: resolveChromeProfileDirForChrome(
+      readProcessEnv(),
+      process.platform,
+      await probeWindowsProfileRoot(),
+    ),
     knownHostsPath: join(workDir.stateDir, 'ssh-known-hosts.txt'),
     logDir: workDir.logDir,
     stateDir: workDir.stateDir,

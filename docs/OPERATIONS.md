@@ -224,9 +224,14 @@ deploydeck login
 
 判据：
 
-1. 专用 Chrome 使用独立 user-data-dir，与日常浏览互不干扰。登录态存在状态目录的 `chrome-profile/` 里。
+1. 专用 Chrome 使用独立 user-data-dir，与日常浏览互不干扰。
 2. deploydeck 不填账号密码。登录只由人完成。
 3. 默认等待 300 秒，超时退出码 2。可用 `--timeout <秒>` 改。
+
+登录态存在 Chrome profile 的 Local Storage 里，不在 Cookie 里。profile 必须落能正常写入磁盘的位置：
+WSL 下调 Windows Chrome 时，profile 默认落 Windows 本地磁盘 `%LOCALAPPDATA%\deploydeck\chrome-profile`。
+不能落 `\\wsl.localhost\...`：Chrome 在该路径上无法给 LevelDB 加锁，登录态写不进磁盘，
+每次启动都弹「打开您的个人资料时出了点问题」，并且每次都要重新登录。deploydeck 启动前会拦下这种路径。
 
 WSL 环境：deploydeck 会调用 Windows 侧的 `chrome.exe`，通过 `127.0.0.1:<CDP 端口>` 连接。
 自动查找失败时，用环境变量 `DEPLOYDECK_CHROME_EXECUTABLE` 指定 Chrome 的绝对路径。
@@ -240,8 +245,9 @@ WSL 环境：deploydeck 会调用 Windows 侧的 `chrome.exe`，通过 `127.0.0.
 | `DEPLOYDECK_CONFIG_DIR` | `~/.config/deploydeck` | 配置目录 | 全部 |
 | `DEPLOYDECK_STATE_DIR` | `~/.local/state/deploydeck` | 状态目录 | 全部 |
 | `DEPLOYDECK_CDP_PORT` | `9222` | 专用 Chrome 的 CDP 端口 | 需要控制台的命令 |
-| `DEPLOYDECK_CHROME_PROFILE_DIR` | `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir | 需要控制台的命令 |
+| `DEPLOYDECK_CHROME_PROFILE_DIR` | WSL 下为 `%LOCALAPPDATA%\deploydeck\chrome-profile`，其余为 `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir | 需要控制台的命令 |
 | `DEPLOYDECK_CHROME_EXECUTABLE` | 按平台自动查找 | 专用 Chrome 的绝对路径 | 需要控制台的命令 |
+| `DEPLOYDECK_WINDOWS_PROFILE_ROOT` | `%LOCALAPPDATA%` | WSL 下 Chrome profile 的 Windows 根目录 | 需要控制台的命令 |
 | `DEPLOYDECK_BALANCE_WARN_BELOW_YUAN` | 无 | 余额告警阈值，元 | 只有 `guard` |
 
 判据：`DEPLOYDECK_BALANCE_WARN_BELOW_YUAN` 没有默认值。不配置时 `guard` 启动即报错（退出码 2）。

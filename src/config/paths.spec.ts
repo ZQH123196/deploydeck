@@ -4,6 +4,8 @@ import {
   resolveBalanceWarnBelowYuan,
   resolveChromeExecutableOverride,
   resolveChromeProfileDir,
+  resolveChromeProfileDirForChrome,
+  probeWindowsProfileRoot,
   resolveCdpPort,
   resolveConfigDir,
   resolveStateDir,
@@ -109,3 +111,45 @@ describe('CDP 端口', () => {
 function joinTail(...segments: readonly string[]): string {
   return segments.join('/')
 }
+
+describe('传给 Chrome 的 profile 目录', () => {
+  it('WSL 下落 Windows 本地磁盘，不落状态目录', () => {
+    // 判据：Chrome 在 \\wsl.localhost 上无法给 LevelDB 加锁，登录态写不进磁盘。
+    const dir = resolveChromeProfileDirForChrome(
+      { DEPLOYDECK_STATE_DIR: '/home/me/.local/state/deploydeck' },
+      'linux',
+      'C:\\Users\\me\\AppData\\Local',
+    )
+
+    expect(dir).toBe('C:\\Users\\me\\AppData\\Local\\deploydeck\\chrome-profile')
+  })
+
+  it('非 WSL 平台落状态目录', () => {
+    expect(
+      resolveChromeProfileDirForChrome({ DEPLOYDECK_STATE_DIR: '/custom/state' }, 'darwin', 'C:\\x'),
+    ).toBe('/custom/state/chrome-profile')
+  })
+
+  it('显式覆盖优先，原样使用', () => {
+    expect(
+      resolveChromeProfileDirForChrome(
+        { DEPLOYDECK_CHROME_PROFILE_DIR: 'D:\\custom\\profile' },
+        'linux',
+        'C:\\Users\\me\\AppData\\Local',
+      ),
+    ).toBe('D:\\custom\\profile')
+  })
+
+  it('WSL 里读不到 Windows 目录时回退状态目录，不猜路径', () => {
+    expect(resolveChromeProfileDirForChrome({ DEPLOYDECK_STATE_DIR: '/s' }, 'linux', undefined)).toBe(
+      '/s/chrome-profile',
+    )
+  })
+
+  it('进程环境里没有 LOCALAPPDATA 时，显式覆盖值优先于探测', async () => {
+    // WSL 默认不注入 %LOCALAPPDATA%，探测会真的去问 cmd.exe；这里断言覆盖值先被采用。
+    const root = await probeWindowsProfileRoot({ DEPLOYDECK_WINDOWS_PROFILE_ROOT: 'D:\\dd' })
+
+    expect(root).toBe('D:\\dd')
+  })
+})

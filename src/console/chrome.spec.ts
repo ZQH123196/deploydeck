@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { ChromeLaunchError, ConfigError } from '../errors.js'
 import {
+  assertLaunchableProfileDir,
   buildChromeLaunchArgs,
   chromeExecutableCandidates,
   ensureChromeRunning,
@@ -132,7 +133,7 @@ describe('保证 Chrome 在跑', () => {
   it('冷启动时启动一次，并用翻译后的 profile 路径等到端口就绪', async () => {
     const fake = createFakeEnvironment({
       probeResults: [false, true],
-      translatedPath: '\\\\wsl.localhost\\Ubuntu-24.04\\home\\zqh\\chrome-profile',
+      translatedPath: 'C:\\Users\\zqh\\AppData\\Local\\deploydeck\\chrome-profile',
     })
     const session = await ensureChromeRunning({
       port: 9333,
@@ -147,7 +148,7 @@ describe('保证 Chrome 在跑', () => {
     const launch = assertDefined(fake.launches[0], '应当启动一次')
     expect(launch.executablePath).toBe('/fake/chrome.exe')
     expect(launch.args).toContain(
-      '--user-data-dir=\\\\wsl.localhost\\Ubuntu-24.04\\home\\zqh\\chrome-profile',
+      '--user-data-dir=C:\\Users\\zqh\\AppData\\Local\\deploydeck\\chrome-profile',
     )
     expect(session.launchArgs).toEqual(launch.args)
     expect(fake.translateCalls).toEqual(['/fake/chrome.exe→/home/zqh/chrome-profile'])
@@ -211,5 +212,32 @@ describe('Windows 路径翻译判据', () => {
   it('Linux 原生与 Windows 原生都不需要翻译', () => {
     expect(needsWindowsPathTranslation('linux', '/usr/bin/google-chrome')).toBe(false)
     expect(needsWindowsPathTranslation('win32', 'C:\\chrome.exe')).toBe(false)
+  })
+})
+
+describe('拒绝对 WSL 网络路径启动 Chrome', () => {
+  it('\\wsl.localhost 路径拒绝启动', () => {
+    // 判据：Chrome 在 9p 上无法给 LevelDB 加锁，登录态写不进磁盘。
+    expect(() =>
+      assertLaunchableProfileDir(
+        '\\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\state\\chrome-profile',
+      ),
+    ).toThrow(ConfigError)
+  })
+
+  it('\\wsl$ 路径同样拒绝', () => {
+    expect(() => assertLaunchableProfileDir('\\\\wsl$\\Ubuntu\\home\\me\\profile')).toThrow(
+      ConfigError,
+    )
+  })
+
+  it('Windows 本地路径放行', () => {
+    expect(() =>
+      assertLaunchableProfileDir('C:\\Users\\me\\AppData\\Local\\deploydeck\\chrome-profile'),
+    ).not.toThrow()
+  })
+
+  it('Linux 原生路径放行', () => {
+    expect(() => assertLaunchableProfileDir('/home/me/.local/state/deploydeck/chrome-profile')).not.toThrow()
   })
 })

@@ -140,6 +140,12 @@ export interface LoginCommandOptions {
   readonly logDir?: string
   /** 时钟与等待。测试注入假时钟。 */
   readonly clock?: Clock
+  /**
+   * 开始等待时回调一次。给人看「现在在等什么、等到什么时候」。
+   *
+   * 界面命令必须有这个反馈：默认等 300 秒，不给提示时进程看起来就是卡住了。
+   */
+  readonly onWaitStart?: (info: { readonly timeoutMs: number }) => void
 }
 
 export interface LoginCommandResult {
@@ -163,6 +169,7 @@ export async function runLoginCommand(options: LoginCommandOptions): Promise<Log
 
   await options.channel.goto(options.consoleUrl)
   await captureScreenshot(options.channel, options.logDir, 'login-before', screenshotPaths)
+  options.onWaitStart?.({ timeoutMs })
 
   const outcome = await pollUntil<LoginProbe>({
     description: '等待在专用 Chrome 窗口完成登录',

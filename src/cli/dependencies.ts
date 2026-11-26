@@ -1,9 +1,10 @@
 import { loadProfiles } from '../config/loader.js'
 import {
+  probeWindowsProfileRoot,
   readProcessEnv,
   resolveBalanceWarnBelowYuan,
   resolveCdpPort,
-  resolveChromeProfileDir,
+  resolveChromeProfileDirForChrome,
   resolveConfigDir,
   resolveKnownHostsPath,
   resolveProfilesDir,
@@ -152,6 +153,15 @@ export function createRealCliDependencies(
     },
   }
 
+  // WSL 下 profile 要落 Windows 本地磁盘。Windows 目录只能问一次 cmd.exe，结果缓存起来。
+  let chromeProfileDirPromise: Promise<string> | undefined
+  const resolveChromeProfileDir = (): Promise<string> => {
+    chromeProfileDirPromise ??= probeWindowsProfileRoot(env).then((windowsRoot) =>
+      resolveChromeProfileDirForChrome(env, process.platform, windowsRoot),
+    )
+    return chromeProfileDirPromise
+  }
+
   return {
     configDir,
     stateDir,
@@ -165,7 +175,7 @@ export function createRealCliDependencies(
       const runtime = await openAutodlProvider({
         consoleUrl: CONSOLE_INSTANCE_LIST_URL,
         cdpPort: resolveCdpPort(env),
-        chromeProfileDir: resolveChromeProfileDir(env),
+        chromeProfileDir: await resolveChromeProfileDir(),
         knownHostsPath: resolveKnownHostsPath(stateDir),
         logDir,
         stateDir,
@@ -183,19 +193,20 @@ export function createRealCliDependencies(
       }
     },
 
-    openConsoleSession: async () =>
-      await openConsoleSession({
+    openConsoleSession: async () => {
+      return await openConsoleSession({
         consoleUrl: CONSOLE_INSTANCE_LIST_URL,
         port: resolveCdpPort(env),
-        chromeProfileDir: resolveChromeProfileDir(env),
+        chromeProfileDir: await resolveChromeProfileDir(),
         logger,
-      }),
+      })
+    },
 
     openShell: async ({ logDir, term }) => {
       const session = await openConsoleSession({
         consoleUrl: CONSOLE_INSTANCE_LIST_URL,
         port: resolveCdpPort(env),
-        chromeProfileDir: resolveChromeProfileDir(env),
+        chromeProfileDir: await resolveChromeProfileDir(),
         logger,
       })
       // 未登录时直接抛 LoginRequiredError：此时不返回端口，调用方无从建立任何连接。
