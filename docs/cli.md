@@ -2,9 +2,11 @@
 
 > 契约来源：[Phase 2 spec](specs/deploydeck-phase2.md) 第 12 节与各工单验收。
 > 实现入口：`src/cli/main.ts`；命令实现：`src/cli/commands/`；依赖装配：`src/cli/dependencies.ts`。
-> 退出码含义见本文第 5 节。
+> 退出码与错误行格式见本文第 5 节。操作步骤版见 [操作手册](OPERATIONS.md)。
 
 CLI 是唯一稳定接口。TUI、Web、Agent 都调用同一批命令，人也能直接跑。
+
+外部项目接 deploydeck 时先读 [操作手册](OPERATIONS.md)。本文是命令的逐个参考。
 
 ## 1. 通用约定
 
@@ -385,5 +387,18 @@ deploydeck status --json | jq '.plans[] | { planId, instanceId, spentYuan }'
 | 2 | 需要人工 | 配置非法、未登录、克隆超时、实例未确认消失、克隆配额耗尽、命令未实现 |
 
 错误类自带 `exitCode`（`src/errors.ts`），CLI 只透传，不另建映射表。
+
+### 5.1 错误行格式
+
+`DeploydeckError` 写到 stderr 的行固定是 `<错误码>` 加中文消息：
+
+```text
+[PLAN_INVALID] 计划不存在：plan-20261126190100-29b7。请先执行 plan create。
+```
+
+判据：错误码在行首方括号里。退出码只有三个值，区分不了具体失败原因，机器读者按错误码分叉。
+错误码全集见 `src/errors.ts` 的 `DeploydeckErrorCode`。
+
 `guard` 例外：`escalated` 与控制面降级只记日志，不改变退出码。
 参数解析错误（例如缺必填参数）由 commander 抛出，CLI 统一转成退出码 1 并打印可读信息。
+未经包装的异常打印 `[UNEXPECTED]` 加消息与栈，退出码 1。

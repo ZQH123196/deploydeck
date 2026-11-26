@@ -470,6 +470,24 @@ describe('CLI：退出码', () => {
     expect((await fixture.readPlan(planId)).state).toBe('active')
   })
 
+  it('业务错误在 stderr 行首打出稳定错误码，机器读者按码分叉', async () => {
+    // 判据（docs/OPERATIONS.md 第 7.3 节）：退出码只有三个值，区分不了具体失败原因。
+    const fixture = await createFixture()
+
+    await fixture.run(['plan', 'show', 'plan-missing', '--json'])
+
+    expect(fixture.stderrText().split('\n')[0]).toMatch(/^\[PLAN_INVALID\] /)
+  })
+
+  it('未登录的 stderr 行首是 LOGIN_REQUIRED，退出码 2', async () => {
+    const fixture = await createFixture({ loginRequired: true })
+    const planId = await createPlan(fixture)
+
+    expect(await fixture.run(['run', '--plan', planId, '--json'])).toBe(2)
+
+    expect(fixture.stderrText().split('\n')[0]).toMatch(/^\[LOGIN_REQUIRED\] /)
+  })
+
   it('teardown 未确认消失是 2，退出码来自 InstanceNotGoneError', async () => {
     const fixture = await createFixture()
     const planId = await createPlan(fixture)

@@ -141,6 +141,7 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard --once
 
 ## 文档
 
+- [操作手册](docs/OPERATIONS.md) —— 外部项目怎么接入、怎么跑、机器读者怎么调。**只看一份就从这里开始**
 - [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 本期的设计与验收标准
 - [施工工单](docs/tickets/) —— 按依赖序编号
 - [CLI 命令面](docs/cli.md) —— 命令、参数、`--json` 输出形状、退出码、例行操作

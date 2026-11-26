@@ -234,7 +234,9 @@ export function buildProgram(deps: CliDependencies): Command {
 /** 退出码映射。命令抛出的错误自带 `exitCode`，这里只透传。 */
 function reportError(deps: CliDependencies, error: unknown): ExitCode {
   if (error instanceof DeploydeckError) {
-    writeLine(deps.stderr, error.message)
+    // 稳定错误码打在行首。退出码只有三个值，区分不了「预算不足」与「脚本失败」，
+    // 机器读者按码分叉，不解析中文消息（docs/OPERATIONS.md 第 7.3 节）。
+    writeLine(deps.stderr, `[${error.code}] ${error.message}`)
     return error.exitCode
   }
   if (error instanceof CommanderError) {
