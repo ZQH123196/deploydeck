@@ -174,6 +174,7 @@ function buildInstanceSnapshot(
     balanceWarning: null,
     timedShutdownAt: null,
     sshCommand: null,
+    noGpuMode: null,
   }
 }
 

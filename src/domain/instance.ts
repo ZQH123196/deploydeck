@@ -54,6 +54,14 @@ export const ConsoleInstanceSnapshotSchema = z.object({
   timedShutdownAt: z.string().min(1).nullable(),
   /** SSH 登录列给出的登录指令。密码要展开才可见，由 SSH 通道负责。 */
   sshCommand: z.string().min(1).nullable(),
+  /**
+   * 实例当前是否以无卡模式运行。
+   *
+   * 实测（2026-11-25 真机）：无卡模式实例的状态列同样写「运行中」，
+   * 差别只在第 2 列规格区显示无卡标记。`false` 表示有卡运行；
+   * `null` 表示页面没给出可判定的信息（已关机、创建中、或页面改版）。
+   */
+  noGpuMode: z.boolean().nullable(),
 })
 
 export type ConsoleInstanceSnapshot = z.infer<typeof ConsoleInstanceSnapshotSchema>

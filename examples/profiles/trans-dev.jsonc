@@ -10,6 +10,11 @@
   "regionPreference": [],
   "cloneDataDisk": true,
 
+  // 开机形态：无卡模式。开发与测试优先走它。
+  // 判据：无卡模式不占 GPU，单价低，主机没有空闲 GPU 也一定能开机。
+  // 本机语音模型走的是 Windows 侧服务，容器里不需要算力。
+  "powerOnMode": "no-gpu",
+
   // 克隆源实例：走克隆路径时以这台已关机实例为模板。
   // 写名字或实例 ID 都可以。没有同名实例时按它克隆。
   "cloneSourceInstanceName": "trans-dev",

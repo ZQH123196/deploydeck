@@ -360,6 +360,7 @@ function buildSnapshot(row: FakeRow): ConsoleInstanceSnapshot {
     balanceWarning: null,
     timedShutdownAt: null,
     sshCommand: null,
+    noGpuMode: null,
   }
 }
 

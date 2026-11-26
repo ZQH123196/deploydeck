@@ -35,8 +35,8 @@ export const AUTODL_PROVIDER_ID = 'autodl'
 /**
  * AutoDL 的能力声明。
  *
- * `noGpuMode: false`：控制台能人工用无卡模式开机，但 deploydeck 不使用这条路径
- * （无卡模式由人显式触发，spec 第 7.2 节）。声明为 false 表示「引擎不会走它」，
+ * `noGpuMode: true`：控制台「更多」里有「无卡模式开机」，deploydeck 能走这条路径。
+ * 是否真的走它由部署配置的 `powerOnMode` 决定，引擎不得自行降级或升级。
  * 与 docs/provider-contract.md 第 2 节的能力表一致。
  *
  * `imageSnapshot: false`：控制台有「保存镜像」，但 Phase 2 不做镜像构建，端口也没有对应动作。
@@ -45,7 +45,7 @@ export const AUTODL_PROVIDER_ID = 'autodl'
 export const AUTODL_CAPABILITIES: ProviderCapabilities = {
   create: true,
   powerCycle: true,
-  noGpuMode: false,
+  noGpuMode: true,
   timedShutdown: true,
   accessInfo: true,
   imageSnapshot: false,
@@ -185,7 +185,7 @@ export function createAutodlProvider(input: AutodlProviderInput): Provider {
     id: AUTODL_PROVIDER_ID,
     capabilities: AUTODL_CAPABILITIES,
     listInstances: async (options) => await instances.listInstances(options),
-    powerOn: async (instanceId) => await power.powerOn(instanceId),
+    powerOn: async (instanceId, mode) => await power.powerOn(instanceId, mode),
     powerOff: async (instanceId) => await power.powerOff(instanceId),
     readCloneQuota: async (sourceInstanceId) => await clone.readCloneQuota(sourceInstanceId),
     clone: async (request) => await clone.clone(request),

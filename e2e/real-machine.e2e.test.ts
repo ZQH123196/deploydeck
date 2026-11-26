@@ -259,7 +259,7 @@ describe('真机端到端（耗费测试）', () => {
     '【耗费·UI·慢】开关机：开机等到运行中，关机等到已关机',
     async () => {
       await runCase('开关机（含二次确认）', async () => {
-        const on = await runtime.provider.powerOn(config.sourceInstanceId)
+        const on = await runtime.provider.powerOn(config.sourceInstanceId, 'gpu')
         expect(on).toEqual({ ok: true, instanceId: config.sourceInstanceId })
         const running = await runtime.provider.listInstances({ refresh: true })
         expect(findInstance(running, config.sourceInstanceId)?.status).toBe('running')
@@ -277,7 +277,7 @@ describe('真机端到端（耗费测试）', () => {
     '【耗费·UI·慢】平台定时关机：到点自动关机',
     async () => {
       await runCase('平台定时关机（到点自动关）', async () => {
-        const on = await runtime.provider.powerOn(config.sourceInstanceId)
+        const on = await runtime.provider.powerOn(config.sourceInstanceId, 'gpu')
         expect(on.ok).toBe(true)
 
         // 时间基准取北京时间；真机实测控制台按北京时间显示。

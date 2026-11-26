@@ -5,6 +5,15 @@ export const OnDeployFailureSchema = z.enum(['keep-container', 'destroy-containe
 export type OnDeployFailure = z.infer<typeof OnDeployFailureSchema>
 
 /**
+ * 开机形态。
+ *
+ * `gpu`：租用算力开机，主机没有空闲 GPU 时开不了机。
+ * `no-gpu`：无卡模式开机，不占 GPU，一定能开机，单价低。
+ */
+export const PowerOnModeSchema = z.enum(['gpu', 'no-gpu'])
+export type PowerOnMode = z.infer<typeof PowerOnModeSchema>
+
+/**
  * 部署配置。它规定实例命名、规格优先级、使用时长、预算上限与两个脚本。
  *
  * 所有行为差异都由 Profile 编排，引擎不按「开发/生产」分支判断。
@@ -25,6 +34,14 @@ export const ProfileSchema = z.object({
   gpuPreference: z.array(z.string().min(1)).min(1),
   /** 地区优先级。空数组表示不限制。 */
   regionPreference: z.array(z.string().min(1)).default([]),
+  /**
+   * 开机形态。缺省 `gpu`。
+   *
+   * `no-gpu` 表示走控制台的「无卡模式开机」：不占 GPU，单价低，主机没有空闲 GPU 也能开机。
+   * 判据：开发与测试环境应显式写 `no-gpu`；真正需要算力时才用 `gpu`。
+   * 引擎不会自行降级到无卡模式，也不会从无卡模式自动升到有卡模式。
+   */
+  powerOnMode: PowerOnModeSchema.default('gpu'),
   /** 克隆实例时是否一起拷贝数据盘。系统盘固定拷贝，不可取消。 */
   cloneDataDisk: z.boolean().default(true),
   /**

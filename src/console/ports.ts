@@ -96,9 +96,19 @@ export type PowerOnOutcome =
   | { readonly ok: true; readonly instanceId: string }
   | { readonly ok: false; readonly reason: 'no-gpu' | 'timeout'; readonly detail: string }
 
+/**
+ * 开机形态。
+ *
+ * 判据（spec 第 4.1 节与第 7.2 节）：
+ * - `gpu`：租用算力开机。主机没有空闲 GPU 时开不了机，会返回 `no-gpu`。
+ * - `no-gpu`：无卡模式开机。不占 GPU，始终能开机，单价低。
+ *   它只允许由部署配置显式指定，引擎不得自行降级到这条路径。
+ */
+export type PowerOnMode = 'gpu' | 'no-gpu'
+
 export interface PowerPort {
-  /** 开机并等待到 `running`。不使用无卡模式开机。 */
-  powerOn(instanceId: string): Promise<PowerOnOutcome>
+  /** 按给定形态开机并等待到 `running`。`no-gpu` 形态不会返回 `no-gpu` 失败。 */
+  powerOn(instanceId: string, mode: PowerOnMode): Promise<PowerOnOutcome>
   /** 关机并等待到 `stopped`。 */
   powerOff(instanceId: string): Promise<void>
 }

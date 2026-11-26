@@ -93,7 +93,7 @@ describe('createAutodlProvider', () => {
     expect(provider.capabilities).toEqual({
       create: true,
       powerCycle: true,
-      noGpuMode: false,
+      noGpuMode: true,
       timedShutdown: true,
       accessInfo: true,
       imageSnapshot: false,
