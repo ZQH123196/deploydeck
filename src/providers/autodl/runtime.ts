@@ -270,11 +270,19 @@ function assertHttpUrl(value: string, label: string): void {
   }
 }
 
+/** Windows 盘符绝对路径，例如 `C:\Users\x\y` 或 `C:/Users/x/y`。 */
+const WINDOWS_ABSOLUTE_PATH = /^[A-Za-z]:[\\/]/
+
+/**
+ * WSL 下 Chrome 的 user-data-dir 必须落 Windows 本地磁盘，取值天然是 Windows 路径。
+ * 用 POSIX 的 `isAbsolute` 判它恒为假，会把唯一可用的取值判成非法。
+ * 判据：POSIX 绝对路径与 Windows 盘符路径都算绝对。
+ */
 function assertAbsolutePath(value: string, label: string): void {
   if (value.trim().length === 0) {
     throw new ConfigError(`${label} 不能为空。`)
   }
-  if (!isAbsolute(value)) {
+  if (!isAbsolute(value) && !WINDOWS_ABSOLUTE_PATH.test(value)) {
     throw new ConfigError(`${label} 必须是绝对路径，当前值：${value}。`)
   }
 }

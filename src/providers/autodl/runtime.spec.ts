@@ -142,6 +142,18 @@ describe('openAutodlProvider 的选项校验', () => {
     ).rejects.toBeInstanceOf(ConfigError)
   })
 
+  it('Windows 盘符路径算绝对路径，不抛 ConfigError', async () => {
+    // WSL 下 Chrome 的 user-data-dir 必须落 Windows 本地磁盘，取值天然是 `C:\...`。
+    // 用 POSIX 的 isAbsolute 判它恒为假，会把唯一可用的取值判成非法，
+    // 回退到状态目录又被 9p 检查拒绝 —— 两条路都走不通，控制台命令全部失败。
+    const parent = await createTemporaryParent()
+
+    const provider = await openAutodlProvider(
+      makeOptions(parent, { chromeProfileDir: 'C:\\Users\\example\\AppData\\Local\\deploydeck\\chrome-profile' }),
+    )
+    await provider.close()
+  })
+
   it('known-hosts 落在状态目录外时抛 ConfigError', async () => {
     const parent = await createTemporaryParent()
 
