@@ -24,6 +24,8 @@ function makeProfile(): Record<string, unknown> {
     requirePinnedCommit: false,
     deployScript: 'scripts/deploy.sh',
     startScript: 'scripts/start.sh',
+    env: {},
+    bootstrapEnv: {},
   }
 }
 

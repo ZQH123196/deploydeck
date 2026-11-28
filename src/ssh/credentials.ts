@@ -102,6 +102,33 @@ export async function readSshCredentials(
   return { host: command.host, port: command.port, user: command.user, password: passwordText }
 }
 
+/**
+ * 只读凭据的端口。`creds` 命令经它取 SSH 登录信息，不另写一套控制台定位与复制钩子。
+ *
+ * 判据：凭据只在内存里传，调用方拿到后负责不外泄。`close` 释放浏览器通道，
+ * 不带任何清理动作：本入口不落盘、不改实例状态。
+ */
+export interface CredentialsPort {
+  readCredentials(instanceId: string): Promise<SshCredentials>
+  close(): Promise<void>
+}
+
+/**
+ * 用已有控制台上下文包出凭据端口。
+ *
+ * 函数体就是 `readSshCredentials` 的一次调用：端口只是把「取凭据」与「关通道」
+ * 绑成一个可替换的对象，不复制任何定位或解析逻辑。
+ */
+export function createCredentialsPort(
+  read: (instanceId: string) => Promise<SshCredentials>,
+  close: () => Promise<void>,
+): CredentialsPort {
+  return {
+    readCredentials: async (instanceId: string) => await read(instanceId),
+    close,
+  }
+}
+
 /** 点第 N 个复制图标，等钩子记下明文，读完立刻清空。 */
 async function copySecret(
   context: ConsoleRuntimeContext,

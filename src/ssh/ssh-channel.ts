@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
+import { createServer, type Socket } from 'node:net'
 import { Client, type ClientChannel, type ConnectConfig } from 'ssh2'
-import { ConfigError, DeploydeckError, SshError } from '../errors.js'
+import { ConfigError, DeploydeckError, SshError, TunnelLocalPortInUseError } from '../errors.js'
 import type {
   SshConnectRequest,
   SshSession,
@@ -109,7 +110,11 @@ function createSsh2Session(client: Client, getConnectionFailure: () => Error | u
   let closed = false
 
   return {
-    async exec(command: string, handlers: SshSessionExecHandlers): Promise<SshSessionExecOutcome> {
+    async exec(
+      command: string,
+      handlers: SshSessionExecHandlers,
+      env?: Readonly<Record<string, string>>,
+    ): Promise<SshSessionExecOutcome> {
       if (closed) {
         throw new SshError('SSH_CONNECT_FAILED', 'SSH 会话已关闭，不能执行命令。')
       }
@@ -117,6 +122,7 @@ function createSsh2Session(client: Client, getConnectionFailure: () => Error | u
       if (earlyFailure !== undefined) {
         throw mapSessionFailure(earlyFailure)
       }
+      const execOptions = env === undefined || Object.keys(env).length === 0 ? {} : { env }
 
       return await new Promise<SshSessionExecOutcome>((resolve, reject) => {
         let settled = false
@@ -128,7 +134,7 @@ function createSsh2Session(client: Client, getConnectionFailure: () => Error | u
           action()
         }
 
-        client.exec(command, (error: Error | undefined, channel: ClientChannel) => {
+        client.exec(command, execOptions, (error: Error | undefined, channel: ClientChannel) => {
           if (error !== undefined) {
             settle(() => {
               reject(mapSessionFailure(error))
@@ -438,4 +444,203 @@ function assertTerminalSize(size: TerminalSize): void {
       throw new ConfigError(`终端 ${name} 必须是正整数，收到 ${String(value)}。`)
     }
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* 本地端口转发                                                        */
+/* ------------------------------------------------------------------ */
+
+/** 一条已建立的本地端口转发。 */
+export interface ForwardedPort {
+  /** 本地监听端口。调用方给出的端口被占用时实现方会先失败，不会换成别的端口。 */
+  readonly localPort: number
+  /**
+   * 等转发结束。收到 `signal` 中止时 resolve；通道异常退出时 reject。
+   *
+   * 判据：不把「连接断开」当成功。转发断了，使用方就再也连不上远端，
+   * 静默保持一个断掉的监听比报错更糟。
+   */
+  wait(): Promise<void>
+  /** 关掉本地监听与所有转发连接。重复调用必须安全。 */
+  close(): Promise<void>
+}
+
+export interface ForwardRequest {
+  readonly instanceId: string
+  readonly host: string
+  readonly port: number
+  readonly user: string
+  readonly password: string
+  readonly timeoutMs: number
+  readonly verifyHostKey: (fingerprint: string) => Promise<void>
+  /** 本地监听地址与端口。端口被占用时立即失败。 */
+  readonly listenHost: string
+  readonly localPort: number
+  /** 远端目标。`127.0.0.1` 是远端实例自己的回环。 */
+  readonly remoteHost: string
+  readonly remotePort: number
+  /** 中止信号。中止后实现方负责关监听与全部连接。 */
+  readonly signal: AbortSignal
+}
+
+/**
+ * 建立本地端口转发。
+ *
+ * 判据：
+ * - 端口占用只能在 `listen` 失败时发现，所以 `EADDRINUSE` 必须显式翻译成
+ *   `TunnelLocalPortInUseError`，不能当成普通网络错误。
+ * - 主机密钥指纹在握手阶段校验，与 `exec`、`shell` 完全一致：转发同样把远端当成本地可信网络，
+ *   指纹不验就等于把自己的一半网络交给不确定的主机。
+ * - 连接失败不重试。端口转发是给人用的前台命令，失败就报错让人看。
+ */
+export async function forwardPortWithSsh2(request: ForwardRequest): Promise<ForwardedPort> {
+  const client = new Client()
+  let connectionFailure: Error | undefined
+  let verificationFailure: unknown
+  let closed = false
+  const sockets = new Set<Socket>()
+
+  client.on('error', (error: Error) => {
+    connectionFailure ??= error
+  })
+
+  const connectConfig: ConnectConfig = {
+    host: request.host,
+    port: request.port,
+    username: request.user,
+    password: request.password,
+    readyTimeout: request.timeoutMs,
+    hostVerifier: (hostPublicKey: Buffer, verify: (valid: boolean) => void) => {
+      const fingerprint = toOpenSshSha256Fingerprint(hostPublicKey)
+      request.verifyHostKey(fingerprint).then(
+        () => {
+          verify(true)
+        },
+        (error: unknown) => {
+          verificationFailure = error
+          verify(false)
+        },
+      )
+    },
+  }
+
+  const ready = new Promise<void>((resolve, reject) => {
+    client.once('ready', () => {
+      resolve()
+    })
+    client.once('error', (error: Error) => {
+      reject(mapConnectFailure(error, request, verificationFailure))
+    })
+    client.once('close', () => {
+      reject(new SshError('SSH_CONNECT_FAILED', `SSH 连接在认证完成前关闭：${formatTarget(request)}。`))
+    })
+    client.connect(connectConfig)
+  })
+  try {
+    await ready
+  } catch (error: unknown) {
+    client.end()
+    client.destroy()
+    throw error
+  }
+
+  const server = createServer((socket) => {
+    sockets.add(socket)
+    socket.once('close', () => {
+      sockets.delete(socket)
+    })
+    socket.once('error', () => {
+      socket.destroy()
+    })
+    client.forwardOut(
+      socket.remoteAddress ?? '127.0.0.1',
+      socket.remotePort ?? 0,
+      request.remoteHost,
+      request.remotePort,
+      (error: Error | undefined, stream?: ClientChannel) => {
+        if (error !== undefined || stream === undefined) {
+          socket.destroy()
+          return
+        }
+        socket.pipe(stream)
+        stream.pipe(socket)
+        stream.once('close', () => {
+          socket.destroy()
+        })
+        socket.once('close', () => {
+          stream.destroy()
+        })
+      },
+    )
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', (error: NodeJS.ErrnoException) => {
+      reject(
+        error.code === 'EADDRINUSE'
+          ? new TunnelLocalPortInUseError(
+              request.localPort,
+              `${request.remoteHost}:${String(request.remotePort)}`,
+            )
+          : error,
+      )
+    })
+    server.listen({ host: request.listenHost, port: request.localPort }, () => {
+      resolve()
+    })
+  }).catch((error: unknown) => {
+    client.end()
+    client.destroy()
+    throw error
+  })
+
+  const close = async (): Promise<void> => {
+    if (closed) {
+      return
+    }
+    closed = true
+    for (const socket of sockets) {
+      socket.destroy()
+    }
+    sockets.clear()
+    await new Promise<void>((resolve) => {
+      server.close(() => {
+        resolve()
+      })
+    })
+    client.end()
+    client.destroy()
+  }
+
+  const wait = async (): Promise<void> => {
+    if (request.signal.aborted) {
+      await close()
+      return
+    }
+    const abortPromise = new Promise<'aborted'>((resolve) => {
+      request.signal.addEventListener(
+        'abort',
+        () => {
+          resolve('aborted')
+        },
+        { once: true },
+      )
+    })
+    const channelClosePromise = new Promise<'channel-closed'>((resolve) => {
+      client.once('close', () => {
+        resolve('channel-closed')
+      })
+    })
+    const outcome = await Promise.race([abortPromise, channelClosePromise])
+    await close()
+    if (outcome === 'aborted') {
+      return
+    }
+    // 通道自己断了：这不是用户要求的退出，必须报错，不能静默当成功。
+    throw mapSessionFailure(
+      connectionFailure ?? new Error('本地端口转发所用 SSH 通道已关闭。'),
+    )
+  }
+
+  return { localPort: request.localPort, wait, close }
 }

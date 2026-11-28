@@ -184,13 +184,20 @@ deploydeck run --profile <profileId> [--create-plan] [--commit <sha>] [--run-id 
       "stdoutBytes": 0,
       "stderrBytes": 0,
       "logPath": "/home/.../runs/run-20261125-023500-1a2b/logs/power-on.log",
-      "screenshotPaths": []
+      "screenshotPaths": [],
+      "skipped": false
     }
   ]
 }
 ```
 
 走 `--profile --create-plan` 且当场新建计划时，多一个 `createdPlanId` 字段。
+
+步骤里的 `skipped: true` 表示这一步没有执行，因为它要达成的目标此前已经达成过。
+当前只有引导脚本（`bootstrap-script`）会这样：同一实例的引导成功跑过一次之后，重跑 `run` 会记一条跳过。
+跳过时 `exitCode` 是 `0`，`stderrTail` 写着跳过依据（引导记录写于何时），
+`startedAt` 与 `finishedAt` 都是真值且相差接近 0。
+要强制重跑引导，删掉状态目录里的 `bootstrap/<instanceId>.jsonc`。
 
 ### 2.5 `status`
 
@@ -230,7 +237,8 @@ deploydeck status [--json]
 }
 ```
 
-单价来自 `prices/<profileId>.jsonc` 的最近一次观测。没观测过时为 `null`。
+单价来自 `prices/<profileId>-<slot>.jsonc` 的最近一次观测，`slot` 是开机形态（`gpu` 或 `no-gpu`）：
+实例列表给出了实测形态时按实测形态取槽，否则取 `gpu` 槽。没观测过时为 `null`。
 
 `ledger.status` 区分「账本文件不存在」（`missing`）与「账本存在但为空」（`present` + `entryCount: 0`）。
 文件不存在时人读输出也明说，不冒充 0 行。
@@ -453,6 +461,12 @@ deploydeck status --json | jq '.plans[] | { planId, instanceId, spentYuan }'
 | 2 | 需要人工 | 配置非法、未登录、克隆超时、实例未确认消失、克隆配额耗尽、命令未实现、没有本地 tty、终端会话丢失退出码 |
 
 错误类自带 `exitCode`（`src/errors.ts`），CLI 只透传，不另建映射表。
+
+**远端退出码 78（`EX_CONFIG`）**：deploydeck 进程不会以 78 退出。
+它出现在 SSH 步骤记录的远端退出码里，含义是「声明的环境变量根本没送到远端进程」，
+来源是部署配置的 `env` / `bootstrapEnv`。出现它时不要去读脚本逻辑，先在本机设置这些变量。
+命令前缀用 `test -n "${VAR+x}" || exit 78` 自检：SSH 的 `env` 请求可能被服务端按 `AcceptEnv`
+白名单静默丢弃，数据面收不到失败信号，只能由命令自己判。
 
 ### 5.1 错误行格式
 

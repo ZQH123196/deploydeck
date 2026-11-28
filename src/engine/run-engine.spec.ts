@@ -23,6 +23,7 @@ import {
   CloneSourceMissingError,
   CloneTimeoutError,
   ConfigError,
+  ConsoleParseError,
   HealthCheckFailedError,
   HumanRequiredError,
   InstanceNotGoneError,
@@ -30,11 +31,16 @@ import {
   PinnedCommitRequiredError,
   ScriptFailedError,
   StateFileMissingError,
+  StrayInstanceError,
 } from '../errors.js'
 import type { Logger, LogLevel } from '../logging/logger.js'
 import { createPlanService, computeTimedShutdownAt, type PlanService } from '../plan/plan-service.js'
 import { createPlanStore, type PlanStore } from '../plan/plan-store.js'
-import { readObservedPrice, recordObservedPrice } from '../plan/price-cache.js'
+import {
+  readObservedPrice,
+  recordObservedPrice,
+  type PriceSlot,
+} from '../plan/price-cache.js'
 import type { Provider, ProviderCapabilities } from '../providers/provider.js'
 import type { SshExecOptions, SshExecResult } from '../ssh/ports.js'
 import { createLedgerStore, type LedgerStore } from '../state/ledger-store.js'
@@ -45,7 +51,7 @@ import type { Clock } from '../util/clock.js'
 import { beijingIso, formatBeijingMinute, parseBeijingDateTimeText } from '../util/time.js'
 import { createRunEngine, PRICE_DRIFT_THRESHOLD_RATIO, SSH_READY_TIMEOUT_MS, type RunEngine, type RunSummary } from './run-engine.js'
 import { createRunStore, RUNS_DIRECTORY, type RunStore } from './run-store.js'
-import { STEP_ID } from './steps.js'
+import { DATA_DISK_READY_TIMEOUT_SECONDS, STEP_ID } from './steps.js'
 
 /**
  * 工单 10 执行引擎的验收用例。
@@ -122,6 +128,8 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
     requirePinnedCommit: false,
     deployScript: 'scripts/deploy.sh',
     startScript: 'scripts/start.sh',
+    env: {},
+    bootstrapEnv: {},
     ...overrides,
   }
 }
@@ -132,6 +140,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     repository: { url: 'git@example.com:trans/app.git', branch: 'main' },
     workdir: '/root/trans_app',
     healthCheck: 'curl -fsS http://127.0.0.1:6006/health',
+    dataDiskPath: '/root/autodl-tmp',
     ...overrides,
   }
 }
@@ -348,7 +357,7 @@ class FakeProvider implements Provider {
     command: string,
     options: SshExecOptions,
   ): Promise<SshExecResult> {
-    this.record('exec', { instanceId, command, logPath: options.logPath })
+    this.record('exec', { instanceId, command, logPath: options.logPath, env: options.env })
     const stdout = this.behavior.stdoutFor?.(command) ?? ''
     const exitCode = this.behavior.exitCodeFor?.(command) ?? 0
     // 模拟真实 SSH 端口的行为：完整输出落盘，返回值只带尾部与字节数。
@@ -379,6 +388,8 @@ interface FixtureOptions {
   readonly commitSha?: string | null
   readonly behavior?: FakeProviderBehavior
   readonly seedUnitPriceYuanPerHour?: number
+  /** 种子单价写进哪个形态槽。缺省 `gpu`。 */
+  readonly seedPriceSlot?: PriceSlot
   readonly workdirLogRoot?: string
 }
 
@@ -428,7 +439,7 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
     ...(options.planBudgetCapYuan === undefined ? {} : { budgetCapYuan: options.planBudgetCapYuan }),
   })
   if (options.seedUnitPriceYuanPerHour !== undefined) {
-    await recordObservedPrice(store, profile.id, {
+    await recordObservedPrice(store, profile.id, options.seedPriceSlot ?? 'gpu', {
       unitPriceYuanPerHour: options.seedUnitPriceYuanPerHour,
       observedAt: START_ISO,
       gpuSpec: 'RTX 5090(32GB)',
@@ -520,7 +531,12 @@ describe('run：开机复用路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).sourceInstanceId).toBe(INSTANCE_ID)
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.startScript, STEP_ID.healthCheck])
+    // 部署配置 cloneDataDisk=true：克隆来的数据盘还要拷一会儿，等它稳定再跑启动脚本。
+    expect(sshStepIds(run)).toEqual([
+      STEP_ID.dataDiskReady,
+      STEP_ID.startScript,
+      STEP_ID.healthCheck,
+    ])
   })
 })
 
@@ -541,9 +557,31 @@ describe('run：克隆路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).sourceInstanceId).toBe(CLONE_SOURCE_ID)
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.startScript, STEP_ID.healthCheck])
+    expect(sshStepIds(run)).toEqual([
+      STEP_ID.dataDiskReady,
+      STEP_ID.startScript,
+      STEP_ID.healthCheck,
+    ])
     // 克隆产物要绑定到计划上：下一次执行靠 plan.instanceId 命中「已绑定实例」那条。
     expect((await fixture.readPlan()).instanceId).toBe(summary.instanceId)
+  })
+
+  it('cloneDataDisk=false 时不等数据盘就绪：没克隆的盘是空盘，不是还在拷', async () => {
+    // 判据：数据盘没跟着克隆时不会出现「盘在拷」这个状态，加这一步就是空等一个永远不就绪的盘。
+    const fixture = await createFixture({
+      profile: { cloneSourceInstanceName: 'trans-template', cloneDataDisk: false },
+      behavior: {
+        instances: [makeInstance({ instanceId: CLONE_SOURCE_ID, name: 'trans-template' })],
+      },
+    })
+
+    const summary = await fixture.run()
+
+    expect(summary.mode).toBe('clone')
+    const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
+    expect((cloneCall?.detail['request'] as CloneRequest).cloneDataDisk).toBe(false)
+    const run = await fixture.readRun(summary.runId)
+    expect(sshStepIds(run)).toEqual([STEP_ID.startScript, STEP_ID.healthCheck])
   })
 
   it('克隆源未关机时先关机再克隆', async () => {
@@ -617,6 +655,68 @@ describe('run：克隆路径', () => {
     const runFiles = await readRunRecords(runsDirectory)
     expect(runFiles).toHaveLength(1)
     expect(runFiles[0]?.state).toBe('stray')
+  })
+
+  it('克隆已受理但报错时接管实例：绑定到计划、落 stray，不丢实例 ID', async () => {
+    // Arrange：平台已创建实例并把它放进列表，随后抛 StrayInstanceError（缺口 8.1）。
+    const fixture = await createFixture({
+      profile: { cloneSourceInstanceName: 'trans-template' },
+      behavior: {
+        instances: [makeInstance({ instanceId: CLONE_SOURCE_ID, name: 'trans-template' })],
+        clone: async (request) => {
+          fixture.provider.snapshots = [
+            ...fixture.provider.snapshots,
+            // 被接管的实例带真实快照：规格要能进账本。
+            { ...makeInstance({ instanceId: 'stray-0001', name: '' }), gpuSpec: 'RTX 5090(32GB)' },
+          ]
+          throw new StrayInstanceError(new ConsoleParseError('新实例行读数解析失败'), {
+            instanceId: 'stray-0001',
+            snapshot: { ...makeInstance({ instanceId: 'stray-0001', name: '' }) },
+          })
+        },
+      },
+    })
+
+    // Act
+    const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
+
+    // Assert：实例 ID 不丢，计划绑上它，Run 记 stray，账本记这一笔。
+    expect(error).toBeInstanceOf(StrayInstanceError)
+    expect(error.message).toContain('stray-0001')
+    expect(error.message).toContain('已接管实例 stray-0001')
+    const plan = await fixture.readPlan()
+    expect(plan.instanceId).toBe('stray-0001')
+    expect(plan.state).toBe('escalated')
+    expect((await onlyRunRecord(fixture)).state).toBe('stray')
+    // 单价还没读到，账本不写：金额编不出来，交 teardown 封口。
+    await expect(fixture.ledger.readAll()).rejects.toBeInstanceOf(StateFileMissingError)
+    expect(fixture.provider.actions()).not.toContain('destroy')
+  })
+
+  it('没接管到实例但克隆已受理：Run 记 stray、计划 escalated，报错写明钱可能还在烧', async () => {
+    // 判据：`CLONE_RESULT_UNKNOWN` 但拿不到实例 ID（例如回读也读不到）时，
+    // 仍是「平台已扣配额、实例可能已建出来」，必须按 stray 收尾而不是 failed。
+    const fixture = await createFixture({
+      profile: { cloneSourceInstanceName: 'trans-template' },
+      behavior: {
+        instances: [makeInstance({ instanceId: CLONE_SOURCE_ID, name: 'trans-template' })],
+        clone: async () => {
+          throw new StrayInstanceError(new ConsoleParseError('读数解析失败且回读也没找到新实例'), {
+            instanceId: '',
+            snapshot: null,
+          })
+        },
+      },
+    })
+
+    const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
+
+    expect(error).toBeInstanceOf(StrayInstanceError)
+    const run = await onlyRunRecord(fixture)
+    expect(run.state).toBe('stray')
+    expect((await fixture.readPlan()).state).toBe('escalated')
+    expect(error.message).toContain('钱可能还在烧')
+    expect(fixture.provider.actions()).not.toContain('destroy')
   })
 
   it('克隆返回的实例在列表里读不到时记 stray 与 escalated：实例状态未知', async () => {
@@ -729,7 +829,7 @@ describe('run：前置校验零动作', () => {
 })
 
 describe('run：失败分叉', () => {
-  it('部署脚本失败且 keep-container：Run 为 stray，后续步骤不执行，已执行步骤都已落盘', async () => {
+  it('部署脚本失败时 Run 为 stray、计划 escalated，实例停机保留且不销毁', async () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
@@ -740,15 +840,40 @@ describe('run：失败分叉', () => {
     const error = await fixture.run().catch((caught: unknown) => caught)
 
     expect(error).toBeInstanceOf(ScriptFailedError)
-    expect((error as Error).message).toContain('keep-container')
+    // 判据：自动判定失败只停机，不销毁。销毁入口只剩 teardown。
     expect(fixture.provider.actions()).not.toContain('destroy')
+    expect(fixture.provider.actions()).toContain('powerOff')
+    expect(instanceStatusIn(fixture)).toBe('stopped')
     const run = await onlyRunRecord(fixture)
     expect(run.state).toBe('stray')
     expect(sshStepIds(run)).toEqual([STEP_ID.deployScript])
-    expect((await fixture.readPlan()).state).toBe('active')
+    expect((await fixture.readPlan()).state).toBe('escalated')
+    expect((await fixture.readPlan()).instanceId).toBe(INSTANCE_ID)
+    // 账本封口判据 = 实例不再运行，与「停机是否成功」无关：这里停机成功了，应当封口。
+    expect(await fixture.ledger.readAll()).toHaveLength(1)
   })
 
-  it('健康检查失败且 destroy-container：销毁实例并得到 failed', async () => {
+  it('停机失败时不封口账本：实例可能还在跑，等 teardown 按实际停机时刻封口', async () => {
+    // 判据：实例仍在运行时写账，后续继续烧的钱就进不了这一行。
+    const fixture = await createFixture({
+      behavior: {
+        instances: [makeInstance()],
+        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        powerOff: async () => {
+          throw new Error('控制台关机按钮没响应')
+        },
+      },
+    })
+
+    await fixture.run().catch(() => undefined)
+
+    await expect(fixture.ledger.readAll()).rejects.toBeInstanceOf(StateFileMissingError)
+    const run = await onlyRunRecord(fixture)
+    expect(run.state).toBe('stray')
+    expect((await fixture.readPlan()).state).toBe('escalated')
+  })
+
+  it('健康检查失败且 destroy-container：仍不销毁，只停机保留', async () => {
     const fixture = await createFixture({
       profile: { onDeployFailure: 'destroy-container' },
       behavior: {
@@ -760,28 +885,42 @@ describe('run：失败分叉', () => {
     const error = await fixture.run().catch((caught: unknown) => caught)
 
     expect(error).toBeInstanceOf(HealthCheckFailedError)
-    expect((error as Error).message).toContain('destroy-container')
-    expect(fixture.provider.actions()).toContain('destroy')
+    // 判据：onDeployFailure 不再引起自动销毁，实例留在列表里。
+    expect(fixture.provider.actions()).not.toContain('destroy')
+    expect(instanceStatusIn(fixture)).toBe('stopped')
     const run = await onlyRunRecord(fixture)
-    expect(run.state).toBe('failed')
+    expect(run.state).toBe('stray')
     expect(sshStepIds(run)).toEqual([
       STEP_ID.deployScript,
       STEP_ID.startScript,
       STEP_ID.healthCheck,
     ])
+    expect((error as Error).message).toContain('teardown')
   })
 
-  it('销毁返回 escalated 时抛 InstanceNotGoneError，计划 escalated，Run 为 stray', async () => {
+  it('停机失败也保留实例：原错误照旧抛，报错写明实例可能仍在运行与处置办法', async () => {
     const fixture = await createFixture({
-      profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('start.sh') ? 1 : 0),
-        destroy: async () => ({ state: 'escalated', reason: '释放后实例仍在列表里' }),
+        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        powerOff: async () => {
+          throw new Error('控制台关机按钮没响应')
+        },
       },
     })
 
-    await expect(fixture.run()).rejects.toBeInstanceOf(InstanceNotGoneError)
+    const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
+
+    // 判据：停机失败不改变分类，原错误照旧抛；处置办法与「实例仍在」写进同一条消息。
+    expect(error).toBeInstanceOf(ScriptFailedError)
+    expect(fixture.provider.actions()).not.toContain('destroy')
+    expect(instanceStatusIn(fixture)).not.toBe('stopped')
+    expect(error.message).toContain('停机失败（Error：控制台关机按钮没响应）')
+    expect(error.message).toContain('已保留且可能仍在运行计费')
+    // 文案不能说「已停机」：实例可能还在跑，这句会把人送错方向。
+    expect(error.message).not.toContain('已停机并保留')
+    expect(error.message).toContain('本次未写账本行')
+    expect(error.message).toContain('teardown')
     const run = await onlyRunRecord(fixture)
     expect(run.state).toBe('stray')
     expect((await fixture.readPlan()).state).toBe('escalated')
@@ -789,18 +928,22 @@ describe('run：失败分叉', () => {
 })
 
 describe('run：金钱止损', () => {
-  it('预算超限时销毁实例并抛 BudgetExceededError', async () => {
+  it('预算超限时停机保留并抛 BudgetExceededError，实例仍在列表里', async () => {
     const fixture = await createFixture({
       planBudgetCapYuan: 0.5,
       behavior: { instances: [makeInstance()] },
     })
 
     await expect(fixture.run()).rejects.toBeInstanceOf(BudgetExceededError)
-    expect(fixture.provider.actions()).toContain('destroy')
-    expect((await onlyRunRecord(fixture)).state).toBe('failed')
+    // 判据：预算超限只停机，不销毁。
+    expect(fixture.provider.actions()).not.toContain('destroy')
+    expect(fixture.provider.actions()).toContain('powerOff')
+    expect(instanceStatusIn(fixture)).toBe('stopped')
+    expect((await onlyRunRecord(fixture)).state).toBe('stray')
+    expect((await fixture.readPlan()).state).toBe('escalated')
   })
 
-  it('单价漂移超过阈值时销毁实例并抛 HumanRequiredError，缓存不被新价覆盖', async () => {
+  it('单价漂移超过阈值时停机保留并抛 HumanRequiredError，缓存不被新价覆盖', async () => {
     const fixture = await createFixture({
       seedUnitPriceYuanPerHour: 1,
       behavior: {
@@ -817,13 +960,14 @@ describe('run：金钱止损', () => {
     })
 
     await expect(fixture.run()).rejects.toBeInstanceOf(HumanRequiredError)
-    expect(fixture.provider.actions()).toContain('destroy')
-    expect((await onlyRunRecord(fixture)).state).toBe('failed')
-    const cached = await readObservedPrice(fixture.store, fixture.profile.id)
+    expect(fixture.provider.actions()).not.toContain('destroy')
+    expect(instanceStatusIn(fixture)).toBe('stopped')
+    expect((await onlyRunRecord(fixture)).state).toBe('stray')
+    const cached = await readObservedPrice(fixture.store, fixture.profile.id, 'gpu')
     expect(cached?.unitPriceYuanPerHour).toBe(1)
   })
 
-  it('余额不足以支撑预计花费时销毁实例并抛 BalanceInsufficientError', async () => {
+  it('余额不足以支撑预计花费时停机保留并抛 BalanceInsufficientError', async () => {
     const fixture = await createFixture({
       planBudgetCapYuan: 100,
       behavior: {
@@ -839,12 +983,106 @@ describe('run：金钱止损', () => {
     })
 
     await expect(fixture.run()).rejects.toBeInstanceOf(BalanceInsufficientError)
-    expect(fixture.provider.actions()).toContain('destroy')
+    expect(fixture.provider.actions()).not.toContain('destroy')
+    expect(fixture.provider.actions()).toContain('powerOff')
+    expect(instanceStatusIn(fixture)).toBe('stopped')
+  })
+})
+
+describe('run：单价缓存按开机形态分槽', () => {
+  it('无卡形态开机时读到有卡单价也不算漂移：两种形态各比各的槽', async () => {
+    // Arrange：上次有卡开机观测到 2.87 元/时，本次无卡开机报价 0.0973 元/时。
+    const fixture = await createFixture({
+      profile: { powerOnMode: 'no-gpu' },
+      seedUnitPriceYuanPerHour: 2.87,
+      seedPriceSlot: 'gpu',
+      behavior: {
+        instances: [makeInstance()],
+        readPriceQuote: async (_instanceId, ttlMinutes) => ({
+          serverTime: START_ISO,
+          unitPriceYuanPerHour: 0.0973,
+          estimatedCostYuan: 0.1,
+          ttlMinutes,
+          balanceYuan: 100,
+        }),
+      },
+    })
+
+    // Act
+    const summary = await fixture.run()
+
+    // Assert：无卡槽里还没有观测，不构成漂移；本次观测写进无卡槽，不动有卡槽。
+    expect(summary.state).toBe('succeeded')
+    const noGpuCached = await readObservedPrice(fixture.store, fixture.profile.id, 'no-gpu')
+    expect(noGpuCached?.unitPriceYuanPerHour).toBe(0.0973)
+    const gpuCached = await readObservedPrice(fixture.store, fixture.profile.id, 'gpu')
+    expect(gpuCached?.unitPriceYuanPerHour).toBe(2.87)
+  })
+
+  it('实例列表的实测形态优先：配置写 gpu 但实例标着无卡时按无卡槽比较', async () => {
+    // Arrange：有卡槽里是 2.87，无卡槽里是 0.0973；实例列表给出实测无卡形态。
+    const fixture = await createFixture({
+      seedUnitPriceYuanPerHour: 0.0973,
+      seedPriceSlot: 'no-gpu',
+      behavior: {
+        instances: [makeInstance({ noGpuMode: true })],
+        readPriceQuote: async (_instanceId, ttlMinutes) => ({
+          serverTime: START_ISO,
+          unitPriceYuanPerHour: 0.0973,
+          estimatedCostYuan: 0.1,
+          ttlMinutes,
+          balanceYuan: 100,
+        }),
+      },
+    })
+    await recordObservedPrice(fixture.store, fixture.profile.id, 'gpu', {
+      unitPriceYuanPerHour: 2.87,
+      observedAt: START_ISO,
+      gpuSpec: 'RTX 5090(32GB)',
+    })
+
+    // Act
+    const summary = await fixture.run()
+
+    // Assert
+    expect(summary.state).toBe('succeeded')
+  })
+
+  it('旧版缓存 prices/<profileId>.jsonc 按缺省形态迁移，不被当成无卡形态的对照', async () => {
+    // Arrange：旧文件里是有卡价 2.87。
+    const fixture = await createFixture({
+      profile: { powerOnMode: 'no-gpu' },
+      behavior: {
+        instances: [makeInstance()],
+        readPriceQuote: async (_instanceId, ttlMinutes) => ({
+          serverTime: START_ISO,
+          unitPriceYuanPerHour: 0.0973,
+          estimatedCostYuan: 0.1,
+          ttlMinutes,
+          balanceYuan: 100,
+        }),
+      },
+    })
+    await fixture.store.writeJson('prices/trans-dev.jsonc', {
+      unitPriceYuanPerHour: 2.87,
+      observedAt: START_ISO,
+      gpuSpec: 'RTX 5090(32GB)',
+    })
+
+    // Act
+    const summary = await fixture.run()
+
+    // Assert：旧文件只进有卡槽，无卡开机不拿有卡价做对照。
+    expect(summary.state).toBe('succeeded')
+    const gpuCached = await readObservedPrice(fixture.store, fixture.profile.id, 'gpu')
+    expect(gpuCached?.unitPriceYuanPerHour).toBe(2.87)
+    const noGpuCached = await readObservedPrice(fixture.store, fixture.profile.id, 'no-gpu')
+    expect(noGpuCached?.unitPriceYuanPerHour).toBe(0.0973)
   })
 })
 
 describe('run：定时关机与日志', () => {
-  it('读完单价才发现计划窗口不足时先销毁止损，Run 记 failed 并记账', async () => {
+  it('读完单价才发现计划窗口不足时停机保留，Run 记 stray 并记账', async () => {
     // 本机时钟与控制台服务器时间不一致：本机以为还剩 60 分钟，控制台已经只剩 4 分钟。
     const fixture = await createFixture({
       behavior: {
@@ -860,9 +1098,13 @@ describe('run：定时关机与日志', () => {
     })
 
     await expect(fixture.run()).rejects.toBeInstanceOf(PlanInvalidError)
-    expect(fixture.provider.actions()).toContain('destroy')
+    // 判据：只停机，不销毁。
+    expect(fixture.provider.actions()).not.toContain('destroy')
+    expect(fixture.provider.actions()).toContain('powerOff')
+    expect(instanceStatusIn(fixture)).toBe('stopped')
     expect(fixture.provider.actions()).not.toContain('setTimedShutdown')
-    expect((await onlyRunRecord(fixture)).state).toBe('failed')
+    expect((await onlyRunRecord(fixture)).state).toBe('stray')
+    expect((await fixture.readPlan()).state).toBe('escalated')
     expect(await fixture.ledger.readAll()).toHaveLength(1)
   })
 
@@ -931,9 +1173,8 @@ describe('run：定时关机与日志', () => {
     await expect(fixture.ledger.readAll()).rejects.toBeInstanceOf(StateFileMissingError)
   })
 
-  it('实例被销毁时写一行账本，金额按单价与停机时刻算', async () => {
+  it('失败停机保留时写一行账本，金额按单价与停机时刻算', async () => {
     const fixture = await createFixture({
-      profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
         exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
@@ -949,21 +1190,20 @@ describe('run：定时关机与日志', () => {
     expect(entries[0]?.gpuSpec).toBe('RTX 5090(32GB)')
   })
 
-  it('实例消失写账本后把金额记回计划 spentYuan，下一次预算复核能看到这笔钱', async () => {
+  it('失败停机保留后把金额记回计划 spentYuan，下一次预算复核能看到这笔钱', async () => {
     const fixture = await createFixture({
-      profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
         exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
       },
     })
-    // 让销毁时刻比取得实例晚 30 分钟：假时钟不前进时金额恒为 0，看不出投影有没有发生。
-    fixture.provider.destroy = async (instanceId) => {
+    // 让停机时刻比取得实例晚 30 分钟：假时钟不前进时金额恒为 0，看不出投影有没有发生。
+    // 生产语义上重复关一台已关机的实例是幂等操作，这里照同一语义覆盖停机行为。
+    fixture.provider.powerOff = async (instanceId) => {
       fixture.clock.advanceMinutes(30)
-      fixture.provider.snapshots = fixture.provider.snapshots.filter(
-        (snapshot) => snapshot.instanceId !== instanceId,
+      fixture.provider.snapshots = fixture.provider.snapshots.map((snapshot) =>
+        snapshot.instanceId === instanceId ? { ...snapshot, status: 'stopped' } : snapshot,
       )
-      return { state: 'gone' }
     }
 
     await fixture.run().catch(() => undefined)
@@ -1094,7 +1334,7 @@ describe('run：失败报错的现场信息', () => {
     expect(error.message).toContain('deploydeck teardown')
   })
 
-  it('destroy-container 的 failed 报错给出本机 run 目录', async () => {
+  it('destroy-container 也不再销毁：stray 报错给出本机 run 目录', async () => {
     const fixture = await createFixture({
       profile: { onDeployFailure: 'destroy-container' },
       behavior: {
@@ -1107,7 +1347,8 @@ describe('run：失败报错的现场信息', () => {
     const run = await onlyRunRecord(fixture)
 
     expect(error.message).toContain(run.logDir)
-    expect(run.state).toBe('failed')
+    expect(run.state).toBe('stray')
+    expect(fixture.provider.actions()).not.toContain('destroy')
   })
 
   it('取实例失败（克隆超时）的 stray 报错给出现场信息', async () => {
@@ -1298,6 +1539,11 @@ async function readRunRecords(runsDirectory: string): Promise<Run[]> {
   return records
 }
 
+/** 列表里该实例的当前状态。用例用它断言「实例仍在」。 */
+function instanceStatusIn(fixture: Fixture): string | undefined {
+  return fixture.provider.snapshots.find((snapshot) => snapshot.instanceId === INSTANCE_ID)?.status
+}
+
 async function onlyRunRecord(fixture: Fixture): Promise<Run> {
   const runsDirectory = await fixture.store.resolve(RUNS_DIRECTORY)
   const records = await readRunRecords(runsDirectory)
@@ -1308,3 +1554,271 @@ async function onlyRunRecord(fixture: Fixture): Promise<Run> {
   }
   return record
 }
+
+describe('run：环境变量注入', () => {
+  /** 一个绝不该出现在日志、执行记录或 JSON 输出里的取值。 */
+  const SECRET_VALUE = 'sk-live-do-not-leak-9f8e7d6c'
+
+  it('取值只经 provider.exec 的 options.env 下发，命令里只有变量名', async () => {
+    // Arrange：本机环境里有这个变量。
+    process.env['DEPLOYDECK_SPEC_TOKEN'] = SECRET_VALUE
+    try {
+      const fixture = await createFixture({
+        profile: { env: { DEPLOYDECK_SPEC_TOKEN: '说明文字' } },
+        behavior: { instances: [makeInstance()] },
+      })
+
+      // Act
+      const summary = await fixture.run()
+
+      // Assert：取值经 env 通道到了远端。
+      // 只有带 `envNames` 的步骤（部署脚本与启动脚本）才有 env；健康检查不声明变量，本就不带。
+      const execCalls = fixture.provider.calls.filter((call) => call.action === 'exec')
+      expect(execCalls.length).toBeGreaterThan(0)
+      const withEnv = execCalls.filter((call) => call.detail['env'] !== undefined)
+      expect(withEnv.length).toBeGreaterThan(0)
+      for (const call of withEnv) {
+        const env = call.detail['env'] as Record<string, string>
+        expect(env['DEPLOYDECK_SPEC_TOKEN']).toBe(SECRET_VALUE)
+      }
+      // 所有命令里都只有变量名，没有取值。
+      for (const call of execCalls) {
+        expect(String(call.detail['command'])).not.toContain(SECRET_VALUE)
+      }
+      void summary
+    } finally {
+      delete process.env['DEPLOYDECK_SPEC_TOKEN']
+    }
+  })
+
+  it('取值不出现在步骤日志文件、Run 记录与 --json 载荷里（三处）', async () => {
+    // Arrange
+    process.env['DEPLOYDECK_SPEC_TOKEN'] = SECRET_VALUE
+    try {
+      const fixture = await createFixture({
+        profile: { env: { DEPLOYDECK_SPEC_TOKEN: '说明文字' } },
+        behavior: { instances: [makeInstance()] },
+      })
+
+      // Act
+      const summary = await fixture.run()
+
+      // Assert 1：每个 SSH 步骤的日志文件里没有取值。
+      const run = await fixture.readRun(summary.runId)
+      const sshSteps = run.steps.filter((step) => step.kind === 'ssh')
+      expect(sshSteps.length).toBeGreaterThan(0)
+      for (const step of sshSteps) {
+        // 这份假 provider 把 stdout 写进日志文件；真实通道写的是完整命令输出。
+        // 无论哪种，取值都不允许出现。
+        const written = await readFile(step.logPath, 'utf8')
+        expect(written).not.toContain(SECRET_VALUE)
+        // 变量名在命令模板里，这是允许的；取值不允许。只有声明了 env 的步骤才带自检前缀。
+        if (step.stepId !== STEP_ID.healthCheck) {
+          expect(step.command).toContain('DEPLOYDECK_SPEC_TOKEN')
+        }
+      }
+
+      // Assert 2：Run 记录的 JSON 全文里没有取值。
+      const runsDirectory = await fixture.store.resolve(RUNS_DIRECTORY)
+      const recordText = await readFile(join(runsDirectory, `${summary.runId}.jsonc`), 'utf8')
+      expect(recordText).not.toContain(SECRET_VALUE)
+
+      // Assert 3：--json 载荷（RunSummary）序列化后没有取值。
+      expect(JSON.stringify(summary)).not.toContain(SECRET_VALUE)
+      for (const step of summary.steps) {
+        expect(step.command).not.toContain(SECRET_VALUE)
+        expect(step.stderrTail).not.toContain(SECRET_VALUE)
+        expect(step.stdoutTail).not.toContain(SECRET_VALUE)
+      }
+    } finally {
+      delete process.env['DEPLOYDECK_SPEC_TOKEN']
+    }
+  })
+
+  it('本机缺声明的变量时在发命令之前失败，不静默落空', async () => {
+    // Arrange：Profile 声明了一个本机没有的变量。
+    const fixture = await createFixture({
+      profile: { env: { DEPLOYDECK_SPEC_ABSENT_TOKEN: '说明' } },
+      behavior: { instances: [makeInstance()] },
+    })
+
+    // Act
+    const error = await fixture.run().catch((caught: unknown) => caught)
+
+    // Assert：一次 exec 都没发出去，错误里点名缺的是哪个变量。
+    expect(error).toBeInstanceOf(ConfigError)
+    expect((error as Error).message).toContain('DEPLOYDECK_SPEC_ABSENT_TOKEN')
+    const execCalls = fixture.provider.calls.filter((call) => call.action === 'exec')
+    expect(execCalls).toEqual([])
+  })
+})
+
+describe('run：一次性引导', () => {
+  it('首次执行真跑引导，并写下 bootstrap/<instanceId>.jsonc', async () => {
+    const fixture = await createFixture({
+      profile: { bootstrapScript: 'scripts/bootstrap.sh' },
+      behavior: { instances: [makeInstance()] },
+    })
+
+    const summary = await fixture.run()
+
+    const run = await fixture.readRun(summary.runId)
+    const bootstrapStep = run.steps.find((step) => step.stepId === STEP_ID.bootstrapScript)
+    expect(bootstrapStep?.skipped).toBe(false)
+    const recordPath = await fixture.store.resolve(`bootstrap/${INSTANCE_ID}.jsonc`)
+    const recordText = await readFile(recordPath, 'utf8')
+    expect(recordText).toContain(INSTANCE_ID)
+    expect(recordText).toContain('trans-dev')
+  })
+
+  it('引导记录已存在时不再执行脚本，执行记录里留一条跳过痕迹', async () => {
+    // Arrange：先跑一次，让引导记录落盘。
+    const fixture = await createFixture({
+      profile: { bootstrapScript: 'scripts/bootstrap.sh' },
+      behavior: { instances: [makeInstance()] },
+    })
+    await fixture.run()
+    const execCountAfterFirstRun = fixture.provider.calls.filter(
+      (call) => call.action === 'exec',
+    ).length
+
+    // Act：同一个 fixture 再跑一次（同一状态目录、同一实例）。
+    // 第二次要一份新的生效计划：第一次执行成功后计划仍是 active，可直接复用。
+    const second = await fixture.engine.run({
+      planId: fixture.plan.id,
+      profile: fixture.profile,
+      project: fixture.project,
+      commitSha: null,
+      runId: 'run-second-pass',
+    })
+
+    // Assert 1：引导脚本没有被再执行一次。
+    const secondRunExecCalls = fixture.provider.calls
+      .filter((call) => call.action === 'exec')
+      .slice(execCountAfterFirstRun)
+    expect(
+      secondRunExecCalls.some((call) => String(call.detail['command']).includes('bootstrap.sh')),
+    ).toBe(false)
+
+    // Assert 2：执行记录里有这一步，且标着跳过。
+    const run = await fixture.readRun(second.runId)
+    const bootstrapStep = run.steps.find((step) => step.stepId === STEP_ID.bootstrapScript)
+    expect(bootstrapStep).toBeDefined()
+    expect(bootstrapStep?.skipped).toBe(true)
+    // 「目标达成过」记 0，不是 null（null 会被当失败收尾）。
+    expect(bootstrapStep?.exitCode).toBe(0)
+    expect(bootstrapStep?.stderrTail).toContain('跳过')
+    // 时间字段是真值，且几乎同时。
+    expect(bootstrapStep?.startedAt.length).toBeGreaterThan(0)
+    expect(bootstrapStep?.finishedAt.length).toBeGreaterThan(0)
+    expect(
+      Math.abs(
+        Date.parse(bootstrapStep?.startedAt ?? '') - Date.parse(bootstrapStep?.finishedAt ?? ''),
+      ),
+    ).toBe(0)
+  })
+
+  it('引导失败时不写记录，实例仍留着，下次执行会重新跑引导', async () => {
+    const fixture = await createFixture({
+      profile: { bootstrapScript: 'scripts/bootstrap.sh' },
+      behavior: {
+        instances: [makeInstance()],
+        exitCodeFor: (command) => (command.includes('bootstrap.sh') ? 2 : 0),
+      },
+    })
+
+    // Act 1：第一次执行，引导失败。
+    const error = await fixture.run().catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(ScriptFailedError)
+
+    // Assert 1：记录没写。
+    const recordPath = await fixture.store.resolve(`bootstrap/${INSTANCE_ID}.jsonc`)
+    await expect(readFile(recordPath, 'utf8')).rejects.toThrow()
+    // 实例仍在：stray 收尾只停机不销毁。
+    expect(fixture.provider.actions()).not.toContain('destroy')
+    expect((await onlyRunRecord(fixture)).state).toBe('stray')
+
+    // Act 2：修好之后重跑，引导会再执行一次（记录没写，所以不会被判成已跑过）。
+    // 把 exec 换成「引导也成功」的版本：模拟人修好了原因。
+    fixture.provider.calls.length = 0
+    const failingExec = fixture.provider.exec.bind(fixture.provider)
+    fixture.provider.exec = async (execInstanceId, command, options) => {
+      if (!command.includes('bootstrap.sh')) {
+        return await failingExec(execInstanceId, command, options)
+      }
+      fixture.provider.calls.push({ action: 'exec', detail: { instanceId: execInstanceId, command } })
+      await writeFile(options.logPath, '', 'utf8')
+      return {
+        exitCode: 0,
+        stdoutTail: '',
+        stderrTail: '',
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        durationMs: 1,
+        timedOut: false,
+      }
+    }
+    // 第一次失败后计划已转 escalated，重跑要一份新计划：这是既有裁决，不是引导的逻辑。
+    const retryPlan = await fixture.planService.createPlan({
+      profile: fixture.profile,
+      provider: { id: fixture.provider.id, capabilities: fixture.provider.capabilities },
+    })
+    await fixture.engine
+      .run({
+        planId: retryPlan.id,
+        profile: fixture.profile,
+        project: fixture.project,
+        commitSha: null,
+        runId: 'run-retry',
+      })
+      .catch(() => undefined)
+
+    // Assert 2：引导脚本又被执行了一次。
+    const retriedExec = fixture.provider.calls.filter((call) => call.action === 'exec')
+    expect(
+      retriedExec.some((call) => String(call.detail['command']).includes('bootstrap.sh')),
+    ).toBe(true)
+  })
+})
+
+describe('run：数据盘就绪步骤', () => {
+  it('克隆路径执行数据盘就绪步骤，失败消息写明已读字节、等待时长与超时阈值', async () => {
+    // Arrange：克隆路径，数据盘采样以非 0 退出结束。
+    const fixture = await createFixture({
+      profile: { cloneSourceInstanceName: 'trans-template' },
+      behavior: {
+        instances: [makeInstance({ instanceId: CLONE_SOURCE_ID, name: 'trans-template' })],
+        exitCodeFor: (command) => (command.includes('df -B1') ? 1 : 0),
+        stdoutFor: (command) => (command.includes('df -B1') ? '1048576\n' : ''),
+      },
+    })
+
+    // Act
+    const error = (await fixture.run().catch((caught: unknown) => caught)) as ScriptFailedError
+
+    // Assert：三个量都在消息里。
+    expect(error).toBeInstanceOf(ScriptFailedError)
+    expect(error.message).toContain('数据盘未在')
+    expect(error.message).toContain('1048576')
+    expect(error.message).toContain(String(DATA_DISK_READY_TIMEOUT_SECONDS))
+    expect(error.message).toContain('连续两次采样不变')
+    expect(error.message).toContain('实例本身是好的')
+  })
+
+  it('数据盘步骤排在启动脚本之前执行', async () => {
+    const fixture = await createFixture({
+      profile: { cloneSourceInstanceName: 'trans-template' },
+      behavior: {
+        instances: [makeInstance({ instanceId: CLONE_SOURCE_ID, name: 'trans-template' })],
+      },
+    })
+
+    const summary = await fixture.run()
+
+    const sshSteps = summary.steps.filter((step) => step.kind === 'ssh').map((step) => step.stepId)
+    expect(sshSteps.indexOf(STEP_ID.dataDiskReady)).toBeGreaterThanOrEqual(0)
+    expect(sshSteps.indexOf(STEP_ID.dataDiskReady)).toBeLessThan(
+      sshSteps.indexOf(STEP_ID.startScript),
+    )
+  })
+})

@@ -1,7 +1,12 @@
 import type { Plan, PlanState } from '../../domain/plan.js'
 import type { ConsoleInstanceSnapshot } from '../../domain/instance.js'
 import { RUNS_DIRECTORY } from '../../engine/run-store.js'
-import { readObservedPrice } from '../../plan/price-cache.js'
+import {
+  DEFAULT_POWER_ON_MODE,
+  readObservedPrice,
+  resolvePriceSlot,
+  type PriceSlot,
+} from '../../plan/price-cache.js'
 import type { LedgerEntry } from '../../state/ledger.js'
 import type { LedgerSnapshot } from '../../state/ledger-store.js'
 import { beijingIso, minutesBetweenIso } from '../../util/time.js'
@@ -136,7 +141,14 @@ async function buildPlanView(
       ? undefined
       : snapshots.find((candidate) => candidate.instanceId === plan.instanceId)
   // 单价取该配置最近一次观测：控制台是唯一来源，没观测过就是未知。
-  const observation = await readObservedPrice(stores.stateStore, plan.profileId)
+  // 缓存按开机形态分槽，这里只为展示、不参与任何判定：实例列表给了实测形态就按实测形态取槽，
+  // 否则按缺省形态。传 DEFAULT_POWER_ON_MODE 进 resolvePriceSlot 是故意的：只借它的
+  // 「实测优先」分支，不读部署配置；规则以后变更时本命令自动跟上，不会两处漂移。
+  const priceSlot: PriceSlot =
+    snapshot?.noGpuMode === true || snapshot?.noGpuMode === false
+      ? resolvePriceSlot({ powerOnMode: DEFAULT_POWER_ON_MODE, instanceNoGpuMode: snapshot.noGpuMode })
+      : DEFAULT_POWER_ON_MODE
+  const observation = await readObservedPrice(stores.stateStore, plan.profileId, priceSlot)
   const remainingMinutes = Math.max(
     0,
     Math.floor(minutesBetweenIso(beijingIso(new Date(context.deps.clock.now())), plan.expiresAt)),

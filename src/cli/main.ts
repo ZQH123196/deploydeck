@@ -1,13 +1,16 @@
 #!/usr/bin/env node
+import { createServer } from 'node:net'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { Command, CommanderError } from 'commander'
 import {
+  ConfigError,
   DeploydeckError,
   EXIT_BUSINESS_FAILURE,
   EXIT_OK,
   NotImplementedError,
+  TunnelLocalPortInUseError,
   type ExitCode,
 } from '../errors.js'
 import { createRealCliDependencies, type CliDependencies } from './dependencies.js'
@@ -16,6 +19,13 @@ import type { CommandContext } from './commands/shared.js'
 import { runLoginCommandWithDependencies } from './commands/login.js'
 import { DEFAULT_LOGIN_TIMEOUT_SECONDS } from '../console/login.js'
 import { DEFAULT_TERM } from '../ssh/shell-channel.js'
+import type { PowerOnMode } from '../console/ports.js'
+import { TUNNEL_LISTEN_HOST } from './commands/tunnel.js'
+import type { PowerAction } from './commands/power.js'
+import { runPowerCommand } from './commands/power.js'
+import { runSwitchCommand } from './commands/switch.js'
+import { runCredsCommand } from './commands/creds.js'
+import { runTunnel } from './commands/tunnel.js'
 import { runPlanCreateCommand, runPlanShowCommand } from './commands/plan.js'
 import { runProfileListCommand } from './commands/profile-list.js'
 import { runRunCommand } from './commands/run.js'
@@ -224,6 +234,110 @@ function registerShellCommand(program: Command, deps: CliDependencies): void {
   )
 }
 
+/**
+ * `power`：开机或关机，输出动作结束后的控制台终态。
+ *
+ * action 只做参数解析与调用命令函数。装配、路径、knownHosts 都在 `dependencies.ts`。
+ */
+function registerPowerCommand(program: Command, deps: CliDependencies): void {
+  withJsonOption(
+    program
+      .command('power <instanceId>')
+      .description('开机或关机，并核实终态')
+      .option('--on', '开机')
+      .option('--off', '关机')
+      .option('--gpu', '以有卡形态开机')
+      .option('--no-gpu', '以无卡形态开机')
+      .option('--profile <id>', '目标形态取自这份部署配置'),
+  ).action(
+    async (
+      instanceId: string,
+      commandOptions: {
+        readonly on?: boolean
+        readonly off?: boolean
+        readonly gpu?: boolean
+        readonly noGpu?: boolean
+        readonly profile?: string
+      },
+      command: Command,
+    ) => {
+      await runPowerCommand(contextOf(deps, command), readPowerOptions(instanceId, commandOptions))
+    },
+  )
+}
+
+/**
+ * `switch`：把实例切到指定的开机形态（关机 → 开机 → 复验）。
+ *
+ * 不加确认：`switch` 的用途就是切换形态，多一次确认只是多一次按键。
+ */
+function registerSwitchCommand(program: Command, deps: CliDependencies): void {
+  withJsonOption(
+    program
+      .command('switch <instanceId>')
+      .description('把实例切到指定开机形态：关机 → 开机 → 复验')
+      .option('--gpu', '切到有卡形态')
+      .option('--no-gpu', '切到无卡形态'),
+  ).action(
+    async (
+      instanceId: string,
+      commandOptions: { readonly gpu?: boolean; readonly noGpu?: boolean },
+      command: Command,
+    ) => {
+      const targetMode = readTargetMode(commandOptions)
+      await runSwitchCommand(contextOf(deps, command), { instanceId, targetMode })
+    },
+  )
+}
+
+/** `creds`：读实例的 SSH 登录信息。密码只出现在 stdout。 */
+function registerCredsCommand(program: Command, deps: CliDependencies): void {
+  withJsonOption(
+    program
+      .command('creds <instanceId>')
+      .description('读取实例的 SSH 登录信息（主机、端口、用户、密码）'),
+  ).action(async (instanceId: string, _options: unknown, command: Command) => {
+    await runCredsCommand(contextOf(deps, command), { instanceId }, async ({ logDir }) => {
+      return await deps.openCredentials({ logDir })
+    })
+  })
+}
+
+/**
+ * `tunnel`：把实例的远端端口转发到本机回环。
+ *
+ * action 只做参数解析与调用命令函数。端口试绑与信号处理是本命令自己的运行期依赖，
+ * 在这里就地给出；SSH 与凭据装配走 `deps.openForward` / `deps.openCredentials`，
+ * 不在这里出现 `forwardPortWithSsh2`、`readSshCredentials`、`createKnownHosts`。
+ */
+function registerTunnelCommand(program: Command, deps: CliDependencies): void {
+  withJsonOption(
+    program
+      .command('tunnel <instanceId>')
+      .description('把实例的远端端口转发到本机回环，前台运行直到 Ctrl+C')
+      .requiredOption('--ports <local:remote>', '端口对，形如 6006:6006'),
+  ).action(
+    async (
+      instanceId: string,
+      commandOptions: { readonly ports: string },
+      command: Command,
+    ) => {
+      await runTunnel(
+        contextOf(deps, command),
+        { instanceId, portsSpec: commandOptions.ports },
+        {
+          assertLocalPortFree: async (localPort, remotePort) => {
+            await assertLoopbackPortFree(localPort, remotePort)
+          },
+          openCredentials: async ({ logDir }) => await deps.openCredentials({ logDir }),
+          openForward: async (request) => await deps.openForward(request),
+          onSignal: registerSignalHandler,
+        },
+      )
+    },
+  )
+}
+
 function registerLoginCommand(program: Command, deps: CliDependencies): void {
   withJsonOption(
     program
@@ -263,9 +377,120 @@ export function buildProgram(deps: CliDependencies): Command {
   registerPlanCommands(program, deps)
   registerRunCommands(program, deps)
   registerShellCommand(program, deps)
+  registerPowerCommand(program, deps)
+  registerSwitchCommand(program, deps)
+  registerCredsCommand(program, deps)
+  registerTunnelCommand(program, deps)
   registerLoginCommand(program, deps)
 
   return program
+}
+
+/**
+ * 把 `power` 的命令行选项收成命令接口。
+ *
+ * 判据：`--on` 与 `--off` 必选其一、且只能给一个。两者都给或都不给都是参数错误，
+ * 由 `ConfigError` 报出来，不在命令内部猜一个默认动作。
+ */
+function readPowerOptions(
+  instanceId: string,
+  options: {
+    readonly on?: boolean
+    readonly off?: boolean
+    readonly gpu?: boolean
+    readonly noGpu?: boolean
+    readonly profile?: string
+  },
+): {
+  readonly instanceId: string
+  readonly action: PowerAction
+  readonly profileId: string | null
+  readonly modeOverride: PowerOnMode | null
+} {
+  const hasOn = options.on === true
+  const hasOff = options.off === true
+  if (hasOn === hasOff) {
+    throw new ConfigError('必须且只能给出 --on 或 --off 其中之一。')
+  }
+  const modeOverride = readOptionalTargetMode(options)
+  return {
+    instanceId,
+    action: hasOn ? 'on' : 'off',
+    profileId: options.profile === undefined ? null : options.profile,
+    modeOverride,
+  }
+}
+
+/** 读出可选的形态覆盖。两个都给了是参数错误，不是后一个覆盖前一个。 */
+function readOptionalTargetMode(options: {
+  readonly gpu?: boolean
+  readonly noGpu?: boolean
+}): PowerOnMode | null {
+  const hasGpu = options.gpu === true
+  const hasNoGpu = options.noGpu === true
+  if (hasGpu && hasNoGpu) {
+    throw new ConfigError('--gpu 与 --no-gpu 只能给一个。')
+  }
+  if (hasGpu) {
+    return 'gpu'
+  }
+  return hasNoGpu ? 'no-gpu' : null
+}
+
+/** `switch` 的目标形态必选。不给即参数错误：切换必须有目标，不能猜。 */
+function readTargetMode(options: {
+  readonly gpu?: boolean
+  readonly noGpu?: boolean
+}): PowerOnMode {
+  const targetMode = readOptionalTargetMode(options)
+  if (targetMode === null) {
+    throw new ConfigError('必须给出 --gpu 或 --no-gpu 其中之一：切换需要明确的目标形态。')
+  }
+  return targetMode
+}
+
+/**
+ * 试绑本地回环端口。
+ *
+ * 判据：端口占用只能在 `listen` 失败时发现。这里用回环地址试绑，
+ * 与 `tunnel` 实际监听的地址一致：用 `0.0.0.0` 试绑会把「只有别的程序占着通配地址」
+ * 也判成冲突，反过来漏掉「只占着另一个网卡地址」的情况。
+ */
+async function assertLoopbackPortFree(localPort: number, remotePort: number): Promise<void> {
+  const server = createServer()
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', (error: NodeJS.ErrnoException) => {
+        if (error.code === 'EADDRINUSE') {
+          reject(new TunnelLocalPortInUseError(localPort, `远端端口 ${String(remotePort)}`))
+          return
+        }
+        reject(error)
+      })
+      server.listen({ host: TUNNEL_LISTEN_HOST, port: localPort }, () => {
+        resolve()
+      })
+    })
+  } finally {
+    await new Promise<void>((resolve) => {
+      server.close(() => {
+        resolve()
+      })
+    })
+  }
+}
+
+/** 注册信号监听。返回的 `dispose` 能安全地重复调用。 */
+function registerSignalHandler(signal: NodeJS.Signals, handler: () => void): () => void {
+  process.on(signal, handler)
+  let disposed = false
+  return () => {
+    if (disposed) {
+      return
+    }
+    disposed = true
+    process.off(signal, handler)
+  }
 }
 
 /** 退出码映射。命令抛出的错误自带 `exitCode`，这里只透传。 */

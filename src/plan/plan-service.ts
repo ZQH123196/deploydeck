@@ -1,9 +1,8 @@
-import type { PriceQuote, TeardownPort } from '../console/ports.js'
+import type { PowerPort, PriceQuote } from '../console/ports.js'
 import type { Plan, PlanState } from '../domain/plan.js'
 import type { Profile } from '../domain/profile.js'
 import {
   BudgetExceededError,
-  InstanceNotGoneError,
   PlanInvalidError,
   StateFileMissingError,
 } from '../errors.js'
@@ -154,7 +153,7 @@ export function computeTimedShutdownAt(plan: Plan): string {
 
 /** 预算复核的编排端口。执行引擎读到单价后调用一次。 */
 export interface BudgetEnforcement {
-  /** 读到单价后复核：超预算立即销毁实例并抛 `BudgetExceededError`（退出码 1）。 */
+  /** 读到单价后复核：超预算立即停机保留实例并抛 `BudgetExceededError`（退出码 1）。 */
   recheckAfterInstanceReady(input: {
     readonly planId: string
     readonly runId: string
@@ -165,7 +164,13 @@ export interface BudgetEnforcement {
 
 export interface BudgetEnforcementOptions {
   readonly plans: PlanStore
-  readonly teardown: TeardownPort
+  /**
+   * 超预算时的止损动作：停机。
+   *
+   * 判据（BUG 3.1）：自动判定失败不得销毁实例，销毁入口只有 `teardown` 命令。
+   * 这里收停机端口而不收销毁端口，端口形状本身就挡住了误用。
+   */
+  readonly power: PowerPort
 }
 
 /**
@@ -174,7 +179,7 @@ export interface BudgetEnforcementOptions {
  * 判据见 spec 第 9.2 节：开机或克隆成功后读单价，计算预计花费，超上限立即销毁。
  */
 export function createBudgetEnforcement(options: BudgetEnforcementOptions): BudgetEnforcement {
-  const { plans, teardown } = options
+  const { plans, power } = options
 
   return {
     recheckAfterInstanceReady: async (input) => {
@@ -194,21 +199,22 @@ export function createBudgetEnforcement(options: BudgetEnforcementOptions): Budg
         return
       }
 
-      // 预算超限是业务失败（退出码 1），但此刻实例已经就绪、钱正在烧。
-      // 所以顺序固定为：先销毁并确认消失，再抛预算错误。
-      // 销毁未确认（escalated）时抛 InstanceNotGoneError（退出码 2），因为人必须去控制台确认；
-      // 两件事不能混：先抛预算错误会把「实例可能还在计费」盖过去。
-      const outcome = await teardown.destroy(input.instanceId)
-      if (outcome.state === 'escalated') {
-        throw new InstanceNotGoneError(
-          `计划 ${input.planId} 超预算（已花费 ${plan.spentYuan} 元，本次预计 ${projectedCostYuan} 元，` +
-            `上限 ${plan.budgetCapYuan} 元），销毁实例 ${input.instanceId} 未确认消失：` +
-            `${outcome.reason}。执行 ${input.runId} 已停止，实例可能仍在计费，请人工确认。`,
-        )
+      // 预算超限是业务失败（退出码 1），此刻实例已经就绪、钱正在烧。
+      // 判据：先停机止损、确认停机完成，再抛预算错误；绝不销毁实例。
+      // 停机失败不盖掉预算错误：实例仍在计费这个事实挂进错误消息，交人工处理。
+      let powerOffFailure: string | null = null
+      try {
+        await power.powerOff(input.instanceId)
+      } catch (error: unknown) {
+        powerOffFailure = error instanceof Error ? error.message : String(error)
       }
       throw new BudgetExceededError(
         `计划 ${input.planId} 超预算：已花费 ${plan.spentYuan} 元，本次预计 ${projectedCostYuan} 元，` +
-          `上限 ${plan.budgetCapYuan} 元。已销毁实例 ${input.instanceId}（执行 ${input.runId}）。`,
+          `上限 ${plan.budgetCapYuan} 元（执行 ${input.runId}）。` +
+          (powerOffFailure === null
+            ? `已停机并保留实例 ${input.instanceId}。执行 deploydeck teardown ${input.planId} 销毁它。`
+            : `停机失败：${powerOffFailure}。实例 ${input.instanceId} 仍在计费，` +
+              `请立即到控制台确认并关机，或执行 deploydeck teardown ${input.planId}。`),
       )
     },
   }

@@ -1,6 +1,7 @@
 import { appendFile, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve as resolveAbsolutePath } from 'node:path'
-import type { PriceQuote, TeardownOutcome } from '../console/ports.js'
+import { resolveDeclaredEnv } from '../config/paths.js'
+import type { PowerOnMode, PriceQuote } from '../console/ports.js'
 import { computeLedgerAmount } from '../console/release.js'
 import type { ConsoleInstanceSnapshot } from '../domain/instance.js'
 import type { Plan } from '../domain/plan.js'
@@ -14,7 +15,6 @@ import {
   DeploydeckError,
   HealthCheckFailedError,
   HumanRequiredError,
-  InstanceNotGoneError,
   InstanceNotFoundError,
   isDeploydeckErrorWithCode,
   PlanInvalidError,
@@ -32,7 +32,12 @@ import {
   type PlanService,
 } from '../plan/plan-service.js'
 import type { PlanStore } from '../plan/plan-store.js'
-import { detectPriceDrift, readObservedPrice, recordObservedPrice } from '../plan/price-cache.js'
+import {
+  detectPriceDrift,
+  readObservedPrice,
+  recordObservedPrice,
+  resolvePriceSlot,
+} from '../plan/price-cache.js'
 import type { Provider } from '../providers/provider.js'
 import type { SshExecResult } from '../ssh/ports.js'
 import type { LedgerEntry } from '../state/ledger.js'
@@ -47,6 +52,12 @@ import {
   parseIso,
 } from '../util/time.js'
 import { decideAcquisition } from './acquisition.js'
+import {
+  readBootstrapState,
+  writeBootstrapRecord,
+  type BootstrapIdentity,
+  type BootstrapRecord,
+} from './bootstrap.js'
 import type { RunLayout, RunStore } from './run-store.js'
 import { stepLogFilePath } from './run-store.js'
 import { normalizeCommitSha, planDeploySteps, STEP_ID, type PlannedStep } from './steps.js'
@@ -106,7 +117,8 @@ const ENGINE_STEP_ID = {
   budgetRecheck: 'budget-recheck',
   balanceRecheck: 'balance-recheck',
   timedShutdown: 'timed-shutdown',
-  destroy: 'destroy',
+  /** 失败路径的停机保留。销毁不在这里：销毁入口只有 `teardown` 命令。 */
+  powerOffOnFailure: 'power-off-on-failure',
 } as const
 
 export interface RunEngineOptions {
@@ -172,8 +184,9 @@ interface AcquiredInstance {
 export function createRunEngine(options: RunEngineOptions): RunEngine {
   assertWorkdirLogRoot(options.workdirLogRoot)
   assertProviderLogDirConfig(options.workdirLogRoot, options.providerLogDir)
-  // 预算复核是执行引擎的一步，不走 Profile 分支：超预算就销毁，与失败策略无关。
-  const budget = createBudgetEnforcement({ plans: options.planStore, teardown: options.provider })
+  // 预算复核是执行引擎的一步，不走 Profile 分支：超预算就停机保留，与失败策略无关。
+  // 它收停机端口而不收销毁端口：销毁入口只有 `teardown` 命令一条（BUG 3.1）。
+  const budget = createBudgetEnforcement({ plans: options.planStore, power: options.provider })
 
   return {
     run: async (request) => await runOnce(options, budget, request),
@@ -265,8 +278,6 @@ async function runOnce(
   let gpuSpec = ''
   let acquiredAt = ''
   let unitPriceYuanPerHour: number | null = null
-  /** 实例已被销毁或已确认消失。此后不再对实例做任何动作。 */
-  let instanceDisposed = false
 
   async function updateRecord(patch: Partial<Run>): Promise<void> {
     tracker.record = { ...tracker.record, ...patch }
@@ -355,6 +366,7 @@ async function runOnce(
         stderrBytes: 0,
         logPath,
         screenshotPaths: [],
+        skipped: false,
       })
       logger.error('run.step.failed', {
         runId,
@@ -391,6 +403,7 @@ async function runOnce(
       stderrBytes: 0,
       logPath,
       screenshotPaths: [],
+      skipped: false,
     })
     logger.info('run.step.finish', {
       runId,
@@ -402,9 +415,21 @@ async function runOnce(
     return result
   }
 
-  /** 在实例里跑一条命令。日志文件由 SSH 通道写：完整输出落盘，Run 记录只留尾部与字节数。 */
+  /**
+   * 在实例里跑一条命令。日志文件由 SSH 通道写：完整输出落盘，Run 记录只留尾部与字节数。
+   *
+   * 环境变量的判据：`step.command` 是命令模板，`step.envNames` 是变量名。
+   * 取值在这里从本机解出，只经 `provider.exec` 的 `options.env` 下发。
+   * 值不得出现在 `command`、本步日志、Run 记录或 `--json` 输出里 —— 这三处都只认模板。
+   *
+   * 解值失败（本机没有声明的变量）在碰实例之前就抛 `ConfigError`：
+   * 让脚本跑到一半才缺变量，报出来的是与配置无关的错。
+   */
   async function runSshStep(step: PlannedStep): Promise<SshExecResult> {
     const logPath = stepLogFilePath(layout, step.stepId)
+    const envNames = step.envNames ?? []
+    // 本机缺变量即抛 ConfigError：命令还没发出去，实例上什么都没发生。
+    const env = resolveDeclaredEnv(declarationOf(envNames), `步骤 ${step.stepId} 声明的环境变量`)
     logger.info('run.step.start', {
       runId,
       planId: currentPlan.id,
@@ -413,6 +438,8 @@ async function runOnce(
       command: step.command,
       timeoutSeconds: step.timeoutSeconds,
       logPath,
+      // 只记名字，不记值。日志是给人读的，值不是排查依据。
+      envNames,
     })
     const startedStepAt = clockIso()
 
@@ -421,6 +448,7 @@ async function runOnce(
       result = await provider.exec(instanceId, step.command, {
         timeoutSeconds: step.timeoutSeconds,
         logPath,
+        ...(envNames.length === 0 ? {} : { env }),
       })
     } catch (error: unknown) {
       const finishedStepAt = clockIso()
@@ -455,6 +483,7 @@ async function runOnce(
         stderrBytes: 0,
         logPath,
         screenshotPaths: [],
+        skipped: false,
       })
       throw error
     }
@@ -473,6 +502,7 @@ async function runOnce(
       stderrBytes: result.stderrBytes,
       logPath,
       screenshotPaths: [],
+      skipped: false,
     })
     logger.info('run.step.finish', {
       runId,
@@ -489,132 +519,211 @@ async function runOnce(
   }
 
   /**
-   * 销毁实例并记录这一步。
-   *
-   * 销毁链自己失败时实例状态未知，按 ESCALATED 处理：不能假设它已经消失。
+   * 引导步骤的身份。判据来源在 `bootstrap.ts`：换了配置、项目或脚本，旧记录即失效。
    */
-  async function destroyInstance(): Promise<TeardownOutcome> {
+  function bootstrapIdentityOf(step: PlannedStep): BootstrapIdentity {
+    const script = profile.bootstrapScript
+    if (script === undefined) {
+      throw new ConfigError(`步骤 ${step.stepId} 存在但部署配置 ${profile.id} 没有 bootstrapScript。`)
+    }
+    return { instanceId, profileId: profile.id, projectId: project.id, script }
+  }
+
+  /**
+   * 跑引导脚本：只在实例首次就绪时真跑，已跑过就记一条跳过。
+   *
+   * 判据（工单 B3）：
+   * 1. 判定读 `bootstrap/<instanceId>.jsonc`，不在 `steps.ts` 里判 —— 那里是纯函数，
+   *    不做状态目录 IO。
+   * 2. 已跑过必须留痕迹，不能像没这一步。运维看到步骤列表少了引导步骤，会以为配置写错了。
+   *    跳过记 `skipped: true`、`exitCode: 0`：这一步的目标达成了，只是达成在更早的一次执行里。
+   *    不得记 `exitCode: null` —— 那不是跳过，是「没拿到退出码」，执行链会把它当失败收尾。
+   * 3. 跳过时 `startedAt` 与 `finishedAt` 照样填真值且几乎相同：Run 记录的时间字段没有空串。
+   * 4. 只有真正跑成功才写记录。失败或超时不写，所以重跑 `run` 会重新执行引导。
+   *    引导失败后实例不会消失（失败收尾统一落 `stray`，`destroy-container` 下也不再销毁），
+   *    人可以进容器看现场；现场日志留在本轮 `runs/<runId>/logs/bootstrap-script.log`。
+   */
+  async function runBootstrapStep(step: PlannedStep): Promise<SshExecResult> {
+    const identity = bootstrapIdentityOf(step)
+    const state = await readBootstrapState(runs.stateStore, identity)
+    if (state.kind === 'done') {
+      await recordSkippedStep(step, state)
+      return skippedExecResult()
+    }
+    const result = await runSshStep(step)
+    if (result.timedOut || result.exitCode !== 0) {
+      logger.error('run.bootstrap.failed', {
+        runId,
+        planId: currentPlan.id,
+        instanceId,
+        stepId: step.stepId,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        logPath: stepLogFilePath(layout, step.stepId),
+      })
+      return result
+    }
+    await writeBootstrapRecord(runs.stateStore, {
+      ...identity,
+      finishedAt: clockIso(),
+      exitCode: 0,
+    })
+    logger.info('run.bootstrap.done', {
+      runId,
+      planId: currentPlan.id,
+      instanceId,
+      stepId: step.stepId,
+    })
+    return result
+  }
+
+  /**
+   * 记一条「跳过」的步骤结果。
+   *
+   * `stderrTail` 写跳过的依据（记录写于何时），`stdoutTail` 留空：这一步没有执行输出。
+   */
+  async function recordSkippedStep(step: PlannedStep, state: { readonly record: BootstrapRecord }): Promise<void> {
+    const startedStepAt = clockIso()
+    const finishedStepAt = clockIso()
+    const logPath = stepLogFilePath(layout, step.stepId)
+    const reason =
+      `已跳过：引导记录 bootstrap/${instanceId}.jsonc 写于 ${state.record.finishedAt}，` +
+      '本实例的引导此前已成功跑过。要强制重跑，删掉该记录文件。'
+    await writeFile(
+      logPath,
+      `${jsonLine({ event: 'step.skipped', time: finishedStepAt, stepId: step.stepId, reason })}\n`,
+      'utf8',
+    )
+    await appendStep({
+      stepId: step.stepId,
+      kind: step.kind,
+      command: step.command,
+      exitCode: 0,
+      startedAt: startedStepAt,
+      finishedAt: finishedStepAt,
+      stdoutTail: '',
+      stderrTail: reason,
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      logPath,
+      screenshotPaths: [],
+      skipped: true,
+    })
+    logger.info('run.step.skipped', {
+      runId,
+      planId: currentPlan.id,
+      stepId: step.stepId,
+      reason,
+    })
+  }
+
+  /**
+   * 停机保留：把钱停住，不动实例本身。返回停机失败的原因，成功时返回 `null`。
+   *
+   * 判据：自动判定失败时不得销毁实例。销毁是破坏性且不可撤回的动作，
+   * 只允许由人显式执行 `teardown`。停机失败同样不销毁：实例留在列表里，交人工处理。
+   */
+  async function tryPowerOffForMoneySafety(context: string): Promise<string | null> {
     try {
-      return await runEngineStep<TeardownOutcome>({
-        stepId: ENGINE_STEP_ID.destroy,
+      await runEngineStep({
+        stepId: ENGINE_STEP_ID.powerOffOnFailure,
         kind: 'console',
-        command: `destroy(${instanceId})`,
-        action: () => provider.destroy(instanceId),
-        exitCodeOf: (outcome) => (outcome.state === 'gone' ? 0 : 1),
-        summaryOf: (outcome) =>
-          outcome.state === 'gone' ? { state: 'gone' } : { state: 'escalated', reason: outcome.reason },
+        command: `powerOff(${instanceId})`,
+        action: () => provider.powerOff(instanceId),
+        exitCodeOf: () => 0,
+        summaryOf: () => ({ instanceId }),
       })
     } catch (error: unknown) {
-      throw new InstanceNotGoneError(
-        `销毁实例 ${instanceId} 的链路失败：${describeError(error)}。` +
-          '实例状态未知，钱可能还在烧，请立即在控制台确认。',
-      )
+      logger.error('run.money-safety.power-off-failed', {
+        runId,
+        planId: currentPlan.id,
+        instanceId,
+        context,
+        error: describeError(error),
+      })
+      return describeError(error)
     }
+    logger.info('run.money-safety.power-off', { runId, planId: currentPlan.id, instanceId })
+    return null
   }
 
   /**
-   * 止损销毁：确认消失即把实例标记为已销毁。
+   * 失败收尾的最后一段文字：实例被怎么处置了、人下一步做什么。
    *
-   * 未确认消失（含销毁链自己失败）抛 `InstanceNotGoneError`：钱可能还在烧，
-   * 由失败收尾记 stray 并把计划转 escalated。
+   * 判据：报错必须同时写出「实例仍在」与「销毁入口只有 teardown」，
+   * 停机失败时还要写出实例可能没有停机。
    */
-  async function disposeForMoneySafety(context: string): Promise<void> {
-    const outcome = await destroyInstance()
-    if (outcome.state === 'escalated') {
-      throw new InstanceNotGoneError(
-        `${context} 销毁实例 ${instanceId} 未确认消失：${outcome.reason}。` +
-          '钱可能还在烧，请立即人工确认。',
-      )
-    }
-    instanceDisposed = true
-  }
-
-  /**
-   * 实例已到手但不能再继续（预算、余额、单价漂移、计划窗口不足）：先销毁止损，再抛原错误。
-   *
-   * 这与 `onDeployFailure` 无关。那条策略回答「部署失败后容器怎么办」，
-   * 而这些情况是「根本没有合法窗口继续跑」：留着容器就是无授权计费。
-   */
-  async function abortForMoneySafety(error: DeploydeckError): Promise<never> {
-    await disposeForMoneySafety(error.message)
-    // 现场信息由失败收尾统一追加一次，这里只补「已销毁」这个事实，避免重复。
-    throw withFailureOutcome(
-      error,
-      `已销毁实例 ${instanceId}（控制台中已不存在）。`,
+  function describePowerOffOutcome(powerOffFailure: string | null): string {
+    // 两个分支各说各话：停机成功才敢说「已停机」，停机失败必须说「可能还在跑」。
+    const verdict =
+      powerOffFailure === null
+        ? `实例 ${instanceId} 已停机并保留`
+        : `实例 ${instanceId} 停机失败（${powerOffFailure}），已保留且可能仍在运行计费`
+    return (
+      `${verdict}，Run 状态为 stray，计划 ${currentPlan.id} 转 escalated。` +
+      `停机不等于结算：执行 deploydeck teardown ${currentPlan.id} 销毁它并封口这笔账，` +
+      '或到控制台确认；实例留着时按计划过期时刻由 deploydeck guard 处理。' +
+      (powerOffFailure === null
+        ? ''
+        : '本次未写账本行：账要等 teardown 按实际停机时刻封口，现在封口会把之后烧的钱漏掉。')
     )
   }
 
   /**
-   * 失败收尾：决定容器留不留，落 Run 状态，必要时记账，然后把原错误抛出去。
+   * 实例已到手但不能再继续（预算、余额、单价漂移、计划窗口不足）：先停机，再抛原错误。
    *
-   * 分类判据（spec 第 10.5 节）：
-   * `stray` 是失败但容器仍在，需要人处理；`failed` 是容器已消失。
+   * 这与 `onDeployFailure` 无关。那条策略回答「部署失败后容器怎么办」，
+   * 而这些情况是「没有合法窗口继续跑」：继续运行就是无授权计费，但不销毁实例。
+   * 停机失败时改为抛 `HumanRequiredError`：实例状态未知，原错误不再是主要问题。
+   */
+  async function abortForMoneySafety(error: DeploydeckError): Promise<never> {
+    const powerOffFailure = await tryPowerOffForMoneySafety(error.message)
+    if (powerOffFailure !== null) {
+      throw new HumanRequiredError(
+        `${error.message}\n停机失败：${powerOffFailure}。` +
+          `实例 ${instanceId} 已保留且可能仍在计费。Run 状态为 stray，计划 ${currentPlan.id} 转 escalated。` +
+          `立即到控制台确认并关机，或执行 deploydeck teardown ${currentPlan.id} 销毁它。` +
+          instanceForensicsHint(),
+      )
+    }
+    throw withFailureOutcome(
+      error,
+      `实例 ${instanceId} 已停机并保留。执行 deploydeck teardown ${currentPlan.id} 销毁它并封口这笔账。`,
+    )
+  }
+
+  /**
+   * 失败收尾：先止损再落 Run 状态。
+   *
+   * 判据（BUG 3.1）：销毁实例的入口只有 `teardown` 命令一条。本函数在失败路径上
+   * 只停机、不销毁；失败记录状态一律 `stray`（容器仍在，需要人处理），计划转 escalated。
+   *
+   * 账本封口判据 = 实例不再运行，只有两个触发点：
+   * 1. 本函数停机成功：实例已关机，这一笔到此为止，写账本。
+   * 2. 停机失败：实例可能还在跑，不写账本，等 `teardown` 停机后按实际停机时刻封口。
+   *
+   * 预算超限是唯一例外：预算复核在抛错前自己停过机并写过账，这里不再写，否则同一笔记两行。
+   * 取实例之前的失败不经过这里，由调用方单独收尾。
    */
   async function finishWithFailure(error: unknown): Promise<never> {
-    // 分类只读显式 code 字段（AGENTS.md 代码规范 · 错误分类），不按类继承层级分叉。
-    // 已经确认消失的路径：预算复核自己会先销毁再抛错，金额止损也走这里。
-    if (instanceDisposed || isDeploydeckErrorWithCode(error, 'BUDGET_EXCEEDED')) {
-      await updateRecord({ state: 'failed', finishedAt: clockIso() })
+    // 停机是止损动作，不是收尾的前置条件：它失败时记下原因继续落状态。
+    const powerOffFailure = await tryPowerOffForMoneySafety(describeError(error))
+    await markStray(describeError(error))
+    // 账本封口 = 实例不再运行：停机成功才写，停机失败等 teardown。
+    if (powerOffFailure === null && !isDeploydeckErrorWithCode(error, 'BUDGET_EXCEEDED')) {
       await appendLedgerIfPossible()
-      logger.error('run.failed', {
-        runId,
-        planId: currentPlan.id,
-        instanceId,
-        state: 'failed',
-        error: describeError(error),
-      })
-      throw withFailureOutcome(error, localForensicsHint())
     }
-
-    // 实例可能仍在列表里：钱可能还在烧，计划转 escalated。
-    if (isDeploydeckErrorWithCode(error, 'INSTANCE_NOT_GONE')) {
-      await markStray(error.message)
-      throw withFailureOutcome(error, instanceForensicsHint())
-    }
-
-    if (profile.onDeployFailure === 'keep-container') {
-      await updateRecord({ state: 'stray', finishedAt: clockIso() })
-      logger.error('run.stray', {
+    if (profile.onDeployFailure === 'destroy-container') {
+      logger.warn('run.failure.destroy-container-skipped', {
         runId,
         planId: currentPlan.id,
         instanceId,
         strategy: profile.onDeployFailure,
-        error: describeError(error),
       })
-      throw withFailureOutcome(
-        error,
-        `按部署配置 ${profile.id} 的 onDeployFailure=keep-container 保留了实例 ${instanceId}，` +
-          `Run 状态为 stray。容器仍在计费：到计划过期时刻由 deploydeck guard 销毁` +
-          `（guard 需有人保持运行；Phase 3 才做系统级自启动），` +
-          `也可立即执行 deploydeck teardown ${currentPlan.id} 销毁它。` +
-          instanceForensicsHint(),
-      )
     }
-
-    // destroy-container：实例必须立刻消失。
-    const outcome = await destroyInstance()
-    if (outcome.state === 'escalated') {
-      await markStray(outcome.reason)
-      throw new InstanceNotGoneError(
-        `实例 ${instanceId} 在 ${describeError(error)} 之后销毁未确认消失：${outcome.reason}。` +
-          '钱可能还在烧，请立即人工确认。' + instanceForensicsHint(),
-      )
-    }
-    instanceDisposed = true
-    await updateRecord({ state: 'failed', finishedAt: clockIso() })
-    await appendLedgerIfPossible()
-    logger.error('run.failed', {
-      runId,
-      planId: currentPlan.id,
-      instanceId,
-      state: 'failed',
-      strategy: profile.onDeployFailure,
-      error: describeError(error),
-    })
     throw withFailureOutcome(
       error,
-      `按部署配置 ${profile.id} 的 onDeployFailure=destroy-container 已销毁实例 ${instanceId}` +
-        `（控制台中已不存在），Run 状态为 failed。${localForensicsHint()}`,
+      describePowerOffOutcome(powerOffFailure) + instanceForensicsHint(),
     )
   }
 
@@ -635,9 +744,10 @@ async function runOnce(
   }
 
   /**
-   * 实例消失时写一行账本，并把该行金额记回计划。
+   * 失败收尾时写一行账本，并把该行金额记回计划。
    *
    * 成功路径不写：实例仍在运行，账要等后续 teardown 或计划过期时才封口。
+   * 失败且已停机时写：这一笔的钱到这里就封口了，再留着实例也不该继续按运行时长记。
    * 单价未知时不写：账本只记已封口的金额，编一个数会让事后对账更乱。
    *
    * 记账后必须投影到 `plan.spentYuan`：同一份计划的下一次执行要能看到这次已经烧掉的钱，
@@ -836,10 +946,42 @@ async function runOnce(
     acquired = await acquireInstance()
   } catch (error: unknown) {
     // 还没拿到实例就失败：可能没有容器，也可能容器已经存在。
-    // 克隆超时：新实例可能已创建但未确认。
-    // 克隆成功后回列表读不到：实例存在但我们读不到它的规格，状态未知。
-    // 这两种都按「钱可能还在烧」处理，交人工。分类只读 code 字段。
-    const mayStillBeBilling = isDeploydeckErrorWithCode(error, 'CLONE_TIMEOUT', 'INSTANCE_NOT_FOUND')
+    // 分类只读 code 字段。判据（缺口 8.1）：克隆已受理却没走到确认，实例 ID 已知时
+    // 必须接管——绑定到计划、落 stray。账要等 teardown 才能封口：此刻还没读到单价，
+    // 写账本行就等于编一个金额。接管不了（ID 未知或读不到列表）才交人工核对。
+    const strayReason = strayInstanceReason(error)
+    if (strayReason !== null) {
+      instanceId = strayReason.instanceId
+      acquiredAt = clockIso()
+      await updateRecord({ instanceId, mode: 'clone', instanceAcquiredAt: acquiredAt })
+      await bindPlanInstance(instanceId)
+      await markStray(describeError(error))
+      logger.error('run.instance.taken-over', {
+        runId,
+        planId: currentPlan.id,
+        instanceId,
+        statusKnown: strayReason.snapshot !== null,
+        gpuSpec: strayReason.snapshot?.gpuSpec ?? null,
+      })
+      throw withFailureOutcome(
+        error,
+        `已接管实例 ${instanceId}：已绑定到计划 ${currentPlan.id}，Run 状态为 stray，计划转 escalated。` +
+          `实例状态未知且仍在计费：到控制台核对它，确认后执行 deploydeck teardown ${currentPlan.id} ` +
+          '停机并封口这一笔账。' +
+          instanceForensicsHint(),
+      )
+    }
+    // 钱可能还在烧的判据（按码逐条）：
+    // - `CLONE_RESULT_UNKNOWN`：克隆已受理但没能确认，无论有没有接管到实例 ID。没接管到 ID
+    //   恰恰是最需要人核对的情况：平台已扣配额，实例可能已经建出来了。
+    // - `CLONE_TIMEOUT`：等克隆完成超时，实例可能已经建出来。
+    // - `INSTANCE_NOT_FOUND`：克隆回执给了 ID 但列表读不到，实例可能存在但我们读不到。
+    const mayStillBeBilling = isDeploydeckErrorWithCode(
+      error,
+      'CLONE_RESULT_UNKNOWN',
+      'CLONE_TIMEOUT',
+      'INSTANCE_NOT_FOUND',
+    )
     if (mayStillBeBilling) {
       await updateRecord({ state: 'stray', finishedAt: clockIso() })
       if (currentPlan.state !== 'escalated') {
@@ -912,12 +1054,19 @@ async function runOnce(
 
     // ── 9. 单价漂移 ──
     // 先比较再写缓存：漂移时不能把新价写进缓存，否则「清掉缓存再重试」这个方法就失效了。
+    // 缓存按开机形态分槽：有无卡单价不同源，同一个槽比较必然被判成漂移。
+    const priceSlot = resolvePriceSlot({
+      powerOnMode: profile.powerOnMode,
+      instanceNoGpuMode: acquired.snapshot.noGpuMode,
+    })
     const drift = await runEngineStep({
       stepId: ENGINE_STEP_ID.priceDrift,
       kind: 'builtin',
-      command: `detectPriceDrift(prices/${profile.id}.jsonc, 阈值 ${String(PRICE_DRIFT_THRESHOLD_RATIO)})`,
+      command:
+        `detectPriceDrift(prices/${profile.id}-${priceSlot}.jsonc, ` +
+        `阈值 ${String(PRICE_DRIFT_THRESHOLD_RATIO)})`,
       action: async () => {
-        const cached = await readObservedPrice(runs.stateStore, profile.id)
+        const cached = await readObservedPrice(runs.stateStore, profile.id, priceSlot)
         if (cached === null) {
           return null
         }
@@ -943,9 +1092,9 @@ async function runOnce(
     await runEngineStep({
       stepId: ENGINE_STEP_ID.priceCache,
       kind: 'builtin',
-      command: `recordObservedPrice(prices/${profile.id}.jsonc)`,
+      command: `recordObservedPrice(prices/${profile.id}-${priceSlot}.jsonc)`,
       action: async () =>
-        await recordObservedPrice(runs.stateStore, profile.id, {
+        await recordObservedPrice(runs.stateStore, profile.id, priceSlot, {
           unitPriceYuanPerHour: quote.unitPriceYuanPerHour,
           observedAt: quote.serverTime,
           gpuSpec,
@@ -959,7 +1108,8 @@ async function runOnce(
     })
 
     // ── 10. 预算复核 ──
-    // 超预算时它自己先销毁实例再抛 BudgetExceededError（spec 第 9.2 节）。
+    // 超预算时它只抛 BudgetExceededError，不销毁实例（spec 第 9.2 节）；
+    // 停机保留由本函数的外层 catch 统一做。
     await runEngineStep({
       stepId: ENGINE_STEP_ID.budgetRecheck,
       kind: 'builtin',
@@ -1049,8 +1199,13 @@ async function runOnce(
     })
 
     // ── 13. 脚本与健康检查 ──
+    // 引导步骤单独走 `runBootstrapStep`：它要先判「跑过没有」，已跑过记一条跳过。
+    // 其余步骤（含数据盘就绪）原样执行：退出码已经表达一切，不加额外判据。
     for (const step of planDeploySteps({ mode: acquired.mode, profile, project, commitSha })) {
-      const result = await runSshStep(step)
+      const result =
+        step.stepId === STEP_ID.bootstrapScript
+          ? await runBootstrapStep(step)
+          : await runSshStep(step)
       if (result.timedOut || result.exitCode !== 0) {
         throw stepFailure(step, result)
       }
@@ -1079,16 +1234,8 @@ async function runOnce(
       steps: tracker.record.steps,
     }
   } catch (error: unknown) {
-    // 计划窗口不足是在读完单价后才发现（本机时钟与控制台服务器时间不一致时才会走到）：
-    // 先销毁止损，再按「实例已消失」收尾，否则会留下一台无授权计费的实例。
-    // 分类读 code 字段，不按类继承层级。
-    if (isDeploydeckErrorWithCode(error, 'PLAN_INVALID')) {
-      try {
-        await disposeForMoneySafety(error.message)
-      } catch (destroyError: unknown) {
-        return await finishWithFailure(destroyError)
-      }
-    }
+    // 走到这里时实例已经到手（取实例阶段的失败在上面单独处理过）。
+    // 判据：失败一律停机保留、不销毁，销毁只由 teardown 执行。
     return await finishWithFailure(error)
   }
 }
@@ -1132,6 +1279,39 @@ function assertCapabilitiesForDecision(
   }
 }
 
+/**
+ * 从错误里取出「克隆已创建但状态未知」的实例。
+ *
+ * 判据：只认显式 `instanceId` 字段（错误分类走字段、不走类继承层级）。
+ * 没有该字段时返回 `null`，由调用方按原分类收尾。
+ */
+function strayInstanceReason(
+  error: unknown,
+): { readonly instanceId: string; readonly snapshot: ConsoleInstanceSnapshot | null } | null {
+  if (!isDeploydeckErrorWithCode(error, 'CLONE_RESULT_UNKNOWN')) {
+    return null
+  }
+  const stray = error as { readonly instanceId?: unknown; readonly snapshot?: unknown }
+  if (typeof stray.instanceId !== 'string' || stray.instanceId.length === 0) {
+    return null
+  }
+  const snapshot = stray.snapshot ?? null
+  return {
+    instanceId: stray.instanceId,
+    snapshot: isConsoleInstanceSnapshot(snapshot) ? snapshot : null,
+  }
+}
+
+/** 读回来的实例快照是否带得出规格。规格是账本字段，拿不到就按「未知」记。 */
+function isConsoleInstanceSnapshot(value: unknown): value is ConsoleInstanceSnapshot {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { readonly gpuSpec?: unknown }).gpuSpec === 'string' &&
+    (value as { readonly gpuSpec: string }).gpuSpec.length > 0
+  )
+}
+
 /** 把步骤失败转成业务错误。健康检查失败与脚本失败分开，排障时一眼能看出卡在哪。 */
 function stepFailure(step: PlannedStep, result: SshExecResult): DeploydeckError {
   const outcome = result.timedOut
@@ -1141,9 +1321,52 @@ function stepFailure(step: PlannedStep, result: SshExecResult): DeploydeckError 
   const message =
     `步骤 ${step.stepId} 失败：${outcome}。命令：${step.command}。` +
     (detail.length > 0 ? `输出尾部：${detail}` : '没有输出。')
+  if (step.stepId === STEP_ID.dataDiskReady) {
+    // 数据盘超时不是「实例建没建出来」这种事实缺失：实例是清楚的，只是盘没拷完。
+    // 所以不另建错误码，但消息必须把这件事实直接写出来，让人知道该去看盘而不是看实例。
+    return new ScriptFailedError(`${summarizeDataDiskFailure(step, result)}。${detailOf(detail)}`)
+  }
   return step.stepId === STEP_ID.healthCheck
     ? new HealthCheckFailedError(message)
     : new ScriptFailedError(message)
+}
+
+/**
+ * 数据盘就绪失败的结论句。
+ *
+ * 判据：必须写出三个量 —— 最后读到的已用字节、等待时长、超时阈值。
+ * 只写「命令退出码非 0」的话，人分不清是盘没拷完、采样读不到、还是命令本身写错了。
+ *
+ * 采样循环最后一个动作会打印当时读到的字节数，所以 stdout 尾部就是「盘停在哪」。
+ */
+function summarizeDataDiskFailure(step: PlannedStep, result: SshExecResult): string {
+  const lastBytes = lastSampleOf(result.stdoutTail)
+  const readout = lastBytes === null ? '最后一次采样没有读到字节数' : `最后一次读到已用 ${lastBytes} 字节`
+  const waited = result.timedOut
+    ? `已等满 ${String(step.timeoutSeconds)} 秒上限`
+    : `未等满 ${String(step.timeoutSeconds)} 秒上限就退出`
+  return (
+    `数据盘未在 ${String(step.timeoutSeconds)} 秒内就绪（连续两次采样不变才算就绪）：` +
+    `${readout}，${waited}。实例本身是好的，盘还在拷或拷贝已卡住；` +
+    '可进容器用 df 核对数据盘占用，或稍后重跑。'
+  )
+}
+
+/** 采样循环最后打印的字节数。读不出返回 `null`，不编一个数。 */
+function lastSampleOf(stdoutTail: string): string | null {
+  const lines = stdoutTail.split('\n').map((line) => line.trim()).filter((line) => line.length > 0)
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index] ?? ''
+    if (/^\d+$/.test(line)) {
+      return line
+    }
+  }
+  return null
+}
+
+/** 输出尾部包成一句话。没有输出时给一句明确的「没有输出」。 */
+function detailOf(detail: string): string {
+  return detail.length > 0 ? `输出尾部：${detail}` : '没有输出。'
 }
 
 /** 错误消息里的输出尾部。完整输出在日志文件里，这里只留够定位的几行。 */
@@ -1179,6 +1402,38 @@ function describeError(error: unknown): string {
 
 function jsonLine(value: Record<string, unknown>): string {
   return JSON.stringify(value)
+}
+
+/**
+ * 把「变量名清单」转成 `resolveDeclaredEnv` 要的声明形状。
+ *
+ * 判据：步骤只知道名字，不知道用途说明。这里给一个占位说明，
+ * 因为 `resolveDeclaredEnv` 的错误消息只引用变量名，不引用说明文字。
+ */
+/**
+ * 标为跳过的步骤交给调用方看的执行结果。
+ *
+ * 判据：`exitCode` 必须是 0。调用方按 `timedOut || exitCode !== 0` 判失败，
+ * 跳过不是失败，目标已经在更早的一次执行里达成过。
+ */
+function skippedExecResult(): SshExecResult {
+  return {
+    exitCode: 0,
+    stdoutTail: '',
+    stderrTail: '',
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    durationMs: 0,
+    timedOut: false,
+  }
+}
+
+function declarationOf(envNames: readonly string[]): Record<string, string> {
+  const declaration: Record<string, string> = {}
+  for (const name of envNames) {
+    declaration[name] = name
+  }
+  return declaration
 }
 
 function assertWorkdirLogRoot(workdirLogRoot: string): void {

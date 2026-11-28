@@ -8,20 +8,22 @@ import type {
   OpenShellOptions,
   ShellSessionHandlers,
   ShellSessionOutcome,
+  SshExecOptions,
+  SshExecResult,
   SshShellPort,
 } from '../../ssh/ports.js'
 import type { CliDependencies, ShellSession } from '../dependencies.js'
-import { runShellCommand, type TerminalStreams } from './shell.js'
+import { runShellCommand, SHELL_COMMAND_TIMEOUT_SECONDS, type TerminalStreams } from './shell.js'
 import type { OutputStream } from '../output.js'
 
 /**
  * `shell` 命令的行为用例。
  *
- * 判据（docs/specs/deploydeck-phase3-shell.md 第 4 节）：
+ * 判据（docs/specs/deploydeck-phase3-shell.md 第 3.2 节与第 3.5 节）：
  * - 交互形态与 `--json` 互斥。
  * - 交互形态要求本地有 tty，没有即报错，不静默退化。
- * - 非交互形态在 PTY 里跑一条命令，拿退出码。
- * - 实例不在运行中由通道层拒绝，命令不吞错。
+ * - 非交互形态走数据面 `exec`：不开 PTY，按远端退出码返回，跑完即断开。
+ * - 拿不到远端退出码即失败，不当成成功。
  *
  * 全部 IO 是假的：不连浏览器、不连 SSH、不读真实键盘。
  */
@@ -44,9 +46,7 @@ function createStreams(options: {
 }): {
   readonly streams: TerminalStreams
   readonly stdoutText: () => string
-  readonly writtenToShell: string[]
 } {
-  const writtenToShell: string[] = []
   const stdoutParts: string[] = []
 
   const stdin = {
@@ -71,23 +71,36 @@ function createStreams(options: {
   return {
     streams: { stdin, stdout } as unknown as TerminalStreams,
     stdoutText: () => stdoutParts.join(''),
-    writtenToShell,
   }
 }
 
-interface FakeShellSetup {
-  readonly outcome: ShellSessionOutcome
-  readonly onWrite?: (data: Buffer) => void
+interface FakeExecSetup {
+  readonly exitCode: number | null
+  readonly stdoutTail?: string
+  readonly stderrTail?: string
+  readonly timedOut?: boolean
 }
 
-function createFakeDeps(setup: FakeShellSetup): {
+interface FakeDeps {
   readonly deps: CliDependencies
+  /** 每次 `openShell` 收到的参数。非交互形态不该出现新的 openShell 之外的通道。 */
   readonly opens: Array<{ logDir: string; term: string }>
-  readonly openShellArgs: Array<{ instanceId: string; options: OpenShellOptions }>
+  /** 每次 `shell.openShell` 的参数。非交互形态必须一次都不出现。 */
+  readonly ptyOpens: Array<{ instanceId: string; options: OpenShellOptions }>
+  /** 每次 `exec` 的参数。非交互形态必须恰好一次。 */
+  readonly execs: Array<{ instanceId: string; command: string; options: SshExecOptions }>
   readonly closed: { count: number }
-} {
+  readonly ptyWrites: string[]
+}
+
+function createFakeDeps(input: {
+  readonly outcome?: ShellSessionOutcome
+  readonly exec?: FakeExecSetup
+}): FakeDeps {
   const opens: Array<{ logDir: string; term: string }> = []
-  const openShellArgs: Array<{ instanceId: string; options: OpenShellOptions }> = []
+  const ptyOpens: Array<{ instanceId: string; options: OpenShellOptions }> = []
+  const execs: Array<{ instanceId: string; command: string; options: SshExecOptions }> = []
+  const ptyWrites: string[] = []
   const closed = { count: 0 }
 
   const shellPort: SshShellPort = {
@@ -96,20 +109,38 @@ function createFakeDeps(setup: FakeShellSetup): {
       handlers: ShellSessionHandlers,
       options: OpenShellOptions,
     ): Promise<InteractiveShellSession> {
-      openShellArgs.push({ instanceId, options })
-      const session: InteractiveShellSession = {
-        write: (data: Buffer) => setup.onWrite?.(data),
+      ptyOpens.push({ instanceId, options })
+      void handlers
+      return {
+        write: (data: Buffer) => ptyWrites.push(data.toString('utf8')),
         resize: () => undefined,
-        wait: async () => setup.outcome,
+        wait: async () => input.outcome ?? { exitCode: 0, transportFailure: null },
         close: async () => undefined,
       }
-      void handlers
-      return session
     },
   }
 
   const shellSession: ShellSession = {
     shell: shellPort,
+    exec: async (
+      instanceId: string,
+      command: string,
+      options: SshExecOptions,
+    ): Promise<SshExecResult> => {
+      execs.push({ instanceId, command, options })
+      const stdoutTail = input.exec?.stdoutTail ?? ''
+      const stderrTail = input.exec?.stderrTail ?? ''
+      return {
+        // 用属性存在性判断：`exitCode: null` 是「没拿到退出码」，不能被 `??` 换成 0。
+        exitCode: input.exec === undefined ? 0 : input.exec.exitCode,
+        stdoutTail,
+        stderrTail,
+        stdoutBytes: Buffer.byteLength(stdoutTail, 'utf8'),
+        stderrBytes: Buffer.byteLength(stderrTail, 'utf8'),
+        durationMs: 5,
+        timedOut: input.exec?.timedOut ?? false,
+      }
+    },
     close: async () => {
       closed.count += 1
     },
@@ -125,38 +156,12 @@ function createFakeDeps(setup: FakeShellSetup): {
     stderr: createOutput().stream,
   } as unknown as CliDependencies
 
-  return { deps, opens, openShellArgs, closed }
-}
-
-function createDepsReturningNullExit(): {
-  readonly deps: CliDependencies
-  readonly closed: { count: number }
-} {
-  const closed = { count: 0 }
-  const deps = {
-    stateDir: '/tmp/deploydeck-state',
-    openShell: async () => ({
-      shell: {
-        openShell: async (): Promise<InteractiveShellSession> => ({
-          write: () => undefined,
-          resize: () => undefined,
-          wait: async () => ({ exitCode: null, transportFailure: '连接中断' }),
-          close: async () => undefined,
-        }),
-      },
-      close: async () => {
-        closed.count += 1
-      },
-    }),
-    stdout: createOutput().stream,
-    stderr: createOutput().stream,
-  } as unknown as CliDependencies
-  return { deps, closed }
+  return { deps, opens, ptyOpens, execs, closed, ptyWrites }
 }
 
 describe('shell：交互形态的前置校验', () => {
   it('没有本地 tty 时抛 InteractiveTerminalRequiredError，不建立连接', async () => {
-    const fake = createFakeDeps({ outcome: { exitCode: 0, transportFailure: null } })
+    const fake = createFakeDeps({})
     const { streams } = createStreams({ stdinIsTty: false })
     let opened = false
     const deps = {
@@ -175,7 +180,7 @@ describe('shell：交互形态的前置校验', () => {
   })
 
   it('交互形态与 --json 互斥，抛 ShellFailedError', async () => {
-    const fake = createFakeDeps({ outcome: { exitCode: 0, transportFailure: null } })
+    const fake = createFakeDeps({})
     const { streams } = createStreams({ stdinIsTty: true, columns: 100, rows: 30 })
 
     await expect(
@@ -186,35 +191,93 @@ describe('shell：交互形态的前置校验', () => {
   })
 })
 
-describe('shell：非交互形态', () => {
-  it('在 PTY 里写入命令并返回远端退出码，关闭通道', async () => {
-    const written: string[] = []
-    const fake = createFakeDeps({
-      outcome: { exitCode: 0, transportFailure: null },
-      onWrite: (data) => written.push(data.toString('utf8')),
-    })
-    const { streams } = createStreams({ stdinIsTty: false })
-    const stdout = createOutput()
+describe('shell：交互形态', () => {
+  it('把本地终端的行列数交给 PTY 通道，不是写死的 80x24', async () => {
+    const fake = createFakeDeps({})
+    const { streams } = createStreams({ stdinIsTty: true, columns: 132, rows: 43 })
 
     await runShellCommand(
-      { deps: { ...fake.deps, stdout: stdout.stream } as unknown as CliDependencies, json: true },
+      { deps: fake.deps, json: false },
+      { instanceId: INSTANCE_ID, command: null, term: 'xterm' },
+      streams,
+    )
+
+    expect(fake.ptyOpens[0]?.options.size).toEqual({ columns: 132, rows: 43 })
+    expect(fake.execs).toEqual([])
+  })
+
+  it('没有 tty 尺寸时回落到 80x24', async () => {
+    const fake = createFakeDeps({})
+    const { streams } = createStreams({ stdinIsTty: true })
+
+    await runShellCommand(
+      { deps: fake.deps, json: false },
+      { instanceId: INSTANCE_ID, command: null, term: 'xterm' },
+      streams,
+    )
+
+    expect(fake.ptyOpens[0]?.options.size).toEqual({ columns: 80, rows: 24 })
+  })
+
+  it('会话没给退出码时抛错，不当成成功，并关闭通道', async () => {
+    const fake = createFakeDeps({
+      outcome: { exitCode: null, transportFailure: '连接中断' },
+    })
+    const { streams } = createStreams({ stdinIsTty: true })
+
+    await expect(
+      runShellCommand(
+        { deps: fake.deps, json: false },
+        { instanceId: INSTANCE_ID, command: null, term: 'xterm' },
+        streams,
+      ),
+    ).rejects.toThrow(/连接中断/)
+
+    expect(fake.closed.count).toBe(1)
+  })
+})
+
+describe('shell：非交互形态走 exec', () => {
+  it('命令交给 SshPort.exec，不开 PTY，带独立超时与落盘路径', async () => {
+    // Arrange
+    const fake = createFakeDeps({ exec: { exitCode: 0, stdoutTail: 'Linux host 6.8\n' } })
+    const { streams } = createStreams({ stdinIsTty: false })
+
+    // Act
+    await runShellCommand(
+      { deps: fake.deps, json: false },
       { instanceId: INSTANCE_ID, command: 'uname -a', term: 'xterm-256color' },
       streams,
     )
 
-    // 命令写进远端 shell 时带换行：没有换行远端不会执行。
-    expect(written.join('')).toBe('uname -a\n')
-    expect(fake.openShellArgs).toHaveLength(1)
-    expect(fake.openShellArgs[0]?.instanceId).toBe(INSTANCE_ID)
+    // Assert：只有一次 exec，命令原样交给数据面；PTY 一次都没开。
+    expect(fake.ptyOpens).toEqual([])
+    expect(fake.execs).toHaveLength(1)
+    expect(fake.execs[0]?.instanceId).toBe(INSTANCE_ID)
+    expect(fake.execs[0]?.command).toBe('uname -a')
+    expect(fake.execs[0]?.options.timeoutSeconds).toBe(SHELL_COMMAND_TIMEOUT_SECONDS)
+    expect(fake.execs[0]?.options.logPath).toContain('shell')
+    expect(fake.execs[0]?.options.logPath).toContain(INSTANCE_ID)
+    // 跑完即断开：通道被关，且只关一次。
     expect(fake.closed.count).toBe(1)
-
-    const payload = JSON.parse(stdout.text()) as Record<string, unknown>
-    expect(payload['exitCode']).toBe(0)
-    expect(payload['command']).toBe('uname -a')
   })
 
-  it('远端命令退出码非 0 时抛 ShellFailedError，并带上退出码', async () => {
-    const fake = createFakeDeps({ outcome: { exitCode: 127, transportFailure: null } })
+  it('人读模式下把远端输出尾部写进本地终端', async () => {
+    const fake = createFakeDeps({ exec: { exitCode: 0, stdoutTail: 'total 12\n' } })
+    const { streams, stdoutText } = createStreams({ stdinIsTty: false })
+
+    await runShellCommand(
+      { deps: fake.deps, json: false },
+      { instanceId: INSTANCE_ID, command: 'ls -l', term: 'xterm' },
+      streams,
+    )
+
+    expect(stdoutText()).toContain('total 12')
+    expect(fake.ptyWrites).toEqual([])
+  })
+
+  it('远端退出码非 0 时抛 ShellFailedError，并带上退出码', async () => {
+    const fake = createFakeDeps({ exec: { exitCode: 127, stderrTail: 'nope: command not found' } })
     const { streams } = createStreams({ stdinIsTty: false })
 
     await expect(
@@ -224,86 +287,75 @@ describe('shell：非交互形态', () => {
         streams,
       ),
     ).rejects.toThrow(/127/)
+
+    expect(fake.closed.count).toBe(1)
   })
 
-  it('会话没给退出码时抛错，不当成成功', async () => {
-    const fake = createDepsReturningNullExit()
+  it('超时被杀（退出码 null）时抛 ShellFailedError，不当成成功', async () => {
+    const fake = createFakeDeps({ exec: { exitCode: null, timedOut: true } })
+    const { streams } = createStreams({ stdinIsTty: false })
+
+    const error = await runShellCommand(
+      { deps: fake.deps, json: false },
+      { instanceId: INSTANCE_ID, command: 'sleep 10000', term: 'xterm' },
+      streams,
+    ).catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ShellFailedError)
+    expect((error as Error).message).toContain(String(SHELL_COMMAND_TIMEOUT_SECONDS))
+    expect(fake.closed.count).toBe(1)
+  })
+
+  it('会话断开没给退出码时抛错，不当成 0', async () => {
+    const fake = createFakeDeps({ exec: { exitCode: null, timedOut: false } })
     const { streams } = createStreams({ stdinIsTty: false })
 
     await expect(
       runShellCommand(
         { deps: fake.deps, json: false },
-        { instanceId: INSTANCE_ID, command: 'sleep 100', term: 'xterm' },
+        { instanceId: INSTANCE_ID, command: 'true', term: 'xterm' },
         streams,
       ),
-    ).rejects.toThrow(/连接中断/)
-
-    expect(fake.closed.count).toBe(1)
+    ).rejects.toBeInstanceOf(ShellFailedError)
   })
 })
 
-describe('shell：终端尺寸', () => {
-  it('把本地终端的行列数交给通道，不是写死的 80x24', async () => {
-    const fake = createFakeDeps({ outcome: { exitCode: 0, transportFailure: null } })
-    const { streams } = createStreams({ stdinIsTty: false, columns: 132, rows: 43 })
-
-    await runShellCommand(
-      { deps: fake.deps, json: false },
-      { instanceId: INSTANCE_ID, command: 'true', term: 'xterm' },
-      streams,
-    )
-
-    expect(fake.openShellArgs[0]?.options.size).toEqual({ columns: 132, rows: 43 })
-  })
-
-  it('没有 tty 尺寸时回落到 80x24', async () => {
-    const fake = createFakeDeps({ outcome: { exitCode: 0, transportFailure: null } })
-    const { streams } = createStreams({ stdinIsTty: false })
-
-    await runShellCommand(
-      { deps: fake.deps, json: false },
-      { instanceId: INSTANCE_ID, command: 'true', term: 'xterm' },
-      streams,
-    )
-
-    expect(fake.openShellArgs[0]?.options.size).toEqual({ columns: 80, rows: 24 })
-  })
-})
-
-describe('shell：输出边界', () => {
-  it('--json 模式下 stdout 只有一个 JSON 对象', async () => {
-    const fake = createFakeDeps({ outcome: { exitCode: 0, transportFailure: null } })
+describe('shell：--json 输出', () => {
+  it('--json 的 stdout 只有一个 JSON 对象，字段形状不变', async () => {
+    const fake = createFakeDeps({ exec: { exitCode: 0, stdoutTail: 'ignored\n' } })
     const { streams } = createStreams({ stdinIsTty: false })
     const stdout = createOutput()
 
     await runShellCommand(
       { deps: { ...fake.deps, stdout: stdout.stream } as unknown as CliDependencies, json: true },
-      { instanceId: INSTANCE_ID, command: 'true', term: 'xterm' },
+      { instanceId: INSTANCE_ID, command: 'uname -a', term: 'xterm' },
       streams,
     )
 
     const lines = stdout.text().split('\n').filter((line) => line.length > 0)
     expect(lines).toHaveLength(1)
-    expect(() => JSON.parse(lines[0] ?? '')).not.toThrow()
+    const payload = JSON.parse(lines[0] ?? '') as Record<string, unknown>
+    expect(payload).toEqual({
+      instanceId: INSTANCE_ID,
+      command: 'uname -a',
+      exitCode: 0,
+      transportFailure: null,
+    })
   })
 
-  it('人读模式下远端字节写进真实终端，不写进 stdout 抽象', async () => {
-    const written: string[] = []
-    const fake = createFakeDeps({
-      outcome: { exitCode: 0, transportFailure: null },
-      onWrite: (data) => written.push(data.toString('utf8')),
-    })
+  it('--json 下远端非 0 退出码照常打出对象，退出码由 ShellFailedError 裁决', async () => {
+    const fake = createFakeDeps({ exec: { exitCode: 3 } })
     const { streams } = createStreams({ stdinIsTty: false })
     const stdout = createOutput()
 
-    await runShellCommand(
-      { deps: { ...fake.deps, stdout: stdout.stream } as unknown as CliDependencies, json: false },
-      { instanceId: INSTANCE_ID, command: 'echo hi', term: 'xterm' },
+    const error = await runShellCommand(
+      { deps: { ...fake.deps, stdout: stdout.stream } as unknown as CliDependencies, json: true },
+      { instanceId: INSTANCE_ID, command: 'false', term: 'xterm' },
       streams,
-    )
+    ).catch((caught: unknown) => caught)
 
-    // 命令是写给远端的；stdout 抽象里不该出现它。
-    expect(written.join('')).toBe('echo hi\n')
-    expect(stdout.text()).toBe('')
+    expect(error).toBeInstanceOf(ShellFailedError)
+    const payload = JSON.parse(stdout.text()) as Record<string, unknown>
+    expect(payload['exitCode']).toBe(3)
   })
 })

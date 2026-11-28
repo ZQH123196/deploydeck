@@ -357,7 +357,7 @@ deploydeck teardown <planId>
 2. 未确认消失时计划转 `ESCALATED`，退出码 2，不自动重试。此时钱可能还在烧，必须人工去控制台确认。
 3. 同一实例生命周期只写一行账本。重复执行 `teardown` 不重复记账。
 
-### 5.5 兜底守护
+### 5.5 计划层守护
 
 ```bash
 DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard
@@ -379,7 +379,12 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard
 
 1. 浏览器连不上时降级为告警，进程不退出，已有实例不受影响。
 2. `guard` 的退出码不因 `escalated` 或降级而改变。
-3. Phase 2 不做系统级自启动。要常驻，得人自己把它挂在终端或自管的进程里。
+3. `guard` 只处理计划。它不扫描实例列表，也不关机任何不在计划里的实例。
+4. 系统级自启动属后续阶段。要常驻，得人自己把它挂在终端或自管的进程里。
+
+不做第三层兜底：`guard` 不扫描「运行中但没有生效计划」的实例。
+这类实例会一直计费，必须人工处理。判据与后果见 `docs/plan-and-budget.md` 第 5.2 节。
+处理入口是 `deploydeck power <instanceId> off`。
 
 ## 6. 进容器：交互式终端
 
@@ -523,6 +528,7 @@ deploydeck status --json
 | `CONFIG_INVALID` | 2 | 配置目录里的文件非法 |
 | `CLONE_QUOTA_EXHAUSTED` | 2 | 当日克隆次数用尽 |
 | `CLONE_TIMEOUT` | 2 | 克隆超时 |
+| `CLONE_RESULT_UNKNOWN` | 2 | 克隆已创建实例，但没能确认（读数失败、跳转失败、改名失败等）。配额已扣，实例状态未知。拿得到实例 ID 时执行引擎会把它绑到计划上并转 escalated；拿不到时按「钱可能还在烧」转 escalated，需人工到控制台核对 |
 | `INSTANCE_NOT_GONE` | 2 | 实例未确认消失。钱可能还在烧 |
 | `BROWSER_CHANNEL_FAILED` / `CHROME_LAUNCH_FAILED` | 1 / 2 | 浏览器通道不可用 / 专用 Chrome 起不来 |
 | `NOT_IMPLEMENTED` | 2 | 命令未实现 |
@@ -568,7 +574,7 @@ deploydeck teardown "$plan_id" --json
 ```text
 <状态目录>/
 ├── plans/<planId>.jsonc          计划
-├── prices/<profileId>.jsonc      单价缓存
+├── prices/<profileId>-<slot>.jsonc  单价缓存（slot = gpu | no-gpu）
 ├── runs/<runId>.jsonc            执行记录：步骤、命令、退出码、耗时
 ├── runs/<runId>/logs/<stepId>.log 每一步的完整命令输出
 ├── ledger.jsonl                  账本，只追加

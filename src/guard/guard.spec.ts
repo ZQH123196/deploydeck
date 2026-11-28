@@ -90,6 +90,8 @@ function makeProfile(): Profile {
     requirePinnedCommit: false,
     deployScript: 'scripts/deploy.sh',
     startScript: 'scripts/start.sh',
+    env: {},
+    bootstrapEnv: {},
   }
 }
 

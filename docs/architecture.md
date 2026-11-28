@@ -19,7 +19,7 @@ flowchart TB
 
   subgraph CORE["L1-L4 内核"]
     ENG["L4 执行引擎<br/>步骤编排 / 失败语义 / 终态验证"]
-    PLN["L3 计划与预算<br/>有效期 / 熔断 / 三重关机"]
+    PLN["L3 计划与预算<br/>有效期 / 熔断 / 两重关机"]
     PRV["L2 provider<br/>创建 / 执行 / 销毁"]
     DOM["L1 领域模型<br/>Profile / Project / Plan / Run"]
   end

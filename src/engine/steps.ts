@@ -1,8 +1,8 @@
 import { dirname } from 'node:path'
-import type { Profile } from '../domain/profile.js'
+import { isEnvVarName, type Profile } from '../domain/profile.js'
 import type { Project } from '../domain/project.js'
 import type { RunMode, StepKind } from '../domain/run.js'
-import { ConfigError } from '../errors.js'
+import { ConfigError, REMOTE_ENV_NOT_INJECTED_EXIT_CODE } from '../errors.js'
 
 /**
  * 部署步骤的生成规则（纯函数，不碰时钟、不发请求）。
@@ -20,8 +20,21 @@ import { ConfigError } from '../errors.js'
 export interface PlannedStep {
   readonly stepId: string
   readonly kind: StepKind
+  /**
+   * 写进执行记录与日志的命令文本。
+   *
+   * 判据：它**只含命令模板，不含环境变量的值**。需要注入环境变量的步骤把值放在 `envNames` 里，
+   * 由执行层从本机读出后经数据面单独下发。命令文本会被写进 Run 记录、逐字进日志、
+   * 在失败消息里回显，值写进来就再也收不回去。
+   */
   readonly command: string
   readonly timeoutSeconds: number
+  /**
+   * 本步要注入的环境变量名。取值由执行层从本机环境读出，只进远端进程环境。
+   *
+   * 判据：这里只有名字，没有值。没有注入需求的步骤不写这个字段。
+   */
+  readonly envNames?: readonly string[]
 }
 
 /**
@@ -57,6 +70,36 @@ export const HEALTH_CHECK_TIMEOUT_SECONDS = 120
 export const SYNC_COMMIT_TIMEOUT_SECONDS = DEPLOY_SCRIPT_TIMEOUT_SECONDS
 
 /**
+ * 一次性引导脚本的超时，秒。
+ *
+ * 判据：一次完整安装加模型下载以小时计。实测把装环境与下载模型塞进 `startScript`
+ * 会被 600 秒上限截断，所以它单独占一步、单独给上限。
+ * 取值下限 7200 秒（2 小时）；再长的安装应当改为预置镜像，而不是继续调大它。
+ */
+export const BOOTSTRAP_TIMEOUT_SECONDS = 7200
+
+/**
+ * 克隆出来的实例等数据盘就绪的上限，秒。
+ *
+ * 实测（2026-11-25）：状态离开「克隆锁定中」时数据盘占用仍在推进（3.38% → 36.27% → 55.84%），
+ * 拷贝还要约 6 分钟。取与克隆创建同量级的上限。
+ */
+export const DATA_DISK_READY_TIMEOUT_SECONDS = 900
+
+/**
+ * 两次数据盘采样之间的等待，秒。
+ *
+ * 判据：判据是「连续两次采样不变」，采样间隔必须大于控制台占用数字的刷新粒度，
+ * 否则同一份未刷新的数字会被读两次，把还在拷贝的盘判成就绪。
+ */
+export const DATA_DISK_SAMPLE_INTERVAL_SECONDS = 30
+
+/**
+ * 连续多少次采样相同才算稳定。固定为 2：判据就是「连续两次不变」。
+ */
+export const DATA_DISK_STABLE_SAMPLE_COUNT = 2
+
+/**
  * 步骤 id。
  *
  * 落盘的文件名与 Run 记录里的 `stepId` 都是它，必须稳定：改它等于让历史 Run 的日志路径失配。
@@ -64,10 +107,56 @@ export const SYNC_COMMIT_TIMEOUT_SECONDS = DEPLOY_SCRIPT_TIMEOUT_SECONDS
  */
 export const STEP_ID = {
   syncCommit: 'sync-commit',
+  bootstrapScript: 'bootstrap-script',
+  dataDiskReady: 'data-disk-ready',
   deployScript: 'deploy-script',
   startScript: 'start-script',
   healthCheck: 'health-check',
 } as const
+
+/**
+ * 数据盘就绪判据的采样命令。
+ *
+ * 判据取数据盘已用字节数。用 `df -B1` 取字节而不是 `df -h` 的百分比：百分比是四舍五入后的整数，
+ * 拷最后一段时可能连续多次读到同一个整数，「连续两次不变」会在没拷完时就成立。
+ * 字节数以 4 KiB 块为单位变化，拷贝只要还在写盘就会推动它。
+ *
+ * `-x tmpfs -x devtmpfs` 排除内存文件系统。数字读不出时命令以非 0 退出，
+ * 由执行层判本步失败：读不到不等于拷完。
+ */
+export function buildDataDiskUsageCommand(devicePath: string): string {
+  const target = quote(assertShellSafePath(devicePath, '数据盘路径'))
+  return (
+    `df -B1 -x tmpfs -x devtmpfs --output=used ${target} 2>/dev/null | tail -n +2 | ` +
+    "awk '{ sum += $1 } END { if (NR == 0) exit 1; print sum }'"
+  )
+}
+
+/**
+ * 数据盘就绪的一步：连续两次采样相同才算拷完。
+ *
+ * 为什么放在步骤层而不是克隆动作里：控制面只说「实例可用了」，数据面自己判断盘好了没有。
+ * 克隆动作拿不到 SSH，也不该为这件事去拿数据面。
+ *
+ * 采样循环在远端一条命令里完成，本地只读一次退出码：断线重连不会让计数从头开始。
+ */
+export function buildDataDiskReadyStep(input: { readonly devicePath: string }): PlannedStep {
+  const sample = buildDataDiskUsageCommand(input.devicePath)
+  const required = String(DATA_DISK_STABLE_SAMPLE_COUNT)
+  const command =
+    `prev=""; stable=0; while [ "$stable" -lt ${required} ]; do ` +
+    `cur=$(${sample}) || exit 1; ` +
+    'if [ -n "$prev" ] && [ "$cur" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi; ' +
+    `prev="$cur"; ` +
+    `if [ "$stable" -lt ${required} ]; then sleep ${String(DATA_DISK_SAMPLE_INTERVAL_SECONDS)}; fi; ` +
+    'done'
+  return {
+    stepId: STEP_ID.dataDiskReady,
+    kind: 'ssh',
+    command,
+    timeoutSeconds: DATA_DISK_READY_TIMEOUT_SECONDS,
+  }
+}
 
 /**
  * commit sha 的合法形状：4-40 位十六进制。
@@ -113,6 +202,13 @@ export function normalizeCommitSha(value: string | null): string | null {
  * 判据：`clone` 只跑启动脚本；`reuse` 先跑部署脚本再跑启动脚本；最后一步是健康检查。
  * 给了 commit 时 `sync-commit` 永远是第一步：代码版本必须先定下来，再执行任何脚本。
  *
+ * 前置步骤的顺序（同一份判据下逐条）：
+ * 1. 有引导脚本时，`bootstrap-script` 排在 `startScript` 之前：启动脚本会读引导装好的
+ *    环境与模型。它只管「跑不跑」，跑没跑过由执行层按引导记录判定。
+ * 2. `clone` 路径上，`data-disk-ready` 排在 `startScript` 之前：控制台状态说实例可用时
+ *    数据盘拷完是另一件事实，启动脚本要读盘上的东西。
+ * 3. 前置步骤都在 `sync-commit` 之后：先定代码版本，再动环境。
+ *
  * 路径与 commit 在生成期校验：命令里用双引号包着，含双引号或换行的取值无法安全执行，直接拒绝。
  */
 export function planDeploySteps(input: {
@@ -141,11 +237,39 @@ export function planDeploySteps(input: {
     throw new ConfigError('项目清单的 healthCheck 不能为空。')
   }
 
+  const preStartSteps: PlannedStep[] = []
+  // 引导步骤的两条判据：
+  // 1. 跑不跑由引导记录决定（`src/engine/bootstrap.ts`）。已跑过时执行层仍要在这步留一条
+  //    「跳过」记录：步骤列表里少了这一步，运维会以为配置写错了。
+  // 2. 引导失败后实例不会消失。执行引擎把「实例到手后的失败」统一落 `stray`，
+  //    `destroy-container` 策略下也不再销毁，人可以进容器看现场；记录没写，
+  //    修好后重跑 `run` 会重新执行引导，现场日志留在上一轮的 `runs/<runId>/logs/` 下。
+  if (profile.bootstrapScript !== undefined) {
+    const bootstrapScript = assertShellSafePath(
+      profile.bootstrapScript,
+      `部署配置 ${profile.id} 的 bootstrapScript`,
+    )
+    preStartSteps.push({
+      stepId: STEP_ID.bootstrapScript,
+      kind: 'ssh',
+      command: scriptCommandWithEnvCheck(workdir, bootstrapScript, Object.keys(profile.bootstrapEnv)),
+      timeoutSeconds: BOOTSTRAP_TIMEOUT_SECONDS,
+      envNames: Object.keys(profile.bootstrapEnv),
+    })
+  }
+  // 门控判据：只有数据盘跟着克隆时才有「盘还在拷」这个状态。
+  // `cloneDataDisk === false` 时实例上不存在这个状态，这一步会空等一个永远不会准备好的盘。
+  // 目录总是存在，没克隆时只是空的：「空盘」与「盘在拷」是两个状态。
+  if (mode === 'clone' && profile.cloneDataDisk) {
+    preStartSteps.push(buildDataDiskReadyStep({ devicePath: project.dataDiskPath }))
+  }
+
   const startStep: PlannedStep = {
     stepId: STEP_ID.startScript,
     kind: 'ssh',
-    command: scriptCommand(workdir, startScript),
+    command: scriptCommandWithEnvCheck(workdir, startScript, Object.keys(profile.env)),
     timeoutSeconds: START_SCRIPT_TIMEOUT_SECONDS,
+    envNames: Object.keys(profile.env),
   }
   const healthCheckStep: PlannedStep = {
     stepId: STEP_ID.healthCheck,
@@ -157,14 +281,16 @@ export function planDeploySteps(input: {
   const commitSha = input.commitSha ?? null
   const steps: PlannedStep[] =
     mode === 'clone'
-      ? [startStep, healthCheckStep]
+      ? [...preStartSteps, startStep, healthCheckStep]
       : [
           {
             stepId: STEP_ID.deployScript,
             kind: 'ssh',
-            command: scriptCommand(workdir, deployScript),
+            command: scriptCommandWithEnvCheck(workdir, deployScript, Object.keys(profile.env)),
             timeoutSeconds: DEPLOY_SCRIPT_TIMEOUT_SECONDS,
+            envNames: Object.keys(profile.env),
           },
+          ...preStartSteps,
           startStep,
           healthCheckStep,
         ]
@@ -209,6 +335,85 @@ function buildSyncCommitStep(input: {
     command,
     timeoutSeconds: SYNC_COMMIT_TIMEOUT_SECONDS,
   }
+}
+
+/**
+ * 环境变量没注入时的远端退出码。
+ *
+ * 单一来源在 `src/errors.ts`：那里写了判据与「它不是 deploydeck 进程退出码」这条边界。
+ */
+const ENV_NOT_INJECTED_EXIT_CODE = REMOTE_ENV_NOT_INJECTED_EXIT_CODE
+
+/**
+ * 脚本命令：在项目目录里用 bash 跑仓库内的脚本。
+ *
+ * 带环境变量时在开头插一句自检。原因见 `SshExecOptions.env` 的注释：
+ * SSH 的 `env` 请求在服务端被静默丢弃时，数据面拿不到任何失败信号，
+ * 唯一可靠的判据是「命令自己能不能读到这些变量」。
+ *
+ * 判据：空值等于没注入。`test -n "${VAR+x}"` 判的是「变量是否被设置」，
+ * 所以 `VAR=`（设置了但值为空）能通过它；再叠一层 `-n` 才是本仓要的语义。
+ * 空值与没设置按同一种失败处理：脚本读到空串后报的错（通常是认证失败）
+ * 与配置无关，人查不到根因。
+ *
+ * 变量名已经过 `ProfileSchema` 的 regex 校验，不含 `$`、空白、引号，`eval` 因此安全。
+ */
+export function scriptCommandWithEnvCheck(
+  workdir: string,
+  scriptPath: string,
+  envNames: readonly string[],
+): string {
+  const envCheck = buildEnvPresenceCheck(envNames)
+  const script = `cd ${quote(workdir)} && bash ${quote(scriptPath)}`
+  return envCheck === '' ? script : `${envCheck} && ${script}`
+}
+
+/**
+ * 生成「这些环境变量都必须在场」的自检片段。
+ *
+ * 判据：ssh2 逐个变量发 `env` 请求，服务端的 `AcceptEnv` 是白名单，
+ * 白名单里没有的会被丢弃、有的会被接受。所以「第一个成功了」推不出「全部成功」，
+ * 自检必须覆盖全部变量名。
+ *
+ * 变量多于一个时用一条循环，长度与变量个数无关；只有一个时用一条 `test`。
+ */
+export function buildEnvPresenceCheck(envNames: readonly string[]): string {
+  if (envNames.length === 0) {
+    return ''
+  }
+  for (const name of envNames) {
+    if (!isEnvVarName(name)) {
+      throw new ConfigError(
+        `环境变量名非法：${JSON.stringify(name)}。它会被拼进远端自检命令，` +
+          '只允许字母、数字与下划线，且不能以数字开头。',
+      )
+    }
+  }
+  const exitCode = String(ENV_NOT_INJECTED_EXIT_CODE)
+  // 判据：空值等于没注入。`${VAR+x}` 只判「是否被设置」，`VAR=` 也能通过；
+  // 再叠一个 `[ -n "${VAR}" ]` 才是本仓要的语义。
+  if (envNames.length === 1) {
+    const name = String(envNames[0])
+    return (
+      `test -n "${'$'}{${name}+x}" && [ -n "${'$'}{${name}}" ] || exit ${exitCode}`
+    )
+  }
+  // eval 的参数用双引号包住，所以内层有三处必须转义：
+  // `$` 不写成 `\$`，外层 shell 会先按自己的参数展开，命令直接 bad substitution；
+  // 内层引号不写成 `\"`，会被外层提前闭合，`test` 变成四个词。
+  // 变量名过不了 `"` 与 `$` 那一关（`ProfileSchema` 的 regex），内层不再需要别的转义。
+  // 判据同单变量形态：先判「是否被设置」，再判「值非空」——空值等于没注入。
+  // 改写这段后必须跑 `steps.spec.ts` 里那几条真跑 bash 的用例：转义写错时命令往往仍能跑通，
+  // 只是判据失效，读代码发现不了。
+  const names = envNames.join(' ')
+  // 反斜杠与引号都用 charCode 拼：这段模板要产出三层引号嵌套，
+  // 手写转义只要露出一层，命令仍能跑通但判据失效。
+  const bs = String.fromCharCode(92)
+  const q = String.fromCharCode(34)
+  const set = `${bs}${q}${bs}$` + '{' + '$' + `v+x}${bs}${q}`
+  const nonEmpty = `${bs}${q}${bs}$` + '{' + '$' + `v}${bs}${q}`
+  const check = `test -n ${set} && [ -n ${nonEmpty} ]`
+  return `for v in ${names}; do eval ${q}${check}${q} || exit ${exitCode}; done`
 }
 
 /** 脚本命令：在项目目录里用 bash 跑仓库内的脚本。 */

@@ -6,8 +6,10 @@ import {
   CloneTargetUnavailableError,
   CloneTimeoutError,
   ConsoleParseError,
+  DeploydeckError,
   HumanRequiredError,
   InstanceNotFoundError,
+  StrayInstanceError,
 } from '../errors.js'
 import { createFanoutLogger, createJsonlFileLogger, createStderrLogger } from '../logging/logger.js'
 import { systemClock } from '../util/clock.js'
@@ -783,6 +785,16 @@ function requireSelector(selector: string | null, description: string): string {
   return selector
 }
 
+/** 错误转统一形态：分类只读 code 字段，这里只保证拿到一个 `DeploydeckError`。 */
+function asDeploydeckError(error: unknown): DeploydeckError {
+  if (error instanceof DeploydeckError) {
+    return error
+  }
+  return new ConsoleParseError(error instanceof Error ? error.message : String(error), {
+    cause: error,
+  })
+}
+
 export function createCloneActions(context: ConsoleRuntimeContext): ClonePort {
   const { channel } = context
   const clock: Clock = context.clock ?? systemClock
@@ -806,6 +818,10 @@ export function createCloneActions(context: ConsoleRuntimeContext): ClonePort {
 
   function elapsedSeconds(startedAt: number): number {
     return Math.max(0, Math.round((clock.now() - startedAt) / 1000))
+  }
+
+  function messageOf(error: unknown): string {
+    return error instanceof Error ? error.message : String(error)
   }
 
   async function screenshot(fileName: string): Promise<void> {
@@ -1468,10 +1484,87 @@ export function createCloneActions(context: ConsoleRuntimeContext): ClonePort {
   }
 
   /**
+   * 克隆已受理后的回读判据：抛错前先读一次列表，判本次克隆有没有真的创建出实例。
+   *
+   * 判据（缺口 8.1）：点「创建并开机」之后，平台可能已受理克隆并扣掉配额，但页面报错、
+   * 跳转失败或读数解析失败。此时直接抛原错误会丢掉实例 ID，执行引擎接管不了它，
+   * 账也记不上。因此本函数读一次列表，按两种已知事实判定：
+   *
+   * 1. `knownInstanceId` 非空：已判定过是本次克隆的那台，读回它的快照即可；
+   *    读不到按「已获取但状态未知」返回，`snapshot` 为 `null`。
+   * 2. `beforeIds` 非空：还没判定过是哪台，用「点击前不存在的 ID」比对；
+   *    恰好一台按本次克隆返回，多于一台无法判定，按原错误抛错交人工。
+   *
+   * 两种都判不出结果时原错误照旧抛：没有判据支持「本次克隆创建了实例」。
+   * 读列表本身失败也只抛原错误：回读是尽力而为，不能让它的失败盖掉真实原因。
+   */
+  async function readBackAfterCloneStarted(
+    error: DeploydeckError,
+    input: {
+      readonly sourceInstanceId: string
+      readonly knownInstanceId: string | null
+      readonly beforeIds: ReadonlySet<string>
+    },
+  ): Promise<StrayInstanceError | null> {
+    let snapshots: readonly ConsoleInstanceSnapshot[]
+    try {
+      snapshots = await context.instances.listInstances({ refresh: true })
+    } catch (readError: unknown) {
+      logger.warn('clone.readback-failed', {
+        sourceInstanceId: input.sourceInstanceId,
+        reason: messageOf(error),
+        readError: messageOf(readError),
+      })
+      return null
+    }
+    if (input.knownInstanceId !== null) {
+      const snapshot = snapshots.find(
+        (candidate) => candidate.instanceId === input.knownInstanceId,
+      ) ?? null
+      logger.warn('clone.instance-state-unknown', {
+        sourceInstanceId: input.sourceInstanceId,
+        instanceId: input.knownInstanceId,
+        foundInList: snapshot !== null,
+        reason: messageOf(error),
+      })
+      return new StrayInstanceError(error, {
+        instanceId: input.knownInstanceId,
+        snapshot,
+      })
+    }
+    const created = snapshots.filter((snapshot) => !input.beforeIds.has(snapshot.instanceId))
+    if (created.length !== 1) {
+      logger.warn('clone.readback-no-single-instance', {
+        sourceInstanceId: input.sourceInstanceId,
+        createdCount: created.length,
+        reason: messageOf(error),
+      })
+      return null
+    }
+    const createdInstance = created[0]
+    if (createdInstance === undefined) {
+      return null
+    }
+    logger.warn('clone.instance-recovered-by-readback', {
+      sourceInstanceId: input.sourceInstanceId,
+      instanceId: createdInstance.instanceId,
+      status: createdInstance.status,
+      reason: messageOf(error),
+    })
+    return new StrayInstanceError(error, {
+      instanceId: createdInstance.instanceId,
+      snapshot: createdInstance,
+    })
+  }
+
+  /**
    * 轮询新实例状态，直到离开「克隆锁定中」。
    *
    * 已关机与运行中都算完成。开机中等过渡态继续等；超时抛 CloneTimeoutError，
    * 由执行引擎转 ESCALATED（实例可能仍在计费）。
+   *
+   * 已看到的实例快照留在这里而不丢：超时抛错时它就是「状态未知的实例」，
+   * 调用方回读判据要用它判断实例当前是否还在列表里，不必再读一次列表。
    */
   async function waitForCloneComplete(instanceId: string): Promise<ConsoleInstanceSnapshot> {
     const startedAt = clock.now()
@@ -1494,8 +1587,11 @@ export function createCloneActions(context: ConsoleRuntimeContext): ClonePort {
       },
     })
     if (outcome.status === 'timeout') {
-      throw new CloneTimeoutError(
-        `实例 ${instanceId} 等待克隆完成超时（已等 ${String(elapsedSeconds(startedAt))} 秒），最后状态「${lastStatusRaw}」。`,
+      throw new StrayInstanceError(
+        new CloneTimeoutError(
+          `实例 ${instanceId} 等待克隆完成超时（已等 ${String(elapsedSeconds(startedAt))} 秒），最后状态「${lastStatusRaw}」。`,
+        ),
+        { instanceId, snapshot: null },
       )
     }
     return outcome.value
@@ -1692,8 +1788,19 @@ export function createCloneActions(context: ConsoleRuntimeContext): ClonePort {
     await screenshot(SCREENSHOT.confirmClicked)
 
     // 8. 轮询列表出现新实例，再等它离开克隆锁定中。
-    await waitForInstanceListPage()
-    const created = await waitForCreatedInstance(beforeIds)
+    let created: ConsoleInstanceSnapshot
+    try {
+      await waitForInstanceListPage()
+      created = await waitForCreatedInstance(beforeIds)
+    } catch (error: unknown) {
+      // 平台可能已受理克隆：抛错前回读一次列表，判出实例就按「已获取但状态未知」交引擎接管。
+      const recovered = await readBackAfterCloneStarted(asDeploydeckError(error), {
+        sourceInstanceId: request.sourceInstanceId,
+        knownInstanceId: null,
+        beforeIds,
+      })
+      throw recovered ?? error
+    }
     // 规格文本按控制台原文记录。对不上只告警不改变结果：实例已经创建，不能丢结果。
     if (!created.gpuSpec.includes(selection.model.name)) {
       logger.warn('clone.gpu-spec-unexpected', {
@@ -1708,7 +1815,22 @@ export function createCloneActions(context: ConsoleRuntimeContext): ClonePort {
       sourceInstanceId: request.sourceInstanceId,
       status: created.status,
     })
-    const completed = await waitForCloneComplete(created.instanceId)
+    let completed: ConsoleInstanceSnapshot
+    try {
+      completed = await waitForCloneComplete(created.instanceId)
+    } catch (error: unknown) {
+      // 实例已判定是本轮克隆，状态未知也要把 ID 交出去，让引擎绑定并记账。
+      const reason = asDeploydeckError(error)
+      const recovered = await readBackAfterCloneStarted(
+        reason instanceof StrayInstanceError ? reason.cause as DeploydeckError : reason,
+        {
+          sourceInstanceId: request.sourceInstanceId,
+          knownInstanceId: created.instanceId,
+          beforeIds,
+        },
+      )
+      throw recovered ?? error
+    }
     await screenshot(SCREENSHOT.completed)
     logger.info('clone.completed', {
       instanceId: completed.instanceId,
@@ -1717,7 +1839,17 @@ export function createCloneActions(context: ConsoleRuntimeContext): ClonePort {
       statusRaw: completed.statusRaw,
     })
     // 9. 给新实例改名。克隆不复制实例名，不改名会让下一次执行按名字找不到它。
-    await renameCreatedInstance(completed.instanceId, request.instanceName)
+    // 这一步失败不丢实例：实例已经确认存在，只是名字没改成，按「已获取但状态未知」返回。
+    try {
+      await renameCreatedInstance(completed.instanceId, request.instanceName)
+    } catch (error: unknown) {
+      const recovered = await readBackAfterCloneStarted(asDeploydeckError(error), {
+        sourceInstanceId: request.sourceInstanceId,
+        knownInstanceId: completed.instanceId,
+        beforeIds,
+      })
+      throw recovered ?? error
+    }
     return { instanceId: completed.instanceId, sourceInstanceId: request.sourceInstanceId }
   }
 

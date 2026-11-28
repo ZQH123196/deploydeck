@@ -74,8 +74,21 @@ export interface SshSessionExecOutcome {
  * 真实实现在 `ssh-channel.ts`；单测用假实现。这里不出现 `ssh2` 的任何类型。
  */
 export interface SshSession {
-  /** 执行一条命令。连接中断时 reject。 */
-  exec(command: string, handlers: SshSessionExecHandlers): Promise<SshSessionExecOutcome>
+  /**
+   * 执行一条命令。连接中断时 reject。
+   *
+   * `env` 只进本命令进程的环境，不拼进 `command`。实现方经 SSH 的 `env` 请求下发。
+   *
+   * 边界：注入是否成功**不可观测**。服务端可以按 `AcceptEnv` 白名单丢弃 `env` 请求，
+   * 客户端收不到错误；ssh2 的 `reqEnv` 也不进排队，`reqExec` 紧随其后发出。
+   * 所以实现方不得承诺「注入失败会报错」，调用方也不得依赖这个信号。
+   * 需要判据时由命令自己以变量在场为前置条件（见 `PlannedStep.envNames` 的消费者）。
+   */
+  exec(
+    command: string,
+    handlers: SshSessionExecHandlers,
+    env?: Readonly<Record<string, string>>,
+  ): Promise<SshSessionExecOutcome>
   /** 关闭连接。重复调用必须安全。 */
   close(): Promise<void>
 }
@@ -222,18 +235,22 @@ export function createSshPortWithOverrides(
       }, execOptions.timeoutSeconds * 1000)
     })
 
-    const execPromise = session.exec(command, {
-      onStdout: (chunk: Buffer) => {
-        stdoutBytes += chunk.length
-        outputLog.write(chunk)
-        stdoutTailBuffer.push(stdoutDecoder.write(chunk))
+    const execPromise = session.exec(
+      command,
+      {
+        onStdout: (chunk: Buffer) => {
+          stdoutBytes += chunk.length
+          outputLog.write(chunk)
+          stdoutTailBuffer.push(stdoutDecoder.write(chunk))
+        },
+        onStderr: (chunk: Buffer) => {
+          stderrBytes += chunk.length
+          outputLog.write(chunk)
+          stderrTailBuffer.push(stderrDecoder.write(chunk))
+        },
       },
-      onStderr: (chunk: Buffer) => {
-        stderrBytes += chunk.length
-        outputLog.write(chunk)
-        stderrTailBuffer.push(stderrDecoder.write(chunk))
-      },
-    })
+      execOptions.env,
+    )
     // 超时分支可能先返回，连接关闭后 execPromise 才会失败。先挂一个处理函数，避免未处理拒绝。
     execPromise.catch(() => undefined)
 

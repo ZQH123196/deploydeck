@@ -5,6 +5,7 @@ import type {
   CloneOutcome,
   CloneRequest,
   ListInstancesOptions,
+  PowerOnMode,
   PowerOnOutcome,
   PriceQuote,
   TeardownOutcome,
@@ -137,9 +138,11 @@ class FakeProvider implements Provider {
     return [...this.snapshots]
   }
 
-  async powerOn(instanceId: string): Promise<PowerOnOutcome> {
+  async powerOn(instanceId: string, mode: PowerOnMode): Promise<PowerOnOutcome> {
     this.calls.push('powerOn')
-    this.setStatus(instanceId, 'running', '运行中')
+    // 无卡模式实例的状态列一样写「运行中」，差别在第 2 列的标记。
+    // 单价缓存按开机形态分槽，status 命令要靠这个标记取对槽。
+    this.setStatus(instanceId, 'running', '运行中', mode === 'no-gpu')
     return { ok: true, instanceId }
   }
 
@@ -231,9 +234,12 @@ class FakeProvider implements Provider {
     instanceId: string,
     status: ConsoleInstanceSnapshot['status'],
     statusRaw: string,
+    noGpuMode: boolean | null = false,
   ): void {
     this.snapshots = this.snapshots.map((snapshot) =>
-      snapshot.instanceId === instanceId ? { ...snapshot, status, statusRaw } : snapshot,
+      snapshot.instanceId === instanceId
+        ? { ...snapshot, status, statusRaw, noGpuMode }
+        : snapshot,
     )
   }
 }
@@ -333,6 +339,24 @@ async function createFixture(options: FixtureOptions = {}): Promise<CliFixture> 
     },
     openShell: async () => {
       throw new Error('测试不应打开真实终端通道')
+    },
+    openCredentials: async () => {
+      throw new Error('测试不应打开真实凭据通道')
+    },
+    openForward: async () => {
+      throw new Error('测试不应打开真实端口转发')
+    },
+    withProvider: async (_logDir, action) => {
+      // 与真实装配同形：开、调、关各一次。测试里 provider 已经是假对象。
+      openedLogDirs.push(_logDir)
+      if (options.loginRequired === true) {
+        throw new LoginRequiredError()
+      }
+      return await action(provider)
+    },
+    commandEvidenceDir: async (command, instanceId) => {
+      const store = stateStoreFactory()
+      return await store.resolve(`${command}/${instanceId}`)
     },
     readProviderCapabilities: () => ({ id: 'autodl', capabilities: DEFAULT_CAPABILITIES }),
     createStateStore: stateStoreFactory,
@@ -962,5 +986,30 @@ describe('CLI：参数错误', () => {
     expect(code).not.toBe(0)
     expect(fixture.stderrText()).toContain('--profile')
     expect(fixture.stderrText()).toContain('--help')
+  })
+})
+
+describe('CLI：power / switch / creds / tunnel 的参数面', () => {
+  it('help 里列出四个子命令，命名与 C 组导出的常量一致', async () => {
+    const fixture = await createFixture()
+
+    await fixture.run(['--help'])
+
+    const help = fixture.stdoutText()
+    expect(help).toMatch(/^\s+power /m)
+    expect(help).toMatch(/^\s+switch /m)
+    expect(help).toMatch(/^\s+creds /m)
+    expect(help).toMatch(/^\s+tunnel /m)
+    // 命名照 C 组：不是 credentials、不是 port-forward。
+    expect(help).not.toMatch(/credentials\s+<instanceId>/)
+  })
+
+  it('power 只给一个 --on/--off 都不给时报参数错误，不碰任何实例', async () => {
+    const fixture = await createFixture()
+
+    const code = await fixture.run(['power', INSTANCE_ID])
+
+    expect(code).not.toBe(0)
+    expect(fixture.provider.calls).toEqual([])
   })
 })

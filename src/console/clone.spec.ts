@@ -10,6 +10,7 @@ import {
   ConsoleParseError,
   HumanRequiredError,
   InstanceNotFoundError,
+  StrayInstanceError,
 } from '../errors.js'
 import type { Logger } from '../logging/logger.js'
 import type { Clock } from '../util/clock.js'
@@ -129,6 +130,8 @@ interface FakeConsoleOptions {
   readonly createdInstanceName?: string
   /** 打开改名输入框，但失焦后不提交。用来模拟改名没有生效。 */
   readonly renameIgnored?: boolean
+  /** 点「创建并开机」后列表里不出现新实例。用来模拟平台受理克隆但列表读不到。 */
+  readonly hideCreatedInstance?: boolean
 }
 
 const DEFAULT_GPU_MODELS: readonly FakeGpuModelConfig[] = [
@@ -227,6 +230,7 @@ class FakeConsole implements ConsoleChannel {
   private readonly confirmAlwaysDisabled: boolean
   private readonly createFailureNotice: string | undefined
   private readonly renameIgnored: boolean
+  private readonly hideCreatedInstance: boolean
   private renameDraftValue = ''
   private createdVisible = false
   private createdStatusIndex = 0
@@ -246,6 +250,7 @@ class FakeConsole implements ConsoleChannel {
     this.confirmAlwaysDisabled = options.confirmAlwaysDisabled ?? false
     this.createFailureNotice = options.createFailureNotice
     this.renameIgnored = options.renameIgnored ?? false
+    this.hideCreatedInstance = options.hideCreatedInstance ?? false
     this.renamedName = options.createdInstanceName ?? null
     this.regionTexts = options.regionTexts ?? DEFAULT_REGION_TEXTS
     this.createdInstanceId = options.createdInstanceId ?? CREATED_INSTANCE_ID
@@ -288,7 +293,7 @@ class FakeConsole implements ConsoleChannel {
           )
         }
       }
-      if (this.createdVisible) {
+      if (this.createdVisible && !this.hideCreatedInstance) {
         const status = this.createdStatuses[this.createdStatusIndex] ?? 'cloning'
         snapshots.push(
           buildInstanceSnapshot(this.createdInstanceId, status, this.renamedName ?? ''),
@@ -865,16 +870,18 @@ describe('clone 正常路径', () => {
 })
 
 describe('clone 失败路径', () => {
-  it('克隆状态一直是克隆锁定中时抛 CloneTimeoutError，并带实例 ID 与已等时长', async () => {
+  it('克隆状态一直是克隆锁定中时按已获取但状态未知返回，原 CloneTimeoutError 经 cause 保留', async () => {
     const fixture = await createFixture({ createdStatuses: ['cloning'] })
 
-    const error = await captureError(fixture.actions.clone(buildCloneRequest({})))
+    const error = (await captureError(fixture.actions.clone(buildCloneRequest({})))) as StrayInstanceError
 
-    expect(error).toBeInstanceOf(CloneTimeoutError)
-    const message = messageOf(error)
-    expect(message).toContain(CREATED_INSTANCE_ID)
-    expect(message).toMatch(/已等 \d+ 秒/)
-    expect(message).toContain('克隆锁定中')
+    // 判据：实例已确认存在，只是状态没收敛；ID 必须交出去，不能只报超时。
+    expect(error).toBeInstanceOf(StrayInstanceError)
+    expect(error.instanceId).toBe(CREATED_INSTANCE_ID)
+    expect(error.cause).toBeInstanceOf(CloneTimeoutError)
+    const causeMessage = (error.cause as Error).message
+    expect(causeMessage).toMatch(/已等 \d+ 秒/)
+    expect(causeMessage).toContain('克隆锁定中')
   })
 
   it('GPU 型号偏好一条都对不上时抛错，并列出页面可选型号', async () => {
@@ -936,12 +943,17 @@ describe('clone 失败路径', () => {
     expect(fixture.console.screenshots.some((path) => path.endsWith('clone-09-confirm-clicked.png'))).toBe(false)
   })
 
-  it('点创建后平台给出错误提示时立即失败，不盲等超时', async () => {
+  it('点创建后平台给出错误提示时立即失败，不盲等超时；列表已有新实例则接管它', async () => {
+    // Arrange：平台的错误提示出现在新实例进入列表之后。提示本身不能当成「没创建」。
     const fixture = await createFixture({ createFailureNotice: '余额不足' })
 
-    const error = await captureError(fixture.actions.clone(buildCloneRequest({})))
+    // Act
+    const error = (await captureError(fixture.actions.clone(buildCloneRequest({})))) as StrayInstanceError
 
-    expect(error).toBeInstanceOf(HumanRequiredError)
+    // Assert：原错误经 cause 保留「余额不足」，实例 ID 一并交出去。
+    expect(error).toBeInstanceOf(StrayInstanceError)
+    expect(error.instanceId).toBe(CREATED_INSTANCE_ID)
+    expect((error.cause as Error).message).toContain('余额不足')
     expect(messageOf(error)).toContain('余额不足')
   })
 
@@ -969,12 +981,70 @@ describe('clone 失败路径', () => {
     expect(messageOf(error)).toContain('无法判定哪一台是本次克隆')
   })
 
-  it('改名提交后列表里的名字一直没变时抛错，并带实例 ID 与目标名字', async () => {
+  it('对话框不出现但点过创建后列表多了新实例：按已获取但状态未知返回该实例', async () => {
+    // Arrange：列表看不到新实例，但「点过创建」这件事已经发生。
+    const fixture = await createFixture({ hideCreatedInstance: true })
+    // 正在轮询新实例时平台把实例放进列表：读回判据要能从中认出本轮克隆。
+    const originalList = fixture.console.listInstances.bind(fixture.console)
+    fixture.console.listInstances = async (options) => {
+      const snapshots = await originalList(options)
+      if (fixture.console.confirmed) {
+        return [...snapshots, buildInstanceSnapshot(CREATED_INSTANCE_ID, 'cloning', '')].filter(
+          (snapshot, index, all) =>
+            all.findIndex((candidate) => candidate.instanceId === snapshot.instanceId) === index,
+        )
+      }
+      return snapshots
+    }
+
+    // Act
+    const error = (await captureError(fixture.actions.clone(buildCloneRequest({})))) as StrayInstanceError
+
+    // Assert
+    expect(error).toBeInstanceOf(StrayInstanceError)
+    expect(error instanceof StrayInstanceError ? error.instanceId : undefined).toBe(
+      CREATED_INSTANCE_ID,
+    )
+    expect(error instanceof StrayInstanceError ? error.snapshot?.instanceId : undefined).toBe(
+      CREATED_INSTANCE_ID,
+    )
+    expect(error.message).toContain(CREATED_INSTANCE_ID)
+  })
+
+  it('创建已确认但改名失败：按已获取但状态未知返回实例，不丢实例 ID', async () => {
+    // Arrange：改名后列表名字一直不变，改名阶段抛错。
+    const fixture = await createFixture({ renameIgnored: true })
+
+    // Act
+    const error = (await captureError(fixture.actions.clone(buildCloneRequest({})))) as StrayInstanceError
+
+    // Assert
+    expect(error).toBeInstanceOf(StrayInstanceError)
+    expect(error instanceof StrayInstanceError ? error.instanceId : undefined).toBe(
+      CREATED_INSTANCE_ID,
+    )
+    // 原错误经 cause 保留：改名失败这个事实不能被「状态未知」盖掉。
+    expect((error.cause as Error).message).toContain('trans-dev')
+  })
+
+  it('点过创建但回读也看不到新实例时照旧抛原错误', async () => {
+    // Arrange：列表里始终没有新实例，回读判不出「本次克隆创建了实例」。
+    const fixture = await createFixture({ hideCreatedInstance: true })
+
+    // Act
+    const error = await captureError(fixture.actions.clone(buildCloneRequest({})))
+
+    // Assert：判据是「有判据支持才接管」，没有判据时不能凭空造实例 ID。
+    expect(error).not.toBeInstanceOf(StrayInstanceError)
+    expect(error).toBeInstanceOf(CloneTimeoutError)
+  })
+
+  it('改名提交后列表里的名字一直没变时返回已获取但状态未知，带实例 ID 与目标名字', async () => {
     const fixture = await createFixture({ renameIgnored: true })
 
     const error = await captureError(fixture.actions.clone(buildCloneRequest({})))
 
-    expect(error).toBeInstanceOf(ConsoleParseError)
+    expect(error).toBeInstanceOf(StrayInstanceError)
     const message = messageOf(error)
     expect(message).toContain(CREATED_INSTANCE_ID)
     expect(message).toContain('trans-dev')

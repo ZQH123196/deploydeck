@@ -1,3 +1,5 @@
+import type { ConsoleInstanceSnapshot } from './domain/instance.js'
+
 /** 退出码。0 成功，1 业务失败，2 需要人工介入。 */
 export type ExitCode = 0 | 1 | 2
 
@@ -36,15 +38,33 @@ export type DeploydeckErrorCode =
   | 'STATE_LOCK_TIMEOUT'
   | 'CLONE_SOURCE_UNAVAILABLE'
   | 'CLONE_TARGET_UNAVAILABLE'
+  | 'CLONE_RESULT_UNKNOWN'
   | 'INSTANCE_NOT_FOUND'
   | 'POWER_OFF_TIMEOUT'
   | 'INSTANCE_NOT_RUNNING'
   | 'INTERACTIVE_TERMINAL_REQUIRED'
   | 'SHELL_FAILED'
+  | 'POWER_ON_FAILED'
+  | 'INSTANCE_FORM_MISMATCH'
+  | 'TUNNEL_LOCAL_PORT_IN_USE'
 
 export const EXIT_OK: ExitCode = 0
 export const EXIT_BUSINESS_FAILURE: ExitCode = 1
 export const EXIT_HUMAN_REQUIRED: ExitCode = 2
+
+/**
+ * 远端脚本自检失败：声明的环境变量根本没送到远端进程。
+ *
+ * 取值 78 来自 sysexits 的 `EX_CONFIG`。它**不是 deploydeck 进程的退出码**：
+ * deploydeck 自身只有 0/1/2 三种（`ExitCode`），它出现在 SSH 步骤的远端退出码里。
+ *
+ * 判据：必须是独立取值。脚本在缺变量时可能自己退出 1，混在一起时读日志的人
+ * 分不清「脚本失败」与「环境根本没送到」。出现 78 时不要去读脚本逻辑，先查本机环境变量。
+ *
+ * 产出方是 `src/engine/steps.ts` 的命令前缀（SSH 的 `env` 请求可能被服务端静默丢弃，
+ * 数据面拿不到失败信号，只能让命令自己判）。
+ */
+export const REMOTE_ENV_NOT_INJECTED_EXIT_CODE = 78
 
 /** 所有 deploydeck 抛出错误的基类。携带稳定错误码与退出码。 */
 export class DeploydeckError extends Error {
@@ -113,9 +133,12 @@ export class LoginRequiredError extends DeploydeckError {
 
 /** 控制台页面结构与解析器不一致。页面改版必须报错，不得返回空结果。 */
 export class ConsoleParseError extends DeploydeckError {
-  constructor(message: string) {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
     super('CONSOLE_PARSE_FAILED', message, EXIT_HUMAN_REQUIRED)
     this.name = 'ConsoleParseError'
+    if (options?.cause !== undefined) {
+      this.cause = options.cause
+    }
   }
 }
 
@@ -136,6 +159,36 @@ export class CloneTimeoutError extends DeploydeckError {
   constructor(message: string) {
     super('CLONE_TIMEOUT', message, EXIT_HUMAN_REQUIRED)
     this.name = 'CloneTimeoutError'
+  }
+}
+
+/**
+ * 克隆已经创建了实例，但没能走到「确认完成」那一步：实例状态未知。
+ *
+ * 判据：平台受理克隆后配额已扣、实例已存在。此时抛任何普通错误都会丢掉实例 ID，
+ * 执行引擎就接管不了它，账也记不上。因此这种情况一律用本错误：
+ * `instanceId` 必有值，`snapshot` 为 `null` 表示没读回列表，读回则带那一刻的实例快照。
+ * 执行引擎读这两个字段把它绑定到计划上并记账。
+ */
+export class StrayInstanceError extends DeploydeckError {
+  readonly instanceId: string
+  readonly snapshot: ConsoleInstanceSnapshot | null
+
+  constructor(
+    cause: DeploydeckError,
+    instance: { readonly instanceId: string; readonly snapshot: ConsoleInstanceSnapshot | null },
+  ) {
+    super(
+      'CLONE_RESULT_UNKNOWN',
+      `克隆已创建实例 ${instance.instanceId}，但结果未能确认：${cause.message}` +
+        `（原因码 ${cause.code}）。配额已扣，实例状态未知。执行引擎会接管记账，` +
+        '请到控制台核对实例状态。',
+      EXIT_HUMAN_REQUIRED,
+    )
+    this.name = 'StrayInstanceError'
+    this.instanceId = instance.instanceId
+    this.snapshot = instance.snapshot
+    this.cause = cause
   }
 }
 
@@ -438,5 +491,80 @@ export class ShellFailedError extends DeploydeckError {
     if (options?.cause !== undefined) {
       this.cause = options.cause
     }
+  }
+}
+
+/**
+ * 开机失败：控制台报无可用 GPU，或等到超时仍未进入运行中。
+ *
+ * 判据（docs/plan-and-budget.md 第 3.1 节）：开机形态由部署配置或命令行显式给出，
+ * 引擎不自行降级到无卡模式。所以开机失败必须报错，不能静默换一种形态开。
+ *
+ * 退出码 1：换一个时刻重试或改目标形态就能继续，不是需要人排查配置的错误。
+ */
+export class PowerOnFailedError extends DeploydeckError {
+  constructor(
+    instanceId: string,
+    mode: 'gpu' | 'no-gpu',
+    reason: 'no-gpu' | 'timeout',
+    detail: string,
+    lastStatusRaw: string,
+  ) {
+    super(
+      'POWER_ON_FAILED',
+      `实例 ${instanceId} 按${mode === 'no-gpu' ? '无卡' : '有卡'}模式开机失败` +
+        `（原因：${reason}，最后状态：${lastStatusRaw}）：${detail}` +
+        '未做任何降级：目标形态是显式给出的，换形态请重新执行命令并指定。',
+      EXIT_BUSINESS_FAILURE,
+    )
+    this.name = 'PowerOnFailedError'
+  }
+}
+
+/**
+ * 切换形态后复验不一致：实测形态与目标形态不同。
+ *
+ * 判据（`ConsoleInstanceSnapshot.noGpuMode`）：true 表示无卡，false 表示有卡，
+ * null 表示页面没给出可判定的信息。null 同样算不一致：没有事实支撑的「大概对」不能算成功。
+ *
+ * 退出码 2：实例已经开起来了但形态不对，说明控制台行为与预期不符，需要人确认。
+ */
+export class InstanceFormMismatchError extends DeploydeckError {
+  constructor(input: {
+    readonly instanceId: string
+    readonly targetMode: 'gpu' | 'no-gpu'
+    readonly observedNoGpuMode: boolean | null
+    readonly statusRaw: string
+  }) {
+    const observed =
+      input.observedNoGpuMode === null ? '未给出可判定的形态' : input.observedNoGpuMode ? '无卡' : '有卡'
+    super(
+      'INSTANCE_FORM_MISMATCH',
+      `切换后复验不一致：目标是${input.targetMode === 'no-gpu' ? '无卡' : '有卡'}，` +
+        `实测形态是${observed}（实例 ${input.instanceId}，状态「${input.statusRaw}」）。` +
+        '实例已保留，未销毁。请在控制台确认形态与计费口径。',
+      EXIT_HUMAN_REQUIRED,
+    )
+    this.name = 'InstanceFormMismatchError'
+  }
+}
+
+/**
+ * 本地端口已被占用，端口转发起不来。
+ *
+ * 判据：端口被占用是确定性失败。重试解决不了，等下去也不会变；静默失败更糟，
+ * 使用方会以为转发已经建好。所以立即报错。
+ *
+ * 退出码 1：换一个本地端口即可继续。
+ */
+export class TunnelLocalPortInUseError extends DeploydeckError {
+  constructor(localPort: number, remote: string) {
+    super(
+      'TUNNEL_LOCAL_PORT_IN_USE',
+      `本地端口 ${String(localPort)} 已被占用，无法建立到 ${remote} 的端口转发。` +
+        '换一个本地端口重试。未建立任何转发，也未重试。',
+      EXIT_BUSINESS_FAILURE,
+    )
+    this.name = 'TunnelLocalPortInUseError'
   }
 }
