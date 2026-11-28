@@ -458,8 +458,12 @@ deploydeck shell <instanceId> -- apt-get update
 | `teardown <planId>` | 销毁实例、记账、关闭计划 | 是 |
 | `login` | 打开专用 Chrome 等人登录 | 是 |
 | `guard [--once]` | 前台常驻守护 | 是 |
-| `shell <instanceId>` | 进入交互式终端 | 是 |
-| `shell <instanceId> -- <cmd>` | 在 PTY 里跑一条命令 | 是 |
+| `shell <instanceId>` | 进入交互式终端（PTY） | 是 |
+| `shell <instanceId> -- <cmd>` | 跑一条命令并返回远端退出码（走 exec，不开 PTY） | 是 |
+| `power <instanceId> --on\|--off` | 开机或关机，并核实终态 | 是 |
+| `switch <instanceId> --gpu\|--no-gpu` | 关机 → 按目标形态开机 → 复验形态 | 是 |
+| `creds <instanceId>` | 打印 SSH 登录信息（密码只进 stdout） | 是 |
+| `tunnel <instanceId> --ports <本地>:<远端>` | 本机回环端口转发，前台运行 | 是 |
 | `plan extend` | 未实现，退出码 2 | — |
 | `ledger` | 未实现，退出码 2 | — |
 
@@ -692,7 +696,7 @@ deploydeck 靠页面结构定位。页面改版会让全部控制面动作失效
 | 连续关机释放 | 15 天。超过未处理会被平台回收 |
 | `guard` 自启动 | Phase 2 不做，需人自行常驻 |
 | `plan extend` / `ledger` | 未实现 |
-| 交互式终端 | 只支持本地有 tty 的交互形态；不做跳板机、端口转发、文件传输 |
+| 交互式终端 | 不做跳板机、文件传输。端口转发走独立的 `tunnel` 命令 |
 | 无卡模式 | 只由部署配置显式指定；已有卡运行的实例不会被自动关机重开 |
 | 账本对账 | 按量计费不是逐秒结算，余额差额可能小于真实花费。以账本为准 |
 

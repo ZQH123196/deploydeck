@@ -140,7 +140,7 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard --once
 |---|---|---|
 | L1 领域模型 | 定义 Profile、Project、Plan、Run 的形状 | 否 |
 | L2 provider | 在某类资源上创建、执行、销毁 | 否 |
-| L3 计划与预算 | 有效期、预算上限、三重关机 | 否 |
+| L3 计划与预算 | 有效期、预算上限、两重关机与余额告警 | 否 |
 | L4 执行引擎 | 步骤编排、失败语义、终态验证 | 否 |
 | L5 命令服务 | 唯一入口，人机共用 | 否 |
 | L6 界面与 Agent | CLI、TUI、Web、Agent 接入 | 是 |
