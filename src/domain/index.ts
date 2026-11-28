@@ -5,7 +5,7 @@ export {
   type Profile,
 } from './profile.js'
 
-export { ProjectSchema, RepositorySchema, type Project, type Repository } from './project.js'
+export { ProjectSchema, type Project } from './project.js'
 
 export { PlanSchema, PlanStateSchema, type Plan, type PlanState } from './plan.js'
 

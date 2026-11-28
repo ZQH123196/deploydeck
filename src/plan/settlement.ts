@@ -8,11 +8,14 @@ import type { StateStore } from '../state/ports.js'
 import { planSettlementLockName, type PlanStore } from './plan-store.js'
 
 /**
- * 计划结算：账本行生成、计划关闭、计划转 ESCALATED。
+ * 计划结算：账本行生成、计划关闭、计划转 ESCALATED / STOPPED-PENDING-SETTLEMENT。
  *
  * 三条路径共用这一份实现：`teardown`、`guard` 的过期/超预算销毁、以及后续
  * 任何「实例已确认消失」的收尾。判据见 docs/plan-and-budget.md 第 7.1 节：
  * 账本是事实，`plan.spentYuan` 是它的投影；封口一行就把金额记回计划。
+ *
+ * 计费终点判据：一个实例生命周期只记一行账，那一行的 `stoppedAt` 就是计费终点。
+ * 停机成功那一刻已经写下的行，后续任何结算动作都必须承认它，不能再用更晚的钟点造第二行。
  */
 
 /** 结算需要的存储。三件都指向同一个状态目录。 */
@@ -95,6 +98,13 @@ export function buildLedgerEntry(input: {
 export interface ClosePlanResult {
   readonly plan: Plan
   readonly writtenEntry: LedgerEntry | null
+  /**
+   * 账本里已有的那一行，仅当本次没有新增行时给出。
+   *
+   * 用途：让调用方能打印「费用已在 <时刻> 封口」这句话。没有它，调用方只能再说一遍
+   * 「未重复记账」，运维无法确认那笔账到底记在哪个时刻。
+   */
+  readonly existingEntry: LedgerEntry | null
 }
 
 /**
@@ -104,6 +114,10 @@ export interface ClosePlanResult {
  * 1. 再次读计划：锁外读到的状态可能已被别的进程改掉。
  * 2. 再次查账本：同一实例生命周期只允许一行账，重复结算不重复记账、不重复累加。
  * 3. 先写账本再更新计划：账本是事实，计划是它的投影。
+ *
+ * 判据（M1）：`entry` 只在「该实例尚无账本行」时才允许非空。已有账本行时调用方必须传
+ * `null` —— 此时实例的计费终点早已被那一行封住，再用当前钟点造一行只会被本函数丢弃，
+ * 而丢弃本身不可见，账本会永久少记「停机到 teardown 之间」那段时长。
  */
 export async function closePlanWithLedger(
   stores: PlanSettlementStores,
@@ -113,15 +127,15 @@ export async function closePlanWithLedger(
 ): Promise<ClosePlanResult> {
   return stores.stateStore.withLock(planSettlementLockName(planId), async () => {
     const current = await stores.planStore.read(planId)
-    const alreadyAccounted = await isInstanceAlreadyAccounted(stores.ledger, planId, instanceId)
-    const writtenEntry = entry !== null && !alreadyAccounted ? entry : null
+    const existingEntry = await findInstanceEntry(stores.ledger, planId, instanceId)
+    const writtenEntry = entry !== null && existingEntry === null ? entry : null
     if (writtenEntry !== null) {
       await stores.ledger.append(writtenEntry)
     }
     const spentYuan = current.spentYuan + (writtenEntry === null ? 0 : writtenEntry.amountYuan)
     const closed = PlanSchema.parse({ ...current, spentYuan, state: 'closed' })
     await stores.planStore.save(closed)
-    return { plan: closed, writtenEntry }
+    return { plan: closed, writtenEntry, existingEntry }
   })
 }
 
@@ -142,7 +156,12 @@ export async function closePlanWithoutLedger(
   })
 }
 
-/** 计划转 `escalated`：实例未确认消失，钱可能还在烧。 */
+/**
+ * 计划转 `escalated`：实例未确认消失，钱可能还在烧。
+ *
+ * 判据：只有「实例可能仍在运行」才允许写这个状态。停机成功的计划写
+ * `stopped-pending-settlement`，不用这个状态，否则运维分不清该先关机还是先结账。
+ */
 export async function markPlanEscalated(
   stores: Pick<PlanSettlementStores, 'planStore'>,
   planId: string,
@@ -156,16 +175,37 @@ export async function markPlanEscalated(
   return escalated
 }
 
-async function isInstanceAlreadyAccounted(
+/**
+ * 计划转 `stopped-pending-settlement`：实例已确认停机，钱停了；账还没结。
+ *
+ * 判据：本状态只由「实例已确认不再运行」的路径写入。写它之后 `guard` 会补做结算。
+ */
+export async function markPlanStoppedPendingSettlement(
+  stores: Pick<PlanSettlementStores, 'planStore'>,
+  planId: string,
+): Promise<Plan> {
+  const current = await stores.planStore.read(planId)
+  if (current.state === 'stopped-pending-settlement') {
+    return current
+  }
+  const stopped = PlanSchema.parse({ ...current, state: 'stopped-pending-settlement' })
+  await stores.planStore.save(stopped)
+  return stopped
+}
+
+/** 该实例在该计划下的账本行。没有则返回 `null`，不编造金额。 */
+export async function findInstanceEntry(
   ledger: LedgerStore,
   planId: string,
   instanceId: string,
-): Promise<boolean> {
+): Promise<LedgerEntry | null> {
   const snapshot = await ledger.readSnapshot()
   if (snapshot.status === 'missing') {
-    return false
+    return null
   }
-  return snapshot.entries.some(
-    (candidate) => candidate.planId === planId && candidate.instanceId === instanceId,
+  return (
+    snapshot.entries.find(
+      (candidate) => candidate.planId === planId && candidate.instanceId === instanceId,
+    ) ?? null
   )
 }

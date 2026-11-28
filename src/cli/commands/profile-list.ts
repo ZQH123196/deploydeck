@@ -18,7 +18,7 @@ export async function runProfileListCommand(context: CommandContext): Promise<vo
     return
   }
 
-  const headers = ['ID', '项目', 'provider', '开机', '时长(分)', '预算(元)', '失败后', '锁定commit']
+  const headers = ['ID', '项目', 'provider', '开机', '时长(分)', '预算(元)', '失败后']
   const rows = profiles.map((profile) => [
     profile.id,
     profile.project,
@@ -27,7 +27,6 @@ export async function runProfileListCommand(context: CommandContext): Promise<vo
     String(profile.ttlMinutes),
     String(profile.budgetCapYuan),
     formatOnDeployFailure(profile.onDeployFailure),
-    profile.requirePinnedCommit ? '是' : '否',
   ])
   writeTable(context.deps.stdout, headers, rows)
 }

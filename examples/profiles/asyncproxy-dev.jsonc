@@ -27,15 +27,5 @@
   "budgetCapYuan": 6,
 
   // 开发环境部署失败后保留容器，人可以进去查现场。期间继续计费，到计划过期时销毁。
-  "onDeployFailure": "keep-container",
-
-  // 开发允许使用实例里的当前工作区，不强制锁定 commit。
-  "requirePinnedCommit": false,
-
-  // 两个脚本在被部署的项目仓库里，路径相对于仓库根。
-  // 它们属于 asyncProxyServer 仓库，不在 deploydeck 仓库内：
-  //   scripts/deploy.sh  拉代码、uv sync 装依赖
-  //   scripts/start.sh   跑 start_asyncProxyServer.sh 拉起 pm2 托管进程
-  "deployScript": "scripts/deploy.sh",
-  "startScript": "scripts/start.sh"
+  "onDeployFailure": "keep-container"
 }

@@ -1,7 +1,25 @@
 import { z } from 'zod'
 
-/** 计划状态。`escalated` 表示实例未确认消失，钱可能还在烧。 */
-export const PlanStateSchema = z.enum(['active', 'closed', 'expired', 'escalated'])
+/**
+ * 计划状态。
+ *
+ * 判据：每个状态必须能单独回答「这台实例的钱停了没有」。
+ * - `active`：授权窗口内，实例可能开着。
+ * - `closed`：结算完成，钱已封口，账本已记。
+ * - `expired`：展示层对「已过有效期的 active」的投影，不是落盘状态。
+ * - `stopped-pending-settlement`：实例已确认停机，钱停了；账本行与关闭还没做。
+ * - `escalated`：实例未确认消失，钱可能还在烧。
+ *
+ * `stopped-pending-settlement` 不是一个缓和版的 `escalated`。两者区别在
+ * 「实例还在不在计费」：前者肯定不在，后者拿不准。混用会让运维分不清该先关机还是先结账。
+ */
+export const PlanStateSchema = z.enum([
+  'active',
+  'closed',
+  'expired',
+  'stopped-pending-settlement',
+  'escalated',
+])
 export type PlanState = z.infer<typeof PlanStateSchema>
 
 /**

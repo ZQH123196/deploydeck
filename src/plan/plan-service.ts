@@ -153,33 +153,31 @@ export function computeTimedShutdownAt(plan: Plan): string {
 
 /** 预算复核的编排端口。执行引擎读到单价后调用一次。 */
 export interface BudgetEnforcement {
-  /** 读到单价后复核：超预算立即停机保留实例并抛 `BudgetExceededError`（退出码 1）。 */
+  /**
+   * 读到单价后复核：超预算立即抛 `BudgetExceededError`（退出码 1）。
+   *
+   * 判据：本函数不停机。停机只有执行引擎的失败收尾一处出口，
+   * 否则「实例停了没有」会有两个判断点，账本封口判据必须同时看两处才成立。
+   */
   recheckAfterInstanceReady(input: {
     readonly planId: string
     readonly runId: string
-    readonly instanceId: string
     readonly quote: PriceQuote
   }): Promise<void>
 }
 
 export interface BudgetEnforcementOptions {
   readonly plans: PlanStore
-  /**
-   * 超预算时的止损动作：停机。
-   *
-   * 判据（BUG 3.1）：自动判定失败不得销毁实例，销毁入口只有 `teardown` 命令。
-   * 这里收停机端口而不收销毁端口，端口形状本身就挡住了误用。
-   */
-  readonly power: PowerPort
 }
 
 /**
  * 创建预算复核。
  *
- * 判据见 spec 第 9.2 节：开机或克隆成功后读单价，计算预计花费，超上限立即销毁。
+ * 判据见 spec 第 9.2 节：开机或克隆成功后读单价，计算预计花费，超上限立即报告超预算。
+ * 停机保留实例由执行引擎的失败收尾统一做（BUG 3.1：自动判定不得销毁实例）。
  */
 export function createBudgetEnforcement(options: BudgetEnforcementOptions): BudgetEnforcement {
-  const { plans, power } = options
+  const { plans } = options
 
   return {
     recheckAfterInstanceReady: async (input) => {
@@ -200,21 +198,10 @@ export function createBudgetEnforcement(options: BudgetEnforcementOptions): Budg
       }
 
       // 预算超限是业务失败（退出码 1），此刻实例已经就绪、钱正在烧。
-      // 判据：先停机止损、确认停机完成，再抛预算错误；绝不销毁实例。
-      // 停机失败不盖掉预算错误：实例仍在计费这个事实挂进错误消息，交人工处理。
-      let powerOffFailure: string | null = null
-      try {
-        await power.powerOff(input.instanceId)
-      } catch (error: unknown) {
-        powerOffFailure = error instanceof Error ? error.message : String(error)
-      }
+      // 本函数不停机：执行引擎的失败收尾会停机保留实例并把状态分叉写清。
       throw new BudgetExceededError(
         `计划 ${input.planId} 超预算：已花费 ${plan.spentYuan} 元，本次预计 ${projectedCostYuan} 元，` +
-          `上限 ${plan.budgetCapYuan} 元（执行 ${input.runId}）。` +
-          (powerOffFailure === null
-            ? `已停机并保留实例 ${input.instanceId}。执行 deploydeck teardown ${input.planId} 销毁它。`
-            : `停机失败：${powerOffFailure}。实例 ${input.instanceId} 仍在计费，` +
-              `请立即到控制台确认并关机，或执行 deploydeck teardown ${input.planId}。`),
+          `上限 ${plan.budgetCapYuan} 元（执行 ${input.runId}）。`,
       )
     },
   }

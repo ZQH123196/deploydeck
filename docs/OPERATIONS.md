@@ -7,17 +7,21 @@
 
 ## 1. 这个工具做什么
 
-deploydeck 把一次云端部署收敛成一条链路：
+deploydeck 把一次云端实例获取收敛成一条链路：
 
 ```text
-申请计划 → 取实例 → 部署 → 验证 → 结束
+申请计划 → 获取实例 → 等 SSH 就绪 → 健康检查 → 结束
 ```
 
 三件事由它保证：
 
 1. 没有计划不得开机或克隆。计划写明可用时长与预算上限。
-2. 部署成功后自动设置平台定时关机。到点平台关停实例，不依赖 deploydeck 进程存活。
+2. 实例到手后自动设置平台定时关机。到点平台关停实例，不依赖 deploydeck 进程存活。
 3. 每一步留日志与账本。实例销毁后，现场仍在本机。
+
+装环境、拉代码、起服务不在链路里。它们由使用者自己在实例上执行，见 §2.4。
+
+判据：`run` 成功只保证「实例已获取、已连通、健康检查通过」。它不保证业务服务可用。
 
 deploydeck 不构建镜像、不管本地部署、不替代 AutoDL 控制台。
 
@@ -25,19 +29,19 @@ deploydeck 不构建镜像、不管本地部署、不替代 AutoDL 控制台。
 
 | 名词 | 一句话含义 |
 |---|---|
-| 部署配置（Profile） | 一个场景怎么部署：实例名、算力规格优先级、时长、预算、失败策略、两个脚本 |
-| 项目清单（Project） | 一个项目的代码来源、实例内目录、健康检查命令 |
+| 部署配置（Profile） | 一个场景怎么取实例：实例名、算力规格优先级、开机形态、时长、预算、失败策略 |
+| 项目清单（Project） | 实例内目录与健康检查命令 |
 | 计划（Plan） | 一次授权窗口：能用多久、最多花多少 |
-| 执行（Run） | 计划下的一次部署动作，含逐步日志 |
+| 执行（Run） | 计划下的一次实例获取动作，含逐步日志 |
 | 实例 | AutoDL 控制台里的一台容器实例 |
 | 账本 | 一行一个实例生命周期：规格、起止时刻、单价、金额 |
 
 完整术语见 [术语表](../GLOSSARY.md)。
 
-## 2. 外部项目接入：准备五个文件
+## 2. 外部项目接入：准备两个文件
 
-deploydeck 不认识任何具体项目。接入一个项目只需在配置目录放两个 JSONC 文件，
-并在被部署的仓库里放两个脚本。
+deploydeck 不认识任何具体项目。接入一个项目只需在配置目录放两个 JSONC 文件。
+被部署的仓库里不需要放任何脚本。
 
 ### 2.1 配置目录
 
@@ -61,26 +65,27 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
 | 字段 | 必填 | 含义 |
 |---|---|---|
 | `id` | 是 | 项目标识。文件名去掉 `.jsonc` 必须等于它 |
-| `repository.url` | 是 | 代码的 git 地址。实例内按它克隆 |
-| `repository.branch` | 否 | 默认分支，缺省 `main` |
-| `workdir` | 是 | 实例内的项目目录，例如 `/root/my-project` |
-| `healthCheck` | 是 | 部署后的验证命令。退出码 0 即通过 |
+| `workdir` | 是 | 实例内的项目目录，例如 `/root/my-project`。健康检查命令在它里面执行 |
+| `healthCheck` | 是 | 健康检查命令。退出码 0 即通过 |
 
 ```jsonc
 {
   "id": "my-project",
-  "repository": { "url": "git@github.com:owner/my-project.git", "branch": "main" },
   "workdir": "/root/my-project",
   "healthCheck": "curl -fsS http://127.0.0.1:6006/health"
 }
 ```
 
-判据：`healthCheck` 必须能在实例内跑通。服务没有健康端点时，改用该服务确实可用的探活命令，
-否则部署会以健康检查失败告终。
+判据：
+
+1. `workdir` 必须是绝对路径，且不能以 `/` 结尾。含双引号或换行的取值在生成步骤时即报错。
+2. 引擎把健康检查拼成 `cd "<workdir>" && <healthCheck>` 执行。引号里的 `~` 不展开，所以不用相对路径。
+3. `healthCheck` 不能为空。它必须能在实例内跑通。
+4. 服务没有健康端点时，改用该服务确实可用的探活命令。否则 `run` 会以健康检查失败告终。
 
 ### 2.3 部署配置 `profiles/<id>.jsonc`
 
-它规定某个场景怎么部署。开发与生产的差别全部写在这里，引擎不按「开发/生产」分支判断。
+它规定某个场景怎么取实例。开发与生产的差别全部写在这里，引擎不按「开发/生产」分支判断。
 
 | 字段 | 必填 | 含义 |
 |---|---|---|
@@ -96,9 +101,6 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
 | `ttlMinutes` | 是 | 计划默认可用分钟数 |
 | `budgetCapYuan` | 是 | 计划默认预算上限，单位元 |
 | `onDeployFailure` | 否 | `keep-container`（缺省值）或 `destroy-container` |
-| `requirePinnedCommit` | 是 | 是否强制指定 commit。必填，不给默认值 |
-| `deployScript` | 是 | 项目仓库内的部署脚本相对路径 |
-| `startScript` | 是 | 项目仓库内的启动脚本相对路径 |
 
 ```jsonc
 {
@@ -107,14 +109,13 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
   "provider": "autodl",
   "instanceNamePattern": "my-project-dev",
   "gpuPreference": ["v-32g-p", "5090-p"],
+  "regionPreference": [],
   "powerOnMode": "no-gpu",
+  "cloneDataDisk": true,
   "cloneSourceInstanceName": "my-project-dev",
   "ttlMinutes": 60,
   "budgetCapYuan": 6,
-  "onDeployFailure": "keep-container",
-  "requirePinnedCommit": false,
-  "deployScript": "scripts/deploy.sh",
-  "startScript": "scripts/start.sh"
+  "onDeployFailure": "keep-container"
 }
 ```
 
@@ -147,44 +148,71 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
 3. 引擎不会自行降级到无卡模式，也不会从无卡模式升到有卡模式。写什么就做什么。
 4. 实例已经以有卡形态运行时，`run` 不会为了走无卡模式去关机重开。它报错要人决定。
 
-老配置不写 `powerOnMode` 时按 `gpu` 处理，行为不变。
+要在一台已有实例上换形态，用 `deploydeck switch <instanceId> --gpu|--no-gpu`。
 
-`onDeployFailure` 只管容器，不管代码。`requirePinnedCommit` 只管代码，不管容器。两者互不影响。
+### 2.3.2 `onDeployFailure`：部署失败后容器怎么办
+
+`onDeployFailure` 只管容器，不管代码。
 
 | 取值 | 部署失败后 |
 |---|---|
-| `keep-container` | 容器保留，人可进去查现场。期间继续计费，到计划过期时销毁。开发用 |
-| `destroy-container` | 立即关机、释放，并确认实例从列表消失。生产用 |
+| `keep-container` | 容器保留，实例停机。人可进去查现场。到计划过期时由 `guard` 销毁。 |
+| `destroy-container` | 当前与 `keep-container` 行为相同：保留容器并停机，不自动销毁。 |
 
-判据：`requirePinnedCommit=true` 时 `run` 必须给 `--commit`，否则拒绝执行且不做任何动作。
+判据：自动判定失败只停机止损，不销毁容器。销毁入口只有 `teardown` 命令一条。
 
-### 2.4 被部署仓库里的两个脚本
+### 2.4 哪些事引擎不做
 
-deploydeck 只认两个脚本。它们的路径相对于项目仓库根。
+`run` 只做三件事：获取实例（开机复用或克隆）、等 SSH 就绪、健康检查。
+它不碰实例里的代码与环境。
 
-| 脚本 | 什么时候跑 | 该做什么 |
+判据：装环境、拉代码、起服务都不由引擎执行。引擎里没有对应的字段，也没有对应的步骤。
+
+| 这件事 | 谁做 | 入口 |
 |---|---|---|
-| `deployScript` | **只有开机复用路径跑** | 拉代码、装依赖、构建产物 |
-| `startScript` | **两条路径都跑** | 拉起常驻进程，让它开始监听端口 |
+| 装环境（系统包、语言运行时、Python/Node 依赖） | 使用者 | `shell -- '<命令>'` 或 `shell <instanceId>` 交互终端 |
+| 拉代码、切版本、构建产物 | 使用者 | 同上 |
+| 起服务、改配置、导入数据 | 使用者 | 同上 |
 
-判据：克隆出来的实例环境已就绪，只跑 `startScript`。开机复用的实例代码可能过期，先跑 `deployScript`。
+推荐顺序：
 
-两个脚本必须满足：
+1. 执行 `deploydeck run --plan <planId>`，确认退出码 0。此时实例已开机、SSH 已连通。
+2. 执行自己的环境准备与启动命令。
+3. 执行自己的验证命令，确认业务服务真的可用。
+4. 收工执行 `deploydeck teardown <planId>`。
 
-1. 在实例内可执行。引擎在项目目录里按 `bash <脚本路径>` 调用，
-   路径相对于项目仓库根，所以脚本本身不需要可执行位。
-2. 成功返回退出码 0，失败返回非 0。引擎只看退出码。
-3. 不得交互。没有终端，等待输入会挂到超时。
-4. 长驻进程必须由 `startScript` 拉起并脱离当前会话（例如 `pm2`）。`startScript` 本身必须返回。
+单条命令形态：
 
-超时：`deployScript` 1800 秒，`startScript` 600 秒，`healthCheck` 120 秒。
+```bash
+deploydeck shell <instanceId> -- '<命令>'
+```
+
+例：
+
+```bash
+# 拉代码并切到指定版本
+deploydeck shell <instanceId> -- 'cd /root/my-project && git fetch && git checkout -f <sha>'
+
+# 装依赖
+deploydeck shell <instanceId> -- 'cd /root/my-project && npm ci'
+```
+
+判据：
+
+1. 命令用登录 shell 执行（远端收到的是 `bash -lc '<原文>'`），环境与交互终端里一致。
+2. 一条命令的超时是 600 秒。超过它会以 `SHELL_FAILED` 失败，退出码 2。
+3. 装环境与下载模型这类长任务的耗时由数据量与网络决定。用交互终端跑，自己判断卡住要不要中断。
+4. 使用者自己保证脚本幂等：同一台实例可能被重复获取，也可能被人中途接管。
+5. 业务服务是否就绪，用使用者自己的判据确认。`run` 的成功信号不覆盖这一层。
 
 ### 2.5 接入检查清单
 
 1. 配置目录里放好 `projects/<id>.jsonc` 与 `profiles/<id>.jsonc`。
-2. 被部署仓库里放好两个脚本，并在实例上验证过它们能跑通。
-3. 控制台里有一台**已关机**实例，名字等于 `cloneSourceInstanceName`。它是克隆模板。
-4. 执行 `deploydeck profile list`，确认配置能被解析。
+2. 项目清单的 `workdir` 在被部署的实例里真实存在，取值是绝对路径、不以 `/` 结尾。
+3. 项目清单的 `healthCheck` 已经在这台实例的 `workdir` 里手工跑通过，退出码 0。
+4. 控制台里有一台**已关机**实例，名字或 ID 等于 `cloneSourceInstanceName`。它是克隆模板。
+5. 环境准备与启动命令已经写好在实例上能跑通的形态，接入时经 `shell --` 执行。
+6. 执行 `deploydeck profile list`，确认配置能被解析。
 
 `profile list` 会一次报完全部配置问题。配置有错时不做任何控制台动作。
 
@@ -254,9 +282,9 @@ deploydeck login
 deploydeck profile list
 ```
 
-输出一张表：ID、项目、provider、时长、预算、失败后策略、是否锁定 commit。
+输出一张表：ID、项目、provider、开机形态、时长、预算、失败后策略。
 
-## 5. 一次完整部署
+## 5. 一次完整的取实例流程
 
 五步。每步都先看退出码，退出码为 0 才继续。
 
@@ -274,7 +302,7 @@ deploydeck plan create --profile <profileId>
 
 平台定时关机的时刻 = 计划过期时刻减 5 分钟（安全余量）。
 
-### 5.2 执行部署
+### 5.2 执行
 
 ```bash
 deploydeck run --plan <planId>
@@ -291,7 +319,7 @@ deploydeck run --profile <profileId>
 | `--plan <planId>` | 直接用这份计划 |
 | `--profile <profileId>` | 找该配置的生效计划。恰好一份时用它，多于一份报错，零份失败 |
 | `--create-plan` | 允许 `--profile` 在零份生效计划时当场新建一份。显式授权开关 |
-| `--commit <sha>` | 部署的代码版本，4-40 位十六进制。`requirePinnedCommit=true` 时必填 |
+| `--run-id <id>` | 指定执行 id。测试注入固定值用；默认由 CLI 生成 |
 
 `--plan` 与 `--profile` 必须且只能给一个。
 
@@ -309,17 +337,13 @@ flowchart TB
   E --> R
   R --> F[等 SSH 就绪]
   F --> G[读单价, 复核预算与余额]
-  G -- 超限 --> Z2[立即销毁, 退出码 1]
+  G -- 超限 --> Z2[停机保留实例, 退出码 1]
   G -- 通过 --> H[设置平台定时关机]
-  H --> I{路径}
-  I -- 开机复用 --> J[跑 deployScript]
-  J --> K[跑 startScript]
-  I -- 克隆 --> K
-  K --> L{健康检查}
+  H --> L{健康检查}
   L -- 通过 --> OK[成功]
-  L -- 失败 --> M{onDeployFailure}
-  M -- keep-container --> N[run 记 stray, 实例保留]
-  M -- destroy-container --> O[销毁并确认消失]
+  L -- 失败 --> M{停机}
+  M -- 成功 --> N[run 记 stray, 计划转 stopped-pending-settlement]
+  M -- 失败 --> O[run 记 stray, 计划转 escalated]
 ```
 
 判据：
@@ -328,8 +352,10 @@ flowchart TB
 2. 实例名重复时报错并列出全部同名实例 ID，不猜该用哪一台。
 3. 克隆前检查当日剩余次数。次数为 0 时报错，建议改用开机复用。
 4. 单价只从控制台读取。与上次观测偏差超过 20% 时停下，不按未知价格继续。
-5. 预算或余额不足时**立即销毁实例**，退出码 1。不做「先跑完再说」。
-6. 部署成功后实例**继续运行**。`run` 不等同于「部署完就关机」。
+5. 预算或余额不足时**立即停机并保留实例**，退出码 1。不做「先跑完再说」，也不销毁实例。
+6. 成功时实例**继续运行**。`run` 不等同于「部署完就关机」。
+7. 健康检查是引擎唯一在实例里执行的远端命令。它证明实例已连通，不证明业务服务可用。
+8. 健康检查超时 120 秒，在项目清单的 `workdir` 里执行。
 
 `--json` 输出含 `runId`、`mode`（`reuse` 或 `clone`）、`instanceId`、逐步结果与日志路径。
 
@@ -356,6 +382,7 @@ deploydeck teardown <planId>
 1. 终态判据是「实例从列表消失」，不是「释放请求返回成功」。
 2. 未确认消失时计划转 `ESCALATED`，退出码 2，不自动重试。此时钱可能还在烧，必须人工去控制台确认。
 3. 同一实例生命周期只写一行账本。重复执行 `teardown` 不重复记账。
+4. `run` 失败收尾并确认实例已停机时也会写一行账本，此时再做 `teardown` 不新增行。
 
 ### 5.5 计划层守护
 
@@ -384,11 +411,11 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard
 
 不做第三层兜底：`guard` 不扫描「运行中但没有生效计划」的实例。
 这类实例会一直计费，必须人工处理。判据与后果见 `docs/plan-and-budget.md` 第 5.2 节。
-处理入口是 `deploydeck power <instanceId> off`。
+处理入口是 `deploydeck power <instanceId> --off`。
 
-## 6. 进容器：交互式终端
+## 6. 进容器
 
-部署只是链路的一半。观察进度、处理需要确认的安装、出问题查现场都要进容器。
+装环境、拉代码、起服务、查现场都要进容器。入口是 `shell`。
 
 ### 6.1 进入交互式 shell
 
@@ -407,25 +434,39 @@ deploydeck shell <instanceId>
 2. 不自动开机。要连已关机实例，先自己把它开起来。
 3. 不校验计划。计划外手工开机的实例照样能连。
 4. 必须在真终端里跑。管道、重定向、CI 里没有 tty，报 `INTERACTIVE_TERMINAL_REQUIRED`，退出码 2。
+5. 交互形态不能与 `--json` 一起用。同时给出即报 `SHELL_FAILED`，退出码 2。
 
-### 6.2 在 PTY 里跑一条命令
+### 6.2 用一条命令执行
 
 ```bash
-deploydeck shell <instanceId> -- apt-get update
+deploydeck shell <instanceId> -- '<命令>'
 ```
 
-它在同一个 PTY 里执行这条命令，然后断开。适合三件事：
+它走 SSH 数据面的 `exec` 通道：跑完这一条命令，拿到远端退出码，然后断开。**它不开 PTY。**
 
-1. 需要看进度的长任务。
-2. 需要确认的步骤，例如 `apt install`。
-3. 在脚本里跑一条命令并拿到退出码。
+输出完整落盘到 `<状态目录>/shell/<instanceId>/command.log`。
+人读模式把落盘文件的全文回读并写进终端，不是尾部摘要；输出非空时末尾再补一行日志路径。
+
+适合三件事：
+
+1. 在脚本里跑一条命令并拿到退出码。
+2. 不需要交互的环境准备步骤，例如拉代码、装依赖。
+3. 事后回查：完整输出已经在磁盘上。
 
 判据：
 
-1. `--` 之后的全部参数拼成一条命令。命令里的引号、空格原样保留。
-2. 远端退出码就是本命令的退出码。
-3. 没拿到远端退出码时报 `SHELL_FAILED`，退出码 2。后台任务、连接中断都会走到这里。
-4. 这一步不落盘、不进执行记录、不写账本。它的输出直接进你的终端。
+1. `--` 之后的全部参数用空格拼成一条命令。命令里的引号、空格原样保留。
+2. 引擎把这条命令包成 `bash -lc '<原文>'` 在远端执行，所以**命令用登录 shell 执行**。
+   登录 shell 读远端的 `~/.bash_profile`、`~/.profile`、`~/.bashrc`，
+   因此这里的环境与交互终端里一致。
+3. 包装发生在本地：原文里的单引号先按 shell 规则转义，`echo 'a b'` 到远端还是 `echo 'a b'`。
+4. 超时 600 秒。超时即报 `SHELL_FAILED`，退出码 2，远端命令是否已生效未知。
+5. 远端退出码为 0 才算成功。非 0 时报 `SHELL_FAILED`，退出码 2。
+6. 没拿到远端退出码时报 `SHELL_FAILED`，退出码 2。必须人工核对，不当成 0。
+7. 这一步不进执行记录、不写账本。它的完整输出落在 `shell/<instanceId>/command.log`。
+8. `--json` 模式只输出尾部摘要，全文在 `command.log`；`command` 字段是命令原文，不是包装后的字符串。
+
+装环境、下载模型这类可能超过 600 秒又不确定耗时的动作，用 §6.1 的交互终端执行。
 
 ### 6.3 终端不改任何状态
 
@@ -444,7 +485,8 @@ deploydeck shell <instanceId> -- apt-get update
 
 1. 密码取自控制台 SSH 登录列，只用一次。不落盘、不进日志、不进错误消息。
 2. 主机密钥指纹照样校验。首次记录，变化即 `HOST_KEY_CHANGED`，退出码 2。
-3. 终端输出直接进你的屏幕，不经 deploydeck 的 stdout 抽象，因此不进 `--json`。
+3. 交互形态的输出直接进你的屏幕，不经 deploydeck 的 stdout 抽象，因此不进 `--json`。
+4. shell 命令的包法与主机密钥校验规则与 `run` 的健康检查步骤完全一致。
 
 ## 7. 命令速查
 
@@ -453,19 +495,30 @@ deploydeck shell <instanceId> -- apt-get update
 | `profile list` | 列出全部部署配置 | 否 |
 | `plan create --profile <id>` | 创建计划（授权窗口） | 否 |
 | `plan show [planId] [--balance]` | 查看计划。`--balance` 读账户余额 | 带 `--balance` 时需要 |
-| `run --plan <id>` / `run --profile <id>` | 执行部署 | 是 |
+| `run --plan <id>` / `run --profile <id>` | 执行：取实例、等 SSH 就绪、健康检查 | 是 |
 | `status` | 查看计划、实例、花费、账本 | 有生效计划时需要 |
 | `teardown <planId>` | 销毁实例、记账、关闭计划 | 是 |
 | `login` | 打开专用 Chrome 等人登录 | 是 |
 | `guard [--once]` | 前台常驻守护 | 是 |
 | `shell <instanceId>` | 进入交互式终端（PTY） | 是 |
-| `shell <instanceId> -- <cmd>` | 跑一条命令并返回远端退出码（走 exec，不开 PTY） | 是 |
+| `shell <instanceId> -- <cmd>` | 用登录 shell 跑一条命令并返回远端退出码（走 exec，不开 PTY） | 是 |
 | `power <instanceId> --on\|--off` | 开机或关机，并核实终态 | 是 |
 | `switch <instanceId> --gpu\|--no-gpu` | 关机 → 按目标形态开机 → 复验形态 | 是 |
 | `creds <instanceId>` | 打印 SSH 登录信息（密码只进 stdout） | 是 |
 | `tunnel <instanceId> --ports <本地>:<远端>` | 本机回环端口转发，前台运行 | 是 |
 | `plan extend` | 未实现，退出码 2 | — |
 | `ledger` | 未实现，退出码 2 | — |
+
+`shell -- <cmd>` 的 `--` 之后的全部参数按空格拼成一条命令，引擎把它包成 `bash -lc '<原文>'`：
+命令用登录 shell 执行，环境与交互终端一致。超时 600 秒，完整输出落
+`<状态目录>/shell/<instanceId>/command.log`。
+
+`creds` 的判据：
+
+1. 密码只写 stdout，不落盘、不进日志、不进错误消息。
+2. 人读模式要求 stdout 是终端。被管道或重定向时拒绝输出密码，报 `HUMAN_REQUIRED`，退出码 2。
+3. 拒绝发生在取凭据之前：不开浏览器、不读控制台，一条凭据都不取出来。
+4. `--json` 不受这条限制，字段是 `host`、`port`、`user`、`password`。
 
 `-v, --version` 打印版本号。未知命令退出码 1，并打印 `参数错误。用 --help 查看全部命令与参数。`
 
@@ -494,8 +547,8 @@ deploydeck status --json
 | 退出码 | 含义 | 集成方该做什么 |
 |---|---|---|
 | 0 | 成功 | 读 stdout 的 JSON，继续下一步 |
-| 1 | 业务失败 | 修正输入后重试。例如计划无效、预算不足、脚本失败、健康检查失败 |
-| 2 | 需要人工 | **停止自动重试**，转人工。例如未登录、配置非法、克隆超时、实例未确认消失、配额耗尽、命令未实现 |
+| 1 | 业务失败 | 修正输入后重试。例如计划无效、预算不足、余额不足、健康检查失败、实例不在运行中 |
+| 2 | 需要人工 | **停止自动重试**，转人工。例如未登录、配置非法、克隆超时、实例未确认消失、配额耗尽、命令未实现、人读模式的 `creds` 不是终端 |
 
 判据：退出码 1 可由程序自行处理；退出码 2 一律交给人。把退出码 2 当退出码 1 重试会放大问题，
 例如实例未确认消失时反复重试只会重复发控制台请求。
@@ -525,11 +578,9 @@ deploydeck status --json
 | `PLAN_INVALID` | 1 | 没有生效计划，或计划已过期 |
 | `BUDGET_EXCEEDED` | 1 | 超出预算上限 |
 | `BALANCE_INSUFFICIENT` | 1 | 账户余额不足 |
-| `PINNED_COMMIT_REQUIRED` | 1 | 配置要求锁定 commit，但没给 `--commit` |
-| `SCRIPT_FAILED` | 1 | 部署脚本或启动脚本失败 |
-| `HEALTH_CHECK_FAILED` | 1 | 健康检查未通过 |
+| `HEALTH_CHECK_FAILED` | 1 | 健康检查未通过：退出码非 0，或超过 120 秒被终止 |
 | `LOGIN_REQUIRED` | 2 | 控制台未登录 |
-| `CONFIG_INVALID` | 2 | 配置目录里的文件非法 |
+| `CONFIG_INVALID` | 2 | 配置目录里的文件非法，或命令行参数非法 |
 | `CLONE_QUOTA_EXHAUSTED` | 2 | 当日克隆次数用尽 |
 | `CLONE_TIMEOUT` | 2 | 克隆超时 |
 | `CLONE_RESULT_UNKNOWN` | 2 | 克隆已创建实例，但没能确认（读数失败、跳转失败、改名失败等）。配额已扣，实例状态未知。拿得到实例 ID 时执行引擎会把它绑到计划上并转 escalated；拿不到时按「钱可能还在烧」转 escalated，需人工到控制台核对 |
@@ -537,8 +588,15 @@ deploydeck status --json
 | `BROWSER_CHANNEL_FAILED` / `CHROME_LAUNCH_FAILED` | 1 / 2 | 浏览器通道不可用 / 专用 Chrome 起不来 |
 | `NOT_IMPLEMENTED` | 2 | 命令未实现 |
 | `INSTANCE_NOT_RUNNING` | 1 | 目标实例不在运行中，SSH 连不上 |
+| `INSTANCE_NOT_FOUND` | 1 | 控制台实例列表里找不到目标实例 |
 | `INTERACTIVE_TERMINAL_REQUIRED` | 2 | 需要交互式终端，但当前进程没有 tty |
-| `SHELL_FAILED` | 2 | 终端会话失败：没拿到远端退出码、通道断开、参数冲突 |
+| `SHELL_FAILED` | 2 | `shell` 会话失败：没拿到远端退出码、通道断开、命令超时、交互形态与 `--json` 冲突 |
+| `POWER_ON_FAILED` | 1 | 开机失败：无可用 GPU、等到超时，或动作后状态不是运行中。不降级形态 |
+| `POWER_OFF_FAILED` | 1 | 关机失败：动作返回后实例状态不是已关机。实例可能仍在计费 |
+| `POWER_OFF_TIMEOUT` | 2 | 等关机超时，实例状态仍未变成已关机 |
+| `INSTANCE_FORM_MISMATCH` | 2 | `switch` 复验不一致：实测形态与目标形态不同，或页面没给出可判定的形态。实例已保留 |
+| `TUNNEL_LOCAL_PORT_IN_USE` | 1 | 本地端口已被占用，端口转发起不来。不做预检、不换端口、不重试 |
+| `HUMAN_REQUIRED` | 2 | 需要人工。人读模式的 `creds` 在非终端 stdout 上就报它，拒绝发生在取凭据之前 |
 
 ### 8.4 典型集成流程
 
@@ -551,17 +609,20 @@ deploydeck profile list --json
 # 2. 开计划
 plan_id=$(deploydeck plan create --profile my-project-dev --json | jq -r '.plan.id')
 
-# 3. 部署
+# 3. 取实例（不装环境，不拉代码）
 deploydeck run --plan "$plan_id" --json
 
 # 4. 查询
 deploydeck status --json | jq '.plans[] | { planId, instanceId, spentYuan }'
 
-# 5. 收工
+# 5. 自己的环境准备与启动，由使用者决定
+deploydeck shell "$instance_id" -- '<命令>'
+
+# 6. 收工
 deploydeck teardown "$plan_id" --json
 ```
 
-判据：第 5 步必须执行。`run` 成功后实例仍在运行并计费，只有 `teardown` 或计划过期才会销毁。
+判据：第 6 步必须执行。`run` 成功后实例仍在运行并计费，只有 `teardown` 或计划过期才会销毁。
 
 ### 8.5 agent 使用的额外约束
 
@@ -570,6 +631,7 @@ deploydeck teardown "$plan_id" --json
 3. `run` 返回 `stray` 时实例仍在，必须提示用户进容器查现场或立刻 `teardown`。
 4. 不要用 `--create-plan` 绕过计划。它是人工授权开关，不是默认行为。
 5. 关掉浏览器窗口不影响平台定时关机，但会让 `guard` 与后续命令全部降级。
+6. 不要声称 `run` 成功等于环境就绪。装环境、拉代码、起服务要另跑命令确认。
 
 ## 9. 文件落点
 
@@ -581,6 +643,11 @@ deploydeck teardown "$plan_id" --json
 ├── prices/<profileId>-<slot>.jsonc  单价缓存（slot = gpu | no-gpu）
 ├── runs/<runId>.jsonc            执行记录：步骤、命令、退出码、耗时
 ├── runs/<runId>/logs/<stepId>.log 每一步的完整命令输出
+├── shell/<instanceId>/command.log  `shell -- <命令>` 的完整输出
+├── creds/<instanceId>/           取凭据时的控制台截图与动作日志
+├── power/<instanceId>/           开关机的截图与动作日志
+├── switch/<instanceId>/          切换形态的截图与动作日志
+├── tunnel/<instanceId>/          建端口转发时的控制台证据
 ├── ledger.jsonl                  账本，只追加
 ├── ssh-known-hosts.txt           SSH 主机密钥指纹
 ├── chrome-profile/               专用 Chrome 的登录态
@@ -594,30 +661,30 @@ deploydeck teardown "$plan_id" --json
 1. 状态文件只供阅读，不要手工编辑。机器重写时不保留人工注释。
 2. 需要改状态时用命令，不用编辑器。
 3. 实例销毁后，`runs/<runId>/logs/` 仍在本机，是唯一现场。
+4. 不带 `run` 的命令写证据时一律落 `<命令名>/<instanceId>/`，不进 `runs/`。
 
 ### 9.2 执行步骤 id
 
-`runs/<runId>.jsonc` 的 `steps[].stepId` 取值固定：
+`runs/<runId>.jsonc` 的 `steps[].stepId` 取值固定。一次执行只记录实际跑过的步骤，失败即停，后续步骤不出现。
 
-| stepId | 含义 |
-|---|---|
-| `instance-select` | 选择复用还是克隆 |
-| `power-on` | 开机 |
-| `clone-power-off` | 克隆前关闭源实例 |
-| `clone-quota` | 检查当日克隆配额 |
-| `clone` | 克隆实例 |
-| `ssh-ready` | 等 SSH 就绪 |
-| `price-quote` | 读单价 |
-| `price-drift` | 单价偏差检查 |
-| `price-cache` | 写单价缓存 |
-| `budget-recheck` | 预算复核 |
-| `balance-recheck` | 余额复核 |
-| `timed-shutdown` | 设置平台定时关机 |
-| `sync-commit` | 切 commit 并回验 HEAD（只在给了 `--commit` 时出现） |
-| `deploy-script` | 跑部署脚本（只在开机复用路径出现） |
-| `start-script` | 跑启动脚本 |
-| `health-check` | 健康检查 |
-| `destroy` | 销毁实例 |
+| stepId | 含义 | 何时出现 |
+|---|---|---|
+| `instance-select` | 复用已在运行的实例 | 实例已在运行时 |
+| `power-on` | 开机 | 实例已关机时 |
+| `clone-power-off` | 克隆前关闭源实例 | 源实例未关机时 |
+| `clone-quota` | 检查当日克隆配额 | 走克隆时 |
+| `clone` | 克隆实例 | 走克隆时 |
+| `ssh-ready` | 等 SSH 就绪 | 实例到手后 |
+| `price-quote` | 读单价 | SSH 就绪后 |
+| `price-drift` | 单价偏差检查 | 有上次观测值时 |
+| `price-cache` | 写单价缓存 | 漂移检查通过后 |
+| `budget-recheck` | 预算复核 | 写缓存后 |
+| `balance-recheck` | 余额复核 | 预算复核后 |
+| `timed-shutdown` | 设置平台定时关机 | 余额复核通过后 |
+| `health-check` | 健康检查 | 设置定时关机后 |
+| `power-off-on-failure` | 失败收尾的停机保留 | 实例到手后任一步失败时 |
+
+判据：`health-check` 是唯一的 `ssh` 类型步骤。它是引擎在实例里执行的唯一远端命令。
 
 ## 10. 出问题时
 
@@ -645,9 +712,10 @@ deploydeck login
 
 deploydeck 不自动重试。计划状态停在 `escalated`，`guard` 只巡检 `active` 计划，不会再处理它。
 
-### 10.3 部署失败但实例保留（`run` 状态 `stray`）
+### 10.3 执行失败但实例保留（`run` 状态 `stray`）
 
-含义：按 `onDeployFailure=keep-container` 保留了容器，人该进去查现场。
+含义：任一步失败后引擎只停机保留实例，容器仍在，人该进去查现场。
+`onDeployFailure=keep-container` 是缺省行为，`destroy-container` 当前与它相同：失败时不自动销毁。
 
 处理：
 
@@ -655,11 +723,19 @@ deploydeck 不自动重试。计划状态停在 `escalated`，`guard` 只巡检 
 # 查日志
 ls <状态目录>/runs/<runId>/logs/
 
+# 进容器查现场
+deploydeck power <instanceId> --on
+deploydeck shell <instanceId>
+
 # 立刻销毁，别等计划过期
 deploydeck teardown <planId>
 ```
 
-判据：`stray` 不是 `failed`。实例仍在列表里并在计费。
+判据：
+
+1. `stray` 不是 `failed`。实例仍在列表里，可能仍在计费。
+2. 停机成功时实例已关机、钱已停，但地址与端口保留，所以 `power --on` 之后还能连。
+3. 失败收尾的停机步骤 id 是 `power-off-on-failure`。看得到它说明引擎试过关机。
 
 ### 10.4 锁超时（退出码 2）
 
@@ -697,7 +773,8 @@ deploydeck 靠页面结构定位。页面改版会让全部控制面动作失效
 | `guard` 自启动 | Phase 2 不做，需人自行常驻 |
 | `plan extend` / `ledger` | 未实现 |
 | 交互式终端 | 不做跳板机、文件传输。端口转发走独立的 `tunnel` 命令 |
-| 无卡模式 | 只由部署配置显式指定；已有卡运行的实例不会被自动关机重开 |
+| 无卡模式 | 只由部署配置显式指定；已有卡运行的实例不会被自动关机重开。要换形态用 `switch` |
+| 装环境与起服务 | 不由引擎执行。入口是 `shell`，耗时与失败处置归使用者 |
 | 账本对账 | 按量计费不是逐秒结算，余额差额可能小于真实花费。以账本为准 |
 
 判据：deploydeck 不替代 AutoDL 控制台。控制台仍是唯一事实源。

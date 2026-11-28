@@ -23,12 +23,5 @@
 
   // 部署失败后容器保留。人可以 SSH 进去查现场。
   // 容器到计划过期时刻被销毁。期间继续计费。
-  "onDeployFailure": "keep-container",
-
-  // 开发允许使用实例里的当前工作区。
-  "requirePinnedCommit": false,
-
-  // 两个脚本都在被部署的项目仓库里，路径相对于仓库根。
-  "deployScript": "scripts/deploy.sh",
-  "startScript": "scripts/start.sh"
+  "onDeployFailure": "keep-container"
 }

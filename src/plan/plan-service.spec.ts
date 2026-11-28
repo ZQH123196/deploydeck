@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { PowerPort, PriceQuote } from '../console/ports.js'
+import type { PriceQuote } from '../console/ports.js'
 import type { Plan } from '../domain/plan.js'
 import type { Profile } from '../domain/profile.js'
 import {
@@ -62,11 +62,6 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
     ttlMinutes: 60,
     budgetCapYuan: 6,
     onDeployFailure: 'keep-container',
-    requirePinnedCommit: false,
-    deployScript: 'scripts/deploy.sh',
-    startScript: 'scripts/start.sh',
-    env: {},
-    bootstrapEnv: {},
     ...overrides,
   }
 }
@@ -92,28 +87,6 @@ function makeQuote(overrides: Partial<PriceQuote> = {}): PriceQuote {
     ttlMinutes: 60,
     balanceYuan: 100,
     ...overrides,
-  }
-}
-
-/** 假停机端口：记下被停机的实例，按需抛错。销毁端口不该出现在这条路径上。 */
-interface FakePower {
-  readonly port: PowerPort
-  readonly poweredOffInstanceIds: string[]
-}
-
-function createFakePower(options: { readonly failure?: Error } = {}): FakePower {
-  const poweredOffInstanceIds: string[] = []
-  return {
-    poweredOffInstanceIds,
-    port: {
-      powerOn: async (instanceId) => ({ ok: true, instanceId }),
-      powerOff: async (instanceId) => {
-        poweredOffInstanceIds.push(instanceId)
-        if (options.failure !== undefined) {
-          throw options.failure
-        }
-      },
-    },
   }
 }
 
@@ -396,15 +369,14 @@ describe('showPlan', () => {
 })
 
 describe('recheckAfterInstanceReady', () => {
-  it('预计花费超上限时停机保留实例并抛 BudgetExceededError，退出码 1', async () => {
+  it('预计花费超上限时抛 BudgetExceededError，退出码 1', async () => {
     // Arrange
     const fixture = await createFixture()
     const created = await fixture.service.createPlan({
       profile: makeProfile(),
       provider: { id: 'autodl', capabilities: makeCapabilities() },
     })
-    const power = createFakePower()
-    const enforcement = createBudgetEnforcement({ plans: fixture.plans, power: power.port })
+    const enforcement = createBudgetEnforcement({ plans: fixture.plans })
 
     // Act
     let caught: unknown
@@ -412,71 +384,63 @@ describe('recheckAfterInstanceReady', () => {
       await enforcement.recheckAfterInstanceReady({
         planId: created.id,
         runId: 'run-1',
-        instanceId: 'instance-1',
         quote: makeQuote({ unitPriceYuanPerHour: 10, estimatedCostYuan: 10 }),
       })
     } catch (error: unknown) {
       caught = error
     }
 
-    // Assert：判据是「停机保留」——停机有、销毁没有，报错指向 teardown。
-    expect(power.poweredOffInstanceIds).toEqual(['instance-1'])
+    // Assert
     expect(caught).toBeInstanceOf(BudgetExceededError)
     if (!(caught instanceof BudgetExceededError)) {
       throw new Error('期望抛出 BudgetExceededError')
     }
     expect(caught.code).toBe('BUDGET_EXCEEDED')
     expect(caught.exitCode).toBe(1)
-    expect(caught.message).toContain('已停机并保留实例 instance-1')
-    expect(caught.message).toContain('teardown')
   })
 
-  it('停机失败也抛 BudgetExceededError，报错写明实例仍在计费', async () => {
+  it('超预算时不停机：停机只有失败收尾一处出口', async () => {
+    // 判据（S1）：本函数若自己停机，账本封口判据就得同时看两处。
+    // 本函数只收计划存储，没有停机端口可用 —— 这条用例锁住「抛错就够了」。
     // Arrange
     const fixture = await createFixture()
     const created = await fixture.service.createPlan({
       profile: makeProfile(),
       provider: { id: 'autodl', capabilities: makeCapabilities() },
     })
-    const power = createFakePower({ failure: new Error('控制台关机按钮没响应') })
-    const enforcement = createBudgetEnforcement({ plans: fixture.plans, power: power.port })
+    const enforcement = createBudgetEnforcement({ plans: fixture.plans })
 
     // Act
-    const caught = (await enforcement
+    const caught = await enforcement
       .recheckAfterInstanceReady({
         planId: created.id,
         runId: 'run-1',
-        instanceId: 'instance-1',
         quote: makeQuote({ unitPriceYuanPerHour: 10, estimatedCostYuan: 10 }),
       })
-      .catch((error: unknown) => error)) as BudgetExceededError
+      .catch((error: unknown) => error)
 
-    // Assert
+    // Assert：只报预算，不宣称已停机 —— 它根本不知道实例停没停。
     expect(caught).toBeInstanceOf(BudgetExceededError)
-    expect(caught.message).toContain('停机失败：控制台关机按钮没响应')
-    expect(caught.message).toContain('仍在计费')
-    expect(caught.message).toContain('teardown')
+    expect((caught as Error).message).not.toContain('已停机')
+    expect((caught as Error).message).toContain('超预算')
   })
 
-  it('预算足够时不销毁实例、不抛错', async () => {
+  it('预算足够时不抛错', async () => {
     // Arrange
     const fixture = await createFixture()
     const created = await fixture.service.createPlan({
       profile: makeProfile(),
       provider: { id: 'autodl', capabilities: makeCapabilities() },
     })
-    const power = createFakePower()
-    const enforcement = createBudgetEnforcement({ plans: fixture.plans, power: power.port })
+    const enforcement = createBudgetEnforcement({ plans: fixture.plans })
 
     // Act + Assert
     await expect(
       enforcement.recheckAfterInstanceReady({
         planId: created.id,
         runId: 'run-1',
-        instanceId: 'instance-1',
         quote: makeQuote(),
       }),
     ).resolves.toBeUndefined()
-    expect(power.poweredOffInstanceIds).toEqual([])
   })
 })

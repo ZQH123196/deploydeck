@@ -53,20 +53,6 @@ export const StepResultSchema = z.object({
   logPath: z.string().min(1),
   /** 动作前后截图。没有截图的步骤为空数组。 */
   screenshotPaths: z.array(z.string().min(1)).default([]),
-  /**
-   * 这一步没执行，因为它要达成的目标此前已经达成过。
-   *
-   * 判据只有一条用途：引导脚本。引导是「实例首次就绪时跑一次」的动作，
-   * 已跑过时执行层要留一条跳过记录 —— 步骤列表里少了这一步，运维会以为配置写错了。
-   *
-   * 不要给它找第二个用途。「计划窗口不足没跑这一步」那类不是跳过：它要么是失败，
-   * 要么根本没进计划。把那种情况记成跳过，等于把失败伪装成正常。
-   *
-   * 跳过时 `exitCode` 记 0：这一步的目标达成了，只是达成在更早的一次执行里。
-   * 不要记 `null` —— `null` 的含义是「没拿到退出码」，执行层会把它当失败收尾，
-   * 一次正常跳过会变成一次失败。
-   */
-  skipped: z.boolean().default(false),
 })
 
 export type StepResult = z.infer<typeof StepResultSchema>
@@ -82,7 +68,7 @@ export const RunSchema = z.object({
   mode: RunModeSchema,
   /** 目标实例。克隆尚未完成时为空。 */
   instanceId: z.string().min(1).nullable().default(null),
-  /** 部署的代码版本。配置文件不强制时可以为空。 */
+  /** 部署的代码版本。不锁定版本时为空。 */
   commitSha: z.string().min(1).nullable().default(null),
   state: RunStateSchema.default('created'),
   startedAt: z.string().min(1),

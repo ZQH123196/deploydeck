@@ -80,6 +80,7 @@ function formatRoundProgress(round: number, report: GuardRoundReport): string {
     `守护第 ${String(round)} 轮：生效计划 ${String(report.activePlanCount)} 份`,
     `过期 ${String(report.expiredPlanIds.length)} 份`,
     `关闭 ${String(report.closedPlanIds.length)} 份`,
+    `待结算 ${String(report.stoppedPendingSettlementPlanIds.length)} 份`,
     `ESCALATED ${String(report.escalatedPlanIds.length)} 份`,
   ]
   if (report.balanceYuan === null) {
@@ -102,7 +103,14 @@ function formatRoundResult(
     `守护巡检完成：${report.startedAt}`,
     `  生效计划：${String(report.activePlanCount)} 份（过期 ${String(report.expiredPlanIds.length)} 份）`,
     `  已关闭：${report.closedPlanIds.length === 0 ? '无' : report.closedPlanIds.join('、')}`,
-    `  ESCALATED：${report.escalatedPlanIds.length === 0 ? '无' : report.escalatedPlanIds.join('、')}`,
+    `  待结算（实例已停机，钱已停）：${
+      report.stoppedPendingSettlementPlanIds.length === 0
+        ? '无'
+        : report.stoppedPendingSettlementPlanIds.join('、')
+    }`,
+    `  ESCALATED（实例未确认消失，钱可能还在烧）：${
+      report.escalatedPlanIds.length === 0 ? '无' : report.escalatedPlanIds.join('、')
+    }`,
   ]
   if (report.balanceYuan === null) {
     lines.push('  账户余额：未读取（控制面不可用）')

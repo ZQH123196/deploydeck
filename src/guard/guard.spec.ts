@@ -87,11 +87,6 @@ function makeProfile(): Profile {
     ttlMinutes: 60,
     budgetCapYuan: 6,
     onDeployFailure: 'keep-container',
-    requirePinnedCommit: false,
-    deployScript: 'scripts/deploy.sh',
-    startScript: 'scripts/start.sh',
-    env: {},
-    bootstrapEnv: {},
   }
 }
 
@@ -411,7 +406,7 @@ describe('guard：预算熔断', () => {
     expect((await fixture.readPlan(plan.id)).state).toBe('active')
   })
 
-  it('实例已消失但执行记录缺结算字段：仍先销毁，再转 escalated', async () => {
+  it('实例已消失但执行记录缺结算字段：转待结算，不转 escalated', async () => {
     // Arrange
     const fixture = await createFixture()
     const plan = await fixture.createPlan({
@@ -430,13 +425,16 @@ describe('guard：预算熔断', () => {
     // Act
     const report = await fixture.runRound()
 
-    // Assert：钱先止损，账本因缺字段不写，计划交人工。
+    // Assert：钱先止损，账本因缺字段不写。
+    // 判据（M2）：实例已确认消失，钱停了。这类计划不能报 escalated ——
+    // escalated 的含义是「钱可能还在烧」，写错状态会让人去找一台不存在的机器。
     expect(fixture.provider.calls).toContain(`destroy(${INSTANCE_ID})`)
-    expect(report.escalatedPlanIds).toEqual([plan.id])
-    expect((await fixture.readPlan(plan.id)).state).toBe('escalated')
+    expect(report.escalatedPlanIds).toEqual([])
+    expect(report.stoppedPendingSettlementPlanIds).toEqual([plan.id])
+    expect((await fixture.readPlan(plan.id)).state).toBe('stopped-pending-settlement')
     expect(await fixture.readLedger()).toEqual([])
-    const escalated = eventsNamed(fixture.events, 'guard.plan.escalated')
-    expect(String(escalated[0]?.fields?.['reason'])).toContain('run-accounting-incomplete')
+    const pending = eventsNamed(fixture.events, 'guard.plan.stopped-pending-settlement')
+    expect(String(pending[0]?.fields?.['reason'])).toContain('run-accounting-incomplete')
   })
 })
 
@@ -578,8 +576,90 @@ describe('guard：结算锁', () => {
   })
 })
 
+describe('guard：停机成功待结算的计划', () => {
+  it('待结算计划被本轮结算：写一行账、计划转 closed', async () => {
+    // Arrange：失败停机成功，计划处于 stopped-pending-settlement，实例还在列表里（停着）。
+    const fixture = await createFixture()
+    const plan = await fixture.createPlan({
+      id: 'plan-pending',
+      instanceId: INSTANCE_ID,
+      state: 'stopped-pending-settlement',
+    })
+    await fixture.seedRun({ runId: 'run-pending', planId: plan.id, instanceId: INSTANCE_ID })
+
+    // Act
+    const report = await fixture.runRound()
+
+    // Assert：这类计划不靠「过期」也要被处理，否则钱停了账永远结不掉。
+    expect(report.closedPlanIds).toContain(plan.id)
+    expect(report.escalatedPlanIds).toEqual([])
+    expect((await fixture.readPlan(plan.id)).state).toBe('closed')
+    expect(await fixture.readLedger()).toHaveLength(1)
+  })
+
+  it('待结算计划已有账本行：只关闭，不写第二行、不调销毁链', async () => {
+    // Arrange：失败停机已经写过账（计费终点 = 停机时刻），计划状态是待结算。
+    const fixture = await createFixture()
+    const stoppedAt = beijingIso(new Date(Date.parse(START_ISO) + 5 * 60_000))
+    const recordedEntry: LedgerEntry = {
+      planId: 'plan-pending-accounted',
+      runId: 'run-pending-accounted',
+      instanceId: INSTANCE_ID,
+      gpuSpec: 'RTX 5090(32GB)',
+      startedAt: START_ISO,
+      stoppedAt,
+      unitPriceYuanPerHour: 2,
+      amountYuan: (2 * 5) / 60,
+    }
+    await fixture.ledger.append(recordedEntry)
+    const plan = await fixture.createPlan({
+      id: 'plan-pending-accounted',
+      instanceId: INSTANCE_ID,
+      spentYuan: recordedEntry.amountYuan,
+      state: 'stopped-pending-settlement',
+    })
+    await fixture.seedRun({
+      runId: 'run-pending-accounted',
+      planId: plan.id,
+      instanceId: INSTANCE_ID,
+    })
+    fixture.clock.advanceMinutes(120)
+
+    // Act
+    const report = await fixture.runRound()
+
+    // Assert（M1）：账本行不变；金额不再累加；计划关闭。
+    expect(report.closedPlanIds).toContain(plan.id)
+    expect(await fixture.readLedger()).toEqual([recordedEntry])
+    const closed = await fixture.readPlan(plan.id)
+    expect(closed.state).toBe('closed')
+    expect(closed.spentYuan).toBeCloseTo(recordedEntry.amountYuan, 10)
+    // 已有账本行时连销毁链都不必走：实例的计费终点已封口。
+    expect(fixture.provider.calls).not.toContain(`destroy(${INSTANCE_ID})`)
+  })
+
+  it('待结算计划没有绑定实例：直接关闭，不碰控制台', async () => {
+    // Arrange
+    const fixture = await createFixture()
+    const plan = await fixture.createPlan({
+      id: 'plan-pending-no-instance',
+      instanceId: null,
+      state: 'stopped-pending-settlement',
+    })
+
+    // Act
+    const report = await fixture.runRound()
+
+    // Assert：没有可结的账，只把计划关掉，避免每轮重复扫到它。
+    expect(report.closedPlanIds).toContain(plan.id)
+    expect((await fixture.readPlan(plan.id)).state).toBe('closed')
+    // 没有实例可销毁：这一轮不出现任何销毁动作（余额层照常读余额）。
+    expect(fixture.provider.calls.some((call) => call.startsWith('destroy'))).toBe(false)
+  })
+})
+
 describe('guard：执行记录缺失', () => {
-  it('销毁后找不到执行记录：计划转 escalated，账本不写', async () => {
+  it('销毁后找不到执行记录：计划转待结算，账本不写', async () => {
     // Arrange
     const fixture = await createFixture()
     const plan = await fixture.createPlan({
@@ -592,11 +672,12 @@ describe('guard：执行记录缺失', () => {
     // Act
     const report = await fixture.runRound()
 
-    // Assert
-    expect(report.escalatedPlanIds).toEqual([plan.id])
-    expect((await fixture.readPlan(plan.id)).state).toBe('escalated')
-    const escalated = eventsNamed(fixture.events, 'guard.plan.escalated')
-    expect(String(escalated[0]?.fields?.['reason'])).toContain('run-record-missing')
+    // Assert：实例已确认消失（钱停了），只是账还差一步。
+    expect(report.escalatedPlanIds).toEqual([])
+    expect(report.stoppedPendingSettlementPlanIds).toEqual([plan.id])
+    expect((await fixture.readPlan(plan.id)).state).toBe('stopped-pending-settlement')
+    const pending = eventsNamed(fixture.events, 'guard.plan.stopped-pending-settlement')
+    expect(String(pending[0]?.fields?.['reason'])).toContain('run-record-missing')
   })
 
   it('销毁链自身抛错：计划转 escalated，错误进日志', async () => {

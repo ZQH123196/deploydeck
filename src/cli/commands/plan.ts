@@ -176,7 +176,12 @@ async function showPlanOrThrow(
   }
 }
 
-/** 计划状态的展示词。ESCALATED 保留英文：它表示钱可能还在烧，不适合用温和的译名。 */
+/**
+ * 计划状态的展示词。
+ *
+ * 判据：每个展示词都必须回答「钱停了没有」。ESCALATED 保留英文：
+ * 它表示钱可能还在烧，不适合用温和的译名。
+ */
 export function formatPlanState(state: PlanState): string {
   if (state === 'active') {
     return '生效中'
@@ -187,5 +192,8 @@ export function formatPlanState(state: PlanState): string {
   if (state === 'expired') {
     return '已过期'
   }
-  return 'ESCALATED（需人工确认）'
+  if (state === 'stopped-pending-settlement') {
+    return '已停机·待结算（钱已停，账未结）'
+  }
+  return 'ESCALATED（需人工确认，钱可能还在烧）'
 }

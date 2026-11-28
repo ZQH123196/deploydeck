@@ -14,7 +14,11 @@ import {
 } from '../config/paths.js'
 import { loadProject } from '../config/project-loader.js'
 import { openConsoleSession, type ConsoleSession } from '../console/channel-factory.js'
-import { createInstanceListActions } from '../console/instance-list.js'
+import {
+  createInstanceListActions,
+  readInstanceStatus,
+  type InstanceStatusProbe,
+} from '../console/instance-list.js'
 import type { ConsoleRuntimeContext } from '../console/ports.js'
 import { CONSOLE_INSTANCE_LIST_URL } from '../console/selectors.js'
 import type { Profile } from '../domain/profile.js'
@@ -88,11 +92,17 @@ export interface ProviderSession {
  *
  * `exec` 是同一批凭据下的数据面出口。它给非交互形态用：非交互形态不需要 PTY，
  * 需要的是「跑完一条命令拿退出码」。
+ *
+ * `readInstanceStatus` 是同一批凭据下的实例状态读数。非交互形态在 `exec` 之前用它判
+ * 「实例在运行中」：`exec` 通道不带这条判断，而终端通道带了。判据只有一条
+ * 「只连运行中的实例」，两种形态各自守一遍，读数走同一个控制台动作。
  */
 export interface ShellSession {
   readonly shell: SshShellPort
   /** 与交互形态同一套凭据与指纹校验的数据面出口。 */
   exec(instanceId: string, command: string, options: SshExecOptions): Promise<SshExecResult>
+  /** 读实例状态。不在列表里即抛 `InstanceNotFoundError`。 */
+  readInstanceStatus(instanceId: string): Promise<InstanceStatusProbe>
   close(): Promise<void>
 }
 
@@ -339,6 +349,10 @@ export function createRealCliDependencies(
         shell,
         exec: async (instanceId, command, execOptions) =>
           await ssh.exec(instanceId, command, execOptions),
+        // 与终端通道同一条状态读数：`createShellPort` 里的运行中判断用的就是它，
+        // 这里把它交出去，非交互形态才不会绕过这条判据。
+        readInstanceStatus: async (instanceId) =>
+          await readInstanceStatus(shellContext.channel, instanceId),
         close: async () => {
           await session.close()
         },

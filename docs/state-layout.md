@@ -29,8 +29,9 @@
 │       ├── logs/              每步的完整命令输出
 │       ├── screenshots/       预留：按步骤截图（当前未写入）
 │       └── *.png / *.jsonl    控制台动作的截图与动作日志（见 2.1）
-├── bootstrap/                 引导记录，一台实例一份
-│   └── <instanceId>.jsonc     引导成功记录：实例、部署配置、项目、脚本、封口时刻
+├── shell/                     不带 run 的命令证据（见 2.2）
+│   └── <instanceId>/
+│       └── command.log        `shell -- <命令>` 的完整输出
 ├── ledger.jsonl               账本，一行一个实例生命周期，只追加
 ├── ssh-known-hosts.txt        SSH 主机密钥指纹，一行一个端点，可手工删行
 ├── chrome-profile/            非 WSL 时的专用 Chrome user-data-dir（WSL 下改落 Windows 本地磁盘）
@@ -43,9 +44,9 @@
 | `plans/<planId>.jsonc` | 计划 | 计划命令（工单 09） |
 | `prices/<profileId>-<slot>.jsonc` | 单价缓存：单价、观测时刻、gpuSpec。`slot` 是开机形态，取 `gpu` 或 `no-gpu` | 执行引擎（工单 10） |
 | `runs/<runId>.jsonc` | 执行记录 | 执行引擎（工单 10） |
-| `runs/<runId>/logs/<stepId>.log` | 一步一份：SSH 步骤是命令完整输出，控制台动作与内置判定是引擎写的开始与结束记录 | 执行引擎与 SSH 通道（工单 10） |
+| `runs/<runId>/logs/<stepId>.log` | 一步一份：`health-check` 是 SSH 命令完整输出，控制台动作与内置判定是引擎写的开始与结束记录 | 执行引擎与 SSH 通道（工单 10） |
 | `runs/<runId>/screenshots/` | 预留目录；当前没有写入者（见 2.1） | — |
-| `bootstrap/<instanceId>.jsonc` | 引导记录：实例、部署配置、项目、脚本、封口时刻。存在即表示该实例的引导已成功跑过 | 执行引擎（引导步骤） |
+| `shell/<instanceId>/command.log` | `shell -- <命令>` 的完整输出，只覆盖这一形态 | `shell` 命令的非交互形态 |
 | `ledger.jsonl` | 账本 | 账本存储（工单 11） |
 | `ssh-known-hosts.txt` | SSH 主机密钥指纹 | SSH 通道（工单 07） |
 | `chrome-profile/` | 专用 Chrome 的 user-data-dir：控制台登录态与浏览器缓存。仅非 WSL 时使用 | 专用 Chrome 进程 |
@@ -91,9 +92,9 @@ CLI 在执行前先定 run id、建 `runs/<runId>/`，再把 provider 的 `logDi
 
 ```text
 <状态目录>/
-├── shell/<instanceId>/     终端命令的完整输出
+├── shell/<instanceId>/     终端命令的完整输出（command.log，只覆盖 `shell -- <命令>` 形态）
 ├── creds/<instanceId>/     取凭据时的控制台截图与动作日志
-├── tunnel/<instanceId>/    立端口转发时的控制台证据
+├── tunnel/<instanceId>/    建端口转发时的控制台证据
 ├── power/<instanceId>/     开机与关机动作的截图与动作日志
 ├── switch/<instanceId>/    切换开机形态的截图与动作日志
 └── runs/<runId>/           一次 run 执行的全部现场（只有这一种）
@@ -103,9 +104,6 @@ CLI 在执行前先定 run id、建 `runs/<runId>/`，再把 provider 的 `logDi
 命令证据塞进 `runs/` 会让这条判据失去意义：事后按 `runs/<runId>` 找不到的东西，
 就不知道该去哪找。新增命令要写证据时，按 `<命令名>/<instanceId>/` 建目录，不要进 `runs/`。
 
-`StepResult.skipped` 为 true 表示这一步没有执行、目标此前已达成。当前只有引导脚本会这样：
-引导成功跑过一次之后，重跑 `run` 会在该步记一条跳过（`exitCode` 为 0，`stderrTail` 写跳过依据）。
-引导记录落在 `bootstrap/<instanceId>.jsonc`，删掉它即强制重跑。
 判据：不要声称 `runs/<runId>/screenshots/` 已经有内容。
 
 ## 3. 文件格式

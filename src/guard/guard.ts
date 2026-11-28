@@ -9,7 +9,9 @@ import {
   buildLedgerEntry,
   closePlanWithLedger,
   closePlanWithoutLedger,
+  findInstanceEntry,
   markPlanEscalated,
+  markPlanStoppedPendingSettlement,
   requireRunAccounting,
 } from '../plan/settlement.js'
 import type { Provider } from '../providers/provider.js'
@@ -63,7 +65,17 @@ export interface GuardRoundReport {
   readonly overBudgetPlanIds: readonly string[]
   /** 本轮销毁并关闭的计划。 */
   readonly closedPlanIds: readonly string[]
-  /** 本轮转 `escalated` 的计划：实例未确认消失或结算失败。 */
+  /**
+   * 本轮转 `stopped-pending-settlement` 的计划：实例已停机，钱停了，等下一轮结算。
+   *
+   * 与 `escalatedPlanIds` 分开列：这一类不需要人立即去控制台关机。
+   */
+  readonly stoppedPendingSettlementPlanIds: readonly string[]
+  /**
+   * 本轮转 `escalated` 的计划：实例未确认消失或结算失败，钱可能还在烧。
+   *
+   * 判据：只有「实例可能仍在运行」才进这一列。停机成功的计划不进这里。
+   */
   readonly escalatedPlanIds: readonly string[]
   /** 本轮读到的账户余额。没读到时为 null。 */
   readonly balanceYuan: number | null
@@ -106,10 +118,16 @@ export interface GuardLoopOptions extends GuardRoundSettings {
   readonly onRound?: (report: GuardRoundReport) => void
 }
 
-/** 需要销毁的计划及原因。原因只进日志与报告，不改变动作。 */
+/**
+ * 需要销毁的计划及原因。原因只进日志与报告，不改变动作。
+ *
+ * `pending-settlement` 不是「到期」也不是「超预算」：实例已经停机，钱停了，
+ * 本轮只需要把账结掉。它和另两个原因的动作相同（销毁链 + 结算），差别只在于
+ * 前者通常秒回「已消失」，因为实例本来就停着。
+ */
 interface PendingPlan {
   readonly plan: Plan
-  readonly reason: 'expired' | 'budget-trip'
+  readonly reason: 'expired' | 'budget-trip' | 'pending-settlement'
 }
 
 /**
@@ -131,8 +149,14 @@ export async function runGuardRound(
   const overBudgetPlans = activePlans.filter(
     (plan) => !expiredIds.has(plan.id) && decideRuntime(plan) === 'trip',
   )
+  // 停机成功、等结算的计划。它们的钱已经停了，不按「过期」或「超预算」再算一遍：
+  // 判据只看状态，不再看时钟 —— 这类计划可能还没到期，也可能到期了。
+  const pendingSettlementPlans = allPlans.filter(
+    (plan) => plan.state === 'stopped-pending-settlement',
+  )
 
   const closedPlanIds: string[] = []
+  const stoppedPendingSettlementPlanIds: string[] = []
   const escalatedPlanIds: string[] = []
 
   // 过期但没有绑定实例：没有可销毁的对象，直接关闭，避免每轮重复扫描。
@@ -156,12 +180,36 @@ export async function runGuardRound(
     }
   }
 
+  // 停机成功但没绑定实例：没有可销毁的对象，也就没有可结算的账，直接关闭。
+  for (const plan of pendingSettlementPlans) {
+    if (plan.instanceId !== null) {
+      continue
+    }
+    try {
+      await closePlanWithoutLedger(deps, plan.id)
+      closedPlanIds.push(plan.id)
+      deps.logger.info('guard.plan.closed', {
+        planId: plan.id,
+        reason: 'pending-settlement-without-instance',
+      })
+    } catch (error: unknown) {
+      deps.logger.error('guard.plan.close-failed', {
+        planId: plan.id,
+        reason: 'pending-settlement-without-instance',
+        error: describeError(error),
+      })
+    }
+  }
+
   let degraded = false
   const pending: PendingPlan[] = [
     ...expiredPlans
       .filter((plan) => plan.instanceId !== null)
       .map((plan): PendingPlan => ({ plan, reason: 'expired' })),
     ...overBudgetPlans.map((plan): PendingPlan => ({ plan, reason: 'budget-trip' })),
+    ...pendingSettlementPlans
+      .filter((plan) => plan.instanceId !== null)
+      .map((plan): PendingPlan => ({ plan, reason: 'pending-settlement' })),
   ]
   for (const pendingPlan of pending) {
     let logDir: string
@@ -191,7 +239,14 @@ export async function runGuardRound(
       break
     }
     try {
-      await handlePlan(deps, pendingPlan, session.provider, closedPlanIds, escalatedPlanIds)
+      await handlePlan(
+        deps,
+        pendingPlan,
+        session.provider,
+        closedPlanIds,
+        stoppedPendingSettlementPlanIds,
+        escalatedPlanIds,
+      )
     } catch (error: unknown) {
       // 单份计划的结算失败不能中断其余计划：钱要尽早止损。
       deps.logger.error('guard.plan.failed', {
@@ -237,6 +292,7 @@ export async function runGuardRound(
     expiredPlanIds: expiredPlans.map((plan) => plan.id),
     overBudgetPlanIds: overBudgetPlans.map((plan) => plan.id),
     closedPlanIds,
+    stoppedPendingSettlementPlanIds,
     escalatedPlanIds,
     balanceYuan,
     balanceWarning,
@@ -267,12 +323,23 @@ export async function runGuardLoop(
   }
 }
 
-/** 处理一份需要销毁的计划：销毁 → 记账 → 关闭；未确认消失则转 escalated。 */
+/**
+ * 处理一份需要销毁的计划：销毁 → 记账 → 关闭。
+ *
+ * 判据（M1/M2）：两种结局的状态必须分开写。
+ * 1. 实例确认消失（销毁链成功，或实例本来就不在列表里）：钱停了。
+ *    - 该实例已有账本行 → 那一行就是计费终点，本次不写账，直接关闭。
+ *    - 没有账本行 → 按当前钟点写一行再关闭（此时当前钟点就是停机时刻）。
+ *    结算环节失败（缺字段、锁冲突等）时，实例毕竟已经不在，计划写
+ *    `stopped-pending-settlement` 而不是 `escalated`：钱停了，只是账还差一步。
+ * 2. 实例未确认消失（销毁链失败或超时）：计划转 `escalated`，钱可能还在烧。
+ */
 async function handlePlan(
   deps: GuardDependencies,
   pendingPlan: PendingPlan,
   provider: Provider,
   closedPlanIds: string[],
+  stoppedPendingSettlementPlanIds: string[],
   escalatedPlanIds: string[],
 ): Promise<void> {
   const { plan } = pendingPlan
@@ -280,6 +347,13 @@ async function handlePlan(
   if (instanceId === null) {
     // 调用方已过滤；这里保留判据，防止将来改动漏过滤。
     throw new Error(`计划 ${plan.id} 没有绑定实例，不应进入销毁流程。`)
+  }
+
+  const existingEntry = await findInstanceEntry(deps.ledger, plan.id, instanceId)
+  // 已有账本行时实例的计费终点已封口：连销毁链都不必走（实例可能早已不在列表里）。
+  if (existingEntry !== null) {
+    await closeAlreadyAccountedPlan(deps, plan, instanceId, closedPlanIds, stoppedPendingSettlementPlanIds)
+    return
   }
 
   let outcome: TeardownOutcome
@@ -296,12 +370,13 @@ async function handlePlan(
 
   const run = await latestRunForInstance(deps, plan.id, instanceId)
   if (run === undefined) {
-    await escalate(
+    // 实例已确认消失：钱停了。缺执行记录只是账还差一步，不能报成「钱可能还在烧」。
+    await settleFailureAfterInstanceGone(
       deps,
       plan,
-      escalatedPlanIds,
+      stoppedPendingSettlementPlanIds,
       'run-record-missing',
-      `找不到绑定实例 ${instanceId} 的执行记录，无法结算账本。`,
+      `实例 ${instanceId} 已确认消失，但找不到绑定它的执行记录，无法结算账本。`,
     )
     return
   }
@@ -311,7 +386,13 @@ async function handlePlan(
     accounting = requireRunAccounting(run)
   } catch (error: unknown) {
     // 实例已经消失，钱停止计费；但账本缺字段，不能编金额，交人工。
-    await escalate(deps, plan, escalatedPlanIds, 'run-accounting-incomplete', error)
+    await settleFailureAfterInstanceGone(
+      deps,
+      plan,
+      stoppedPendingSettlementPlanIds,
+      'run-accounting-incomplete',
+      error,
+    )
     return
   }
 
@@ -336,11 +417,88 @@ async function handlePlan(
       reason: pendingPlan.reason,
     })
   } catch (error: unknown) {
-    await escalate(deps, plan, escalatedPlanIds, 'settlement-failed', error)
+    await settleFailureAfterInstanceGone(
+      deps,
+      plan,
+      stoppedPendingSettlementPlanIds,
+      'settlement-failed',
+      error,
+    )
   }
 }
 
-/** 计划转 escalated 并记 error 日志。守护进程不因它改退出码。 */
+/**
+ * 该实例已经在账本里：实例的计费终点是那一行的 `stoppedAt`，直接关闭计划。
+ *
+ * 判据（M1）：已有账本行时不构造 entry、不调销毁链。账本已封口，
+ * 再用当前钟点造一行只会被结算层丢弃，账本因此永久少记时间。
+ * 关闭失败时计划写 `stopped-pending-settlement`：钱停了，下一轮再关。
+ */
+async function closeAlreadyAccountedPlan(
+  deps: GuardDependencies,
+  plan: Plan,
+  instanceId: string,
+  closedPlanIds: string[],
+  stoppedPendingSettlementPlanIds: string[],
+): Promise<void> {
+  try {
+    const closed = await closePlanWithLedger(deps, plan.id, instanceId, null)
+    closedPlanIds.push(plan.id)
+    deps.logger.info('guard.plan.closed', {
+      planId: plan.id,
+      instanceId,
+      wroteLedgerEntry: false,
+      accountedStoppedAt: closed.existingEntry?.stoppedAt ?? null,
+      spentYuan: closed.plan.spentYuan,
+      reason: 'already-accounted',
+    })
+  } catch (error: unknown) {
+    await settleFailureAfterInstanceGone(
+      deps,
+      plan,
+      stoppedPendingSettlementPlanIds,
+      'already-accounted-close-failed',
+      error,
+    )
+  }
+}
+
+/**
+ * 实例已确认消失，但结算没做完：计划转 `stopped-pending-settlement`。
+ *
+ * 判据：这一分支绝不写 `escalated`。`escalated` 的含义是「实例未确认消失，钱可能还在烧」，
+ * 而这里刚好相反：实例不在了，钱停了，只是账还差一步。写错状态会让运维去找一台不存在的机器。
+ */
+async function settleFailureAfterInstanceGone(
+  deps: GuardDependencies,
+  plan: Plan,
+  stoppedPendingSettlementPlanIds: string[],
+  reason: string,
+  cause: unknown,
+): Promise<void> {
+  stoppedPendingSettlementPlanIds.push(plan.id)
+  deps.logger.error('guard.plan.stopped-pending-settlement', {
+    planId: plan.id,
+    instanceId: plan.instanceId,
+    reason,
+    error: describeError(cause),
+    message: '实例已确认停机，钱停了；账还没结算完，下一轮继续。',
+  })
+  try {
+    await markPlanStoppedPendingSettlement(deps, plan.id)
+  } catch (error: unknown) {
+    deps.logger.error('guard.plan.mark-stopped-failed', {
+      planId: plan.id,
+      error: describeError(error),
+    })
+  }
+}
+
+/**
+ * 计划转 escalated 并记 error 日志。守护进程不因它改退出码。
+ *
+ * 判据：只有「实例未确认消失」才允许走到这里。
+ */
 async function escalate(
   deps: GuardDependencies,
   plan: Plan,
@@ -354,7 +512,7 @@ async function escalate(
     instanceId: plan.instanceId,
     reason,
     error: describeError(cause),
-    message: '实例未确认消失或结算失败，钱可能还在烧。请立即在控制台确认。',
+    message: '实例未确认消失，钱可能还在烧。请立即在控制台确认。',
   })
   try {
     await markPlanEscalated(deps, plan.id)

@@ -1,17 +1,8 @@
 // 项目清单：asyncProxyServer。
 // 它随被部署的项目走，不进 deploydeck 仓库。
-// 步骤不写在这里：引擎按 Profile 的两个脚本与本文件的 healthCheck 生成内置步骤。
+// 步骤不写在这里：引擎按本文件的 healthCheck 生成内置步骤。
 {
   "id": "asyncproxy-server",
-
-  // 代码来源。远端地址需要人工确认：deploydeck 仓库里没有登记 asyncProxyServer 的远端地址，
-  // 这里按独立仓库的形态写。
-  // 引擎在实例里没有仓库时会按 url 与 branch 克隆；给了 commit 时还会切过去并回验 HEAD。
-  // 地址写错会让部署失败，首次真机运行前必须人工确认。
-  "repository": {
-    "url": "git@github.com:ZQH123196/asyncProxyServer.git",
-    "branch": "main"
-  },
 
   // 实例内的项目目录。与生产部署保持一致。
   "workdir": "/root/asyncProxyServer",

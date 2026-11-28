@@ -1,6 +1,6 @@
 import type { ConsoleInstanceSnapshot } from '../../domain/instance.js'
 import type { Profile } from '../../domain/profile.js'
-import { ConfigError, PowerOnFailedError } from '../../errors.js'
+import { ConfigError, PowerOffFailedError, PowerOnFailedError } from '../../errors.js'
 import type { PowerOnMode } from '../../console/ports.js'
 import { writeJson, writeLine } from '../output.js'
 import {
@@ -23,6 +23,8 @@ import {
  * - `--gpu` / `--no-gpu` 覆盖目标形态；两个同时给即抛 `ConfigError`。
  * - 开机失败（无可用 GPU、超时、返回后状态不符）即抛 `PowerOnFailedError`，
  *   不静默降级到无卡模式。
+ * - 关机失败（返回后状态不是已关机）抛 `PowerOffFailedError`，不是 `PowerOnFailedError`：
+ *   `--off` 路径上报「开机失败」会让读日志的人找错方向。
  * - 写入磁盘的只有证据目录：控制台截图落 `<stateDir>/power/<instanceId>`。不写状态文件。
  *
  * 证据目录只有一段固定名、不含时间戳：`power` 不是流水线动作，不需要独立现场目录。
@@ -195,29 +197,42 @@ async function resolveProfileForInstance(
  *
  * 判据以列表事实为准，不以动作返回为准：`powerOff` 的契约是「等到已关机」，
  * `powerOn` 的契约是「等到运行中且形态一致」。不符即抛错，不静默当成功。
+ *
+ * 两条路径各抛各的错误：`POWER_OFF_FAILED` 与 `POWER_ON_FAILED` 是两件事，
+ * 码分开了，日志与告警才能按动作分叉。
  */
 function assertFinalStatus(result: PowerCommandResult): void {
   if (result.action === 'off') {
-    if (result.status !== 'stopped') {
-      throw new PowerOnFailedError(
-        result.instanceId,
-        result.powerOnMode,
-        'timeout',
-        `动作返回后实例状态是「${result.statusRaw}」，不是已关机。`,
-        result.statusRaw,
-      )
-    }
+    assertPowerOffFinalStatus(result)
     return
   }
-  if (result.status !== 'running') {
-    throw new PowerOnFailedError(
-      result.instanceId,
-      result.powerOnMode,
-      'timeout',
-      `动作返回后实例状态是「${result.statusRaw}」，不是运行中。`,
-      result.statusRaw,
-    )
+  assertPowerOnFinalStatus(result)
+}
+
+/** 关机终态：实例必须是已关机。 */
+function assertPowerOffFinalStatus(result: PowerCommandResult): void {
+  if (result.status === 'stopped') {
+    return
   }
+  throw new PowerOffFailedError(
+    result.instanceId,
+    `动作返回后实例状态是「${result.statusRaw}」，不是已关机。`,
+    result.statusRaw,
+  )
+}
+
+/** 开机终态：实例必须是运行中。形态是否一致由 `powerOn` 的返回值裁决。 */
+function assertPowerOnFinalStatus(result: PowerCommandResult): void {
+  if (result.status === 'running') {
+    return
+  }
+  throw new PowerOnFailedError(
+    result.instanceId,
+    result.powerOnMode,
+    'timeout',
+    `动作返回后实例状态是「${result.statusRaw}」，不是运行中。`,
+    result.statusRaw,
+  )
 }
 
 /** 读一台实例的快照。不在列表里即抛 `ConfigError`：调用方拿不到快照就不会往下动作。 */

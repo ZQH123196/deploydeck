@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { createServer } from 'node:net'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
@@ -10,7 +9,6 @@ import {
   EXIT_BUSINESS_FAILURE,
   EXIT_OK,
   NotImplementedError,
-  TunnelLocalPortInUseError,
   type ExitCode,
 } from '../errors.js'
 import { createRealCliDependencies, type CliDependencies } from './dependencies.js'
@@ -20,7 +18,6 @@ import { runLoginCommandWithDependencies } from './commands/login.js'
 import { DEFAULT_LOGIN_TIMEOUT_SECONDS } from '../console/login.js'
 import { DEFAULT_TERM } from '../ssh/shell-channel.js'
 import type { PowerOnMode } from '../console/ports.js'
-import { TUNNEL_LISTEN_HOST } from './commands/tunnel.js'
 import type { PowerAction } from './commands/power.js'
 import { runPowerCommand } from './commands/power.js'
 import { runSwitchCommand } from './commands/switch.js'
@@ -134,14 +131,12 @@ function registerRunCommands(program: Command, deps: CliDependencies): void {
         '--create-plan',
         '允许 --profile 在没有生效计划时新建一份。显式授权开关，默认不建',
       )
-      .option('--commit <sha>', '指定 commit。配置要求锁定 commit 时必填')
       .option('--run-id <id>', '指定执行 id。测试注入固定值用；默认由 CLI 生成'),
   ).action(
     async (
       commandOptions: {
         readonly plan?: string
         readonly profile?: string
-        readonly commit?: string
         readonly runId?: string
         readonly createPlan?: boolean
       },
@@ -150,7 +145,6 @@ function registerRunCommands(program: Command, deps: CliDependencies): void {
       await runRunCommand(contextOf(deps, command), {
         ...(commandOptions.plan === undefined ? {} : { plan: commandOptions.plan }),
         ...(commandOptions.profile === undefined ? {} : { profile: commandOptions.profile }),
-        ...(commandOptions.commit === undefined ? {} : { commit: commandOptions.commit }),
         ...(commandOptions.runId === undefined ? {} : { runId: commandOptions.runId }),
         createPlan: commandOptions.createPlan === true,
       })
@@ -204,14 +198,17 @@ function registerRunCommands(program: Command, deps: CliDependencies): void {
  * `shell`：连到运行中实例的交互式终端。
  *
  * 两种形态：只给实例 ID 即开交互式 shell；给 `--` 之后的命令即跑一条命令。
- * 终端流直接取自 `process`，不经注入的输出抽象：交互形态必须把远端字节原样写进真实终端。
+ * 终端流直接取自 `process`，不经注入的输出抽象：交互形态必须把远端字节原样写进真实终端，
+ * 非交互形态的人读输出也是完整输出，同样直连真实终端。
+ *
+ * 子命令描述里的「在 PTY 里执行」是错的：非交互形态走 `exec`，不开 PTY。
  */
 function registerShellCommand(program: Command, deps: CliDependencies): void {
   withJsonOption(
     program
       .command('shell <instanceId> [command...]')
       .description(
-        '连到运行中实例的交互式终端。给 -- 之后的命令时在 PTY 里执行该命令并返回退出码。',
+        '连到运行中实例的交互式终端。给 -- 之后的命令时用登录 shell 执行该命令并返回退出码。',
       )
       .option('--term <term>', '终端类型，写进远端 $TERM', DEFAULT_TERM),
   ).action(
@@ -290,25 +287,37 @@ function registerSwitchCommand(program: Command, deps: CliDependencies): void {
   )
 }
 
-/** `creds`：读实例的 SSH 登录信息。密码只出现在 stdout。 */
+/**
+ * `creds`：读实例的 SSH 登录信息。密码只出现在 stdout。
+ *
+ * `--json` 无额外限制；人读模式要求 stdout 是终端，否则拒绝（退出码 2），
+ * 免得 `creds <id> >> ops.log` 把明文密码写进磁盘。
+ */
 function registerCredsCommand(program: Command, deps: CliDependencies): void {
   withJsonOption(
     program
       .command('creds <instanceId>')
       .description('读取实例的 SSH 登录信息（主机、端口、用户、密码）'),
   ).action(async (instanceId: string, _options: unknown, command: Command) => {
-    await runCredsCommand(contextOf(deps, command), { instanceId }, async ({ logDir }) => {
-      return await deps.openCredentials({ logDir })
-    })
+    await runCredsCommand(
+      contextOf(deps, command),
+      { instanceId },
+      async ({ logDir }) => {
+        return await deps.openCredentials({ logDir })
+      },
+      // 真实终端判断必须用 `process.stdout`：`deps.stdout` 只是应用层的写出口，没有 tty 概念。
+      process.stdout,
+    )
   })
 }
 
 /**
  * `tunnel`：把实例的远端端口转发到本机回环。
  *
- * action 只做参数解析与调用命令函数。端口试绑与信号处理是本命令自己的运行期依赖，
- * 在这里就地给出；SSH 与凭据装配走 `deps.openForward` / `deps.openCredentials`，
- * 不在这里出现 `forwardPortWithSsh2`、`readSshCredentials`、`createKnownHosts`。
+ * action 只做参数解析与调用命令函数。信号处理是本命令自己的运行期依赖，在这里就地给出；
+ * SSH、凭据与端口占用判定全部走 `deps.openForward` 这一次控制台会话，
+ * 不在这里出现 `forwardPortWithSsh2`、`readSshCredentials`、`createKnownHosts`、
+ * 也不出现端口预检：预检的两次 `listen` 之间端口会被抢走，构不成判据。
  */
 function registerTunnelCommand(program: Command, deps: CliDependencies): void {
   withJsonOption(
@@ -326,10 +335,6 @@ function registerTunnelCommand(program: Command, deps: CliDependencies): void {
         contextOf(deps, command),
         { instanceId, portsSpec: commandOptions.ports },
         {
-          assertLocalPortFree: async (localPort, remotePort) => {
-            await assertLoopbackPortFree(localPort, remotePort)
-          },
-          openCredentials: async ({ logDir }) => await deps.openCredentials({ logDir }),
           openForward: async (request) => await deps.openForward(request),
           onSignal: registerSignalHandler,
         },
@@ -447,37 +452,6 @@ function readTargetMode(options: {
     throw new ConfigError('必须给出 --gpu 或 --no-gpu 其中之一：切换需要明确的目标形态。')
   }
   return targetMode
-}
-
-/**
- * 试绑本地回环端口。
- *
- * 判据：端口占用只能在 `listen` 失败时发现。这里用回环地址试绑，
- * 与 `tunnel` 实际监听的地址一致：用 `0.0.0.0` 试绑会把「只有别的程序占着通配地址」
- * 也判成冲突，反过来漏掉「只占着另一个网卡地址」的情况。
- */
-async function assertLoopbackPortFree(localPort: number, remotePort: number): Promise<void> {
-  const server = createServer()
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', (error: NodeJS.ErrnoException) => {
-        if (error.code === 'EADDRINUSE') {
-          reject(new TunnelLocalPortInUseError(localPort, `远端端口 ${String(remotePort)}`))
-          return
-        }
-        reject(error)
-      })
-      server.listen({ host: TUNNEL_LISTEN_HOST, port: localPort }, () => {
-        resolve()
-      })
-    })
-  } finally {
-    await new Promise<void>((resolve) => {
-      server.close(() => {
-        resolve()
-      })
-    })
-  }
 }
 
 /** 注册信号监听。返回的 `dispose` 能安全地重复调用。 */

@@ -19,15 +19,18 @@ Agent、TUI、Web 三个界面都是它的客户端。内核本身不依赖任�
 deploydeck 把这些收敛成一条链路：
 
 ```
-申请计划 → 创建容器 → 部署 → 验证 → 销毁容器 → 确认容器消失
+申请计划 → 获取实例 → 等 SSH 就绪 → 健康检查 → 销毁容器 → 确认容器消失
 ```
 
 每一步都留日志。容器销毁后，日志仍然在本机。
 
+装环境、拉代码、起服务不在链路里。它们由使用者经 `shell` 在实例上自行执行。
+`run` 成功只保证「实例已获取、已连通、健康检查通过」，不保证业务服务可用。
+
 ## 当前状态
 
 Phase 2 命令面已接通，真机全链路已实测通过（2026-11-25，AutoDL 标准容器实例）：
-开关机、平台定时关机、克隆、改名、`run` 十一步全绿、`teardown` 释放并确认消失。
+开关机、平台定时关机、克隆、改名、`run` 全绿、`teardown` 释放并确认消失。
 实测结论与踩到的坑见 `docs/refs/autodl/console-selectors.md`。
 
 真机测试现在是可复跑的套件，见下文「测试」。
@@ -37,15 +40,19 @@ Phase 2 命令面已接通，真机全链路已实测通过（2026-11-25，AutoD
 | 部署清单（Profile / Project）校验 | 可用 |
 | `profile list` | 可用 |
 | `plan create` / `plan show`（`--balance` 可读账户余额） | 可用 |
-| `run` 部署执行：开机复用或克隆、锁定 commit（可选）、预算复核、平台定时关机、脚本与健康检查、逐步日志 | 可用 |
+| `run`：开机复用或克隆、等 SSH 就绪、预算与余额复核、平台定时关机、健康检查、逐步日志 | 可用 |
 | `status`：生效计划、实例状态、单价、花费、账本摘要 | 可用 |
 | `teardown`：销毁、终态验证、账本结算、计划关闭 | 可用 |
 | `login`：打开专用 Chrome 等人登录 | 可用 |
-| `shell`：连到运行中实例的交互式终端（PTY），也支持在 PTY 里跑单条命令 | 可用 |
+| `shell`：连到运行中实例的交互式终端（PTY），也给 `--` 之后的命令走 `exec` 跑一条 | 可用 |
+| `power`：开机或关机，并核实终态 | 可用；真机未验证 |
+| `switch`：关机 → 按目标形态开机 → 复验形态 | 可用；真机未验证 |
+| `creds`：读取实例的 SSH 登录信息，密码只进 stdout | 可用 |
+| `tunnel`：把实例的远端端口转发到本机回环 | 可用 |
 | 无卡模式开机（`powerOnMode: no-gpu`） | 可用；真机未验证 |
 | `guard`：计划层守护（过期计划销毁、预算熔断、余额告警） | 可用；系统级自启动未实现 |
 | AutoDL provider：控制台动作 + SSH 数据面 | 已接入 |
-| 首批接入样例：asyncProxyServer | 配置就绪；部署脚本与真机未验证 |
+| 首批接入样例：asyncProxyServer | 配置就绪；真机未验证 |
 | `plan extend` / `ledger` | 未实现 |
 | `guard` 系统级自启动 | 未实现 |
 
@@ -113,7 +120,7 @@ pnpm dev -- --help
 4. **状态目录可写且不在配置目录内**：默认 `~/.local/state/deploydeck`。状态目录落在配置目录内时，
    构造状态存储即报错（配置目录由人写，机器只读）。
 
-### 一次部署
+### 一次取实例
 
 ```bash
 deploydeck login
@@ -123,6 +130,14 @@ deploydeck run --plan <planId>
 deploydeck status
 deploydeck teardown <planId>
 ```
+
+`run` 结束后实例已开机、SSH 已连通。装环境、拉代码、起服务由你自己执行：
+
+```bash
+deploydeck shell <instanceId> -- '<命令>'
+```
+
+`run` 成功只说明实例已就绪可连。业务服务是否可用要由你自己的命令确认。
 
 计划过期后的兜底是 `deploydeck guard`：它每 5 分钟巡检一次过期计划并销毁绑定实例，
 同时做预算熔断与余额告警。系统级自启动（pm2 / systemd）属 Phase 3，本期需要人把它挂在
@@ -150,7 +165,7 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard --once
 ## 文档
 
 - [操作手册](docs/OPERATIONS.md) —— 外部项目怎么接入、怎么跑、机器读者怎么调。**只看一份就从这里开始**
-- [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 部署链路的设计与验收标准
+- [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 实例获取链路的设计与验收标准
 - [Phase 3 spec](docs/specs/deploydeck-phase3-shell.md) —— 交互式终端与无卡模式开机
 - [施工工单](docs/tickets/) —— 按依赖序编号
 - [CLI 命令面](docs/cli.md) —— 命令、参数、`--json` 输出形状、退出码、例行操作
@@ -167,7 +182,7 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard --once
 | 退出码 | 含义 |
 |---|---|
 | 0 | 成功 |
-| 1 | 业务失败。部署失败、计划无效、预算不足、脚本或健康检查失败 |
+| 1 | 业务失败。计划无效、预算不足、余额不足、健康检查失败、实例不在运行中 |
 | 2 | 需要人工介入。配置错误、未登录、命令未实现、实例未确认消失、克隆超时 |
 
 退出码由错误类自带（`src/errors.ts`），CLI 只透传。逐条说明见 [CLI 命令面](docs/cli.md) 第 5 节。

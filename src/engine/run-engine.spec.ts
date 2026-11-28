@@ -28,8 +28,6 @@ import {
   HumanRequiredError,
   InstanceNotGoneError,
   PlanInvalidError,
-  PinnedCommitRequiredError,
-  ScriptFailedError,
   StateFileMissingError,
   StrayInstanceError,
 } from '../errors.js'
@@ -51,7 +49,7 @@ import type { Clock } from '../util/clock.js'
 import { beijingIso, formatBeijingMinute, parseBeijingDateTimeText } from '../util/time.js'
 import { createRunEngine, PRICE_DRIFT_THRESHOLD_RATIO, SSH_READY_TIMEOUT_MS, type RunEngine, type RunSummary } from './run-engine.js'
 import { createRunStore, RUNS_DIRECTORY, type RunStore } from './run-store.js'
-import { DATA_DISK_READY_TIMEOUT_SECONDS, STEP_ID } from './steps.js'
+import { STEP_ID } from './steps.js'
 
 /**
  * 工单 10 执行引擎的验收用例。
@@ -125,11 +123,6 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
     ttlMinutes: 60,
     budgetCapYuan: 6,
     onDeployFailure: 'keep-container',
-    requirePinnedCommit: false,
-    deployScript: 'scripts/deploy.sh',
-    startScript: 'scripts/start.sh',
-    env: {},
-    bootstrapEnv: {},
     ...overrides,
   }
 }
@@ -137,10 +130,8 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
     id: 'trans-app',
-    repository: { url: 'git@example.com:trans/app.git', branch: 'main' },
     workdir: '/root/trans_app',
     healthCheck: 'curl -fsS http://127.0.0.1:6006/health',
-    dataDiskPath: '/root/autodl-tmp',
     ...overrides,
   }
 }
@@ -357,7 +348,7 @@ class FakeProvider implements Provider {
     command: string,
     options: SshExecOptions,
   ): Promise<SshExecResult> {
-    this.record('exec', { instanceId, command, logPath: options.logPath, env: options.env })
+    this.record('exec', { instanceId, command, logPath: options.logPath })
     const stdout = this.behavior.stdoutFor?.(command) ?? ''
     const exitCode = this.behavior.exitCodeFor?.(command) ?? 0
     // 模拟真实 SSH 端口的行为：完整输出落盘，返回值只带尾部与字节数。
@@ -385,7 +376,6 @@ interface FixtureOptions {
   readonly project?: Partial<Project>
   readonly planTtlMinutes?: number
   readonly planBudgetCapYuan?: number
-  readonly commitSha?: string | null
   readonly behavior?: FakeProviderBehavior
   readonly seedUnitPriceYuanPerHour?: number
   /** 种子单价写进哪个形态槽。缺省 `gpu`。 */
@@ -478,9 +468,13 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
         planId: plan.id,
         profile,
         project,
-        commitSha: options.commitSha ?? null,
       }),
   }
+}
+
+/** 子串在文本里出现的次数。 */
+function countOccurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1
 }
 
 /** Run 记录里 SSH 步骤的顺序。控制台动作与内置判定不参与这个断言。 */
@@ -499,7 +493,7 @@ describe('run：开机复用路径', () => {
     expect(summary.instanceId).toBe(INSTANCE_ID)
     expect(summary.state).toBe('succeeded')
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.deployScript, STEP_ID.startScript, STEP_ID.healthCheck])
+    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
   })
 
   it('实例已运行时不开机，直接跑部署脚本 → 启动脚本 → 健康检查', async () => {
@@ -512,7 +506,7 @@ describe('run：开机复用路径', () => {
     expect(fixture.provider.actions()).not.toContain('powerOn')
     expect(summary.mode).toBe('reuse')
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.deployScript, STEP_ID.startScript, STEP_ID.healthCheck])
+    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
   })
 
   it('开机失败（无可用 GPU）时自动走克隆，只跑启动脚本与健康检查', async () => {
@@ -531,12 +525,7 @@ describe('run：开机复用路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).sourceInstanceId).toBe(INSTANCE_ID)
     const run = await fixture.readRun(summary.runId)
-    // 部署配置 cloneDataDisk=true：克隆来的数据盘还要拷一会儿，等它稳定再跑启动脚本。
-    expect(sshStepIds(run)).toEqual([
-      STEP_ID.dataDiskReady,
-      STEP_ID.startScript,
-      STEP_ID.healthCheck,
-    ])
+    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
   })
 })
 
@@ -557,17 +546,12 @@ describe('run：克隆路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).sourceInstanceId).toBe(CLONE_SOURCE_ID)
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([
-      STEP_ID.dataDiskReady,
-      STEP_ID.startScript,
-      STEP_ID.healthCheck,
-    ])
+    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
     // 克隆产物要绑定到计划上：下一次执行靠 plan.instanceId 命中「已绑定实例」那条。
     expect((await fixture.readPlan()).instanceId).toBe(summary.instanceId)
   })
 
-  it('cloneDataDisk=false 时不等数据盘就绪：没克隆的盘是空盘，不是还在拷', async () => {
-    // 判据：数据盘没跟着克隆时不会出现「盘在拷」这个状态，加这一步就是空等一个永远不就绪的盘。
+  it('cloneDataDisk 只决定克隆参数，不改变步骤序列：克隆路径都只跑启动脚本与健康检查', async () => {
     const fixture = await createFixture({
       profile: { cloneSourceInstanceName: 'trans-template', cloneDataDisk: false },
       behavior: {
@@ -581,7 +565,7 @@ describe('run：克隆路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).cloneDataDisk).toBe(false)
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.startScript, STEP_ID.healthCheck])
+    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
   })
 
   it('克隆源未关机时先关机再克隆', async () => {
@@ -792,16 +776,6 @@ describe('run：取实例判定表的失败', () => {
 })
 
 describe('run：前置校验零动作', () => {
-  it('要求锁定 commit 但没给 commit 时抛错，零动作', async () => {
-    const fixture = await createFixture({
-      profile: { requirePinnedCommit: true },
-      behavior: { instances: [makeInstance()] },
-    })
-
-    await expect(fixture.run()).rejects.toBeInstanceOf(PinnedCommitRequiredError)
-    expect(fixture.provider.actions()).toEqual([])
-  })
-
   it('计划不存在时抛 PlanInvalidError，零控制台动作', async () => {
     const fixture = await createFixture({ behavior: { instances: [makeInstance()] } })
 
@@ -810,7 +784,6 @@ describe('run：前置校验零动作', () => {
         planId: 'plan-missing',
         profile: fixture.profile,
         project: fixture.project,
-        commitSha: null,
       }),
     ).rejects.toBeInstanceOf(PlanInvalidError)
     expect(fixture.provider.actions()).toEqual([])
@@ -829,25 +802,27 @@ describe('run：前置校验零动作', () => {
 })
 
 describe('run：失败分叉', () => {
-  it('部署脚本失败时 Run 为 stray、计划 escalated，实例停机保留且不销毁', async () => {
+  it('健康检查失败时 Run 为 stray、计划转待结算，实例停机保留且不销毁', async () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
       },
     })
 
     const error = await fixture.run().catch((caught: unknown) => caught)
 
-    expect(error).toBeInstanceOf(ScriptFailedError)
+    expect(error).toBeInstanceOf(HealthCheckFailedError)
     // 判据：自动判定失败只停机，不销毁。销毁入口只剩 teardown。
     expect(fixture.provider.actions()).not.toContain('destroy')
     expect(fixture.provider.actions()).toContain('powerOff')
     expect(instanceStatusIn(fixture)).toBe('stopped')
     const run = await onlyRunRecord(fixture)
     expect(run.state).toBe('stray')
-    expect(sshStepIds(run)).toEqual([STEP_ID.deployScript])
-    expect((await fixture.readPlan()).state).toBe('escalated')
+    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    // 判据（M2）：停机成功 = 钱停了。计划状态必须说「已停机、待结算」，
+    // 不能说 escalated —— 那个状态的含义是「实例未确认消失，钱可能还在烧」。
+    expect((await fixture.readPlan()).state).toBe('stopped-pending-settlement')
     expect((await fixture.readPlan()).instanceId).toBe(INSTANCE_ID)
     // 账本封口判据 = 实例不再运行，与「停机是否成功」无关：这里停机成功了，应当封口。
     expect(await fixture.ledger.readAll()).toHaveLength(1)
@@ -858,7 +833,7 @@ describe('run：失败分叉', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
         powerOff: async () => {
           throw new Error('控制台关机按钮没响应')
         },
@@ -870,6 +845,78 @@ describe('run：失败分叉', () => {
     await expect(fixture.ledger.readAll()).rejects.toBeInstanceOf(StateFileMissingError)
     const run = await onlyRunRecord(fixture)
     expect(run.state).toBe('stray')
+    expect((await fixture.readPlan()).state).toBe('escalated')
+  })
+
+  it('同样的失败，停机成功与停机失败落到两个不同的计划状态', async () => {
+    // 判据（M2）：两个状态必须能被人一眼分开 ——
+    // 一个说「钱停了、只差结账」，一个说「钱可能还在烧」。
+    const stopped = await createFixture({
+      behavior: {
+        instances: [makeInstance()],
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+      },
+    })
+    const powerOffFailed = await createFixture({
+      behavior: {
+        instances: [makeInstance()],
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        powerOff: async () => {
+          throw new Error('控制台关机按钮没响应')
+        },
+      },
+    })
+
+    await stopped.run().catch(() => undefined)
+    await powerOffFailed.run().catch(() => undefined)
+
+    expect((await stopped.readPlan()).state).toBe('stopped-pending-settlement')
+    expect((await powerOffFailed.readPlan()).state).toBe('escalated')
+    // 报错文案也要跟着分叉：读到 escalated 的人会想到「先关机」，读到待结算的人只想到「去结账」。
+    const stoppedPlanText = stopped.logs.find((event) => event.event === 'run.stray')
+    expect(stoppedPlanText?.fields?.['instanceStopped']).toBe(true)
+  })
+
+  it('停机成功的报错写明计划转待结算，且只出现一次现场指引', async () => {
+    // 判据（S2）：现场指引只能出现一次。两处都拼会让人以为有两台机器要看。
+    const fixture = await createFixture({
+      behavior: {
+        instances: [makeInstance()],
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+      },
+    })
+
+    const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
+
+    expect(error.message).toContain('转 stopped-pending-settlement')
+    expect(error.message).not.toContain('转 escalated')
+    expect(countOccurrences(error.message, '进容器查现场')).toBe(1)
+  })
+
+  it('停机失败会经 abortForMoneySafety 时，报错里的现场指引也只出现一次', async () => {
+    // 判据（S2）：`abortForMoneySafety` 停机失败分支抛 HumanRequiredError，
+    // 外层 finishWithFailure 还会追加一次 hint。两处都拼就重复了。
+    const fixture = await createFixture({
+      seedUnitPriceYuanPerHour: 1,
+      behavior: {
+        instances: [makeInstance()],
+        readPriceQuote: async (_instanceId, ttlMinutes) => ({
+          serverTime: START_ISO,
+          unitPriceYuanPerHour: 1 + PRICE_DRIFT_THRESHOLD_RATIO * 2,
+          estimatedCostYuan: 1,
+          ttlMinutes,
+          balanceYuan: 100,
+        }),
+        powerOff: async () => {
+          throw new Error('控制台关机按钮没响应')
+        },
+      },
+    })
+
+    const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
+
+    expect(error).toBeInstanceOf(HumanRequiredError)
+    expect(countOccurrences(error.message, '进容器查现场')).toBe(1)
     expect((await fixture.readPlan()).state).toBe('escalated')
   })
 
@@ -890,11 +937,7 @@ describe('run：失败分叉', () => {
     expect(instanceStatusIn(fixture)).toBe('stopped')
     const run = await onlyRunRecord(fixture)
     expect(run.state).toBe('stray')
-    expect(sshStepIds(run)).toEqual([
-      STEP_ID.deployScript,
-      STEP_ID.startScript,
-      STEP_ID.healthCheck,
-    ])
+    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
     expect((error as Error).message).toContain('teardown')
   })
 
@@ -902,7 +945,7 @@ describe('run：失败分叉', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
         powerOff: async () => {
           throw new Error('控制台关机按钮没响应')
         },
@@ -912,7 +955,7 @@ describe('run：失败分叉', () => {
     const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
 
     // 判据：停机失败不改变分类，原错误照旧抛；处置办法与「实例仍在」写进同一条消息。
-    expect(error).toBeInstanceOf(ScriptFailedError)
+    expect(error).toBeInstanceOf(HealthCheckFailedError)
     expect(fixture.provider.actions()).not.toContain('destroy')
     expect(instanceStatusIn(fixture)).not.toBe('stopped')
     expect(error.message).toContain('停机失败（Error：控制台关机按钮没响应）')
@@ -940,7 +983,41 @@ describe('run：金钱止损', () => {
     expect(fixture.provider.actions()).toContain('powerOff')
     expect(instanceStatusIn(fixture)).toBe('stopped')
     expect((await onlyRunRecord(fixture)).state).toBe('stray')
+    expect((await fixture.readPlan()).state).toBe('stopped-pending-settlement')
+  })
+
+  it('预算超限只停机一次：预算复核自己不停机，停机只发生在失败收尾', async () => {
+    // 判据（S1）：停机若有两处，账本封口判据就得同时看两处。这里锁死只有一处。
+    const fixture = await createFixture({
+      planBudgetCapYuan: 0.5,
+      behavior: { instances: [makeInstance()] },
+    })
+
+    await fixture.run().catch(() => undefined)
+
+    const powerOffCalls = fixture.provider.calls.filter((call) => call.action === 'powerOff')
+    expect(powerOffCalls).toHaveLength(1)
+    // 停机成功就该封口，且只封一行。
+    expect(await fixture.ledger.readAll()).toHaveLength(1)
+  })
+
+  it('预算超限停机失败时计划转 escalated，不写账本', async () => {
+    // 判据（M2 的另一半）：停机失败 = 钱可能还在烧，与停机成功必须落到不同状态。
+    const fixture = await createFixture({
+      planBudgetCapYuan: 0.5,
+      behavior: {
+        instances: [makeInstance()],
+        powerOff: async () => {
+          throw new Error('控制台关机按钮没响应')
+        },
+      },
+    })
+
+    await fixture.run().catch(() => undefined)
+
+    expect((await onlyRunRecord(fixture)).state).toBe('stray')
     expect((await fixture.readPlan()).state).toBe('escalated')
+    await expect(fixture.ledger.readAll()).rejects.toBeInstanceOf(StateFileMissingError)
   })
 
   it('单价漂移超过阈值时停机保留并抛 HumanRequiredError，缓存不被新价覆盖', async () => {
@@ -1082,7 +1159,7 @@ describe('run：单价缓存按开机形态分槽', () => {
 })
 
 describe('run：定时关机与日志', () => {
-  it('读完单价才发现计划窗口不足时停机保留，Run 记 stray 并记账', async () => {
+  it('读完单价才发现计划窗口不足时停机保留，Run 记 stray、计划转待结算并记账', async () => {
     // 本机时钟与控制台服务器时间不一致：本机以为还剩 60 分钟，控制台已经只剩 4 分钟。
     const fixture = await createFixture({
       behavior: {
@@ -1104,7 +1181,7 @@ describe('run：定时关机与日志', () => {
     expect(instanceStatusIn(fixture)).toBe('stopped')
     expect(fixture.provider.actions()).not.toContain('setTimedShutdown')
     expect((await onlyRunRecord(fixture)).state).toBe('stray')
-    expect((await fixture.readPlan()).state).toBe('escalated')
+    expect((await fixture.readPlan()).state).toBe('stopped-pending-settlement')
     expect(await fixture.ledger.readAll()).toHaveLength(1)
   })
 
@@ -1132,7 +1209,7 @@ describe('run：定时关机与日志', () => {
     const run = await fixture.readRun(summary.runId)
     const expectedLogDirectory = join(fixture.stateDir, RUNS_DIRECTORY, summary.runId, 'logs')
     const sshSteps = run.steps.filter((step) => step.kind === 'ssh')
-    expect(sshSteps).toHaveLength(3)
+    expect(sshSteps).toHaveLength(1)
     for (const step of sshSteps) {
       expect(step.logPath).toBe(join(expectedLogDirectory, `${step.stepId}.log`))
       const written = await readFile(step.logPath, 'utf8')
@@ -1177,7 +1254,7 @@ describe('run：定时关机与日志', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
       },
     })
 
@@ -1194,7 +1271,7 @@ describe('run：定时关机与日志', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
       },
     })
     // 让停机时刻比取得实例晚 30 分钟：假时钟不前进时金额恒为 0，看不出投影有没有发生。
@@ -1211,74 +1288,6 @@ describe('run：定时关机与日志', () => {
     const plan = await fixture.readPlan()
     // 单价 1 元/时 × 30 分钟 = 0.5 元。
     expect(plan.spentYuan).toBeCloseTo(0.5, 10)
-  })
-})
-
-describe('run：commit 同步', () => {
-  it('给了 commit 时 sync-commit 是第一个 SSH 步骤，命令含 fetch、checkout 与回验', async () => {
-    const fixture = await createFixture({
-      behavior: { instances: [makeInstance()] },
-      commitSha: 'abc1234',
-    })
-
-    const summary = await fixture.run()
-
-    const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([
-      STEP_ID.syncCommit,
-      STEP_ID.deployScript,
-      STEP_ID.startScript,
-      STEP_ID.healthCheck,
-    ])
-    expect(run.commitSha).toBe('abc1234')
-    const syncCommand = run.steps.find((step) => step.stepId === STEP_ID.syncCommit)?.command ?? ''
-    expect(syncCommand).toContain('git fetch --all --prune')
-    expect(syncCommand).toContain('git checkout --force "abc1234"')
-    expect(syncCommand).toContain(
-      'test "$(git -C "/root/trans_app" rev-parse HEAD)" = "abc1234"',
-    )
-  })
-
-  it('没有 commit 时不生成 sync-commit 步骤', async () => {
-    const fixture = await createFixture({ behavior: { instances: [makeInstance()] } })
-
-    const summary = await fixture.run()
-
-    const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).not.toContain(STEP_ID.syncCommit)
-    expect(run.commitSha).toBeNull()
-  })
-
-  it('sync-commit 回验失败（退出码非 0）视为该步失败，后续脚本不执行', async () => {
-    // Arrange：git 命令返回非 0，模拟 rev-parse 回验与 commit 不相等。
-    const fixture = await createFixture({
-      behavior: {
-        instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('rev-parse HEAD') ? 1 : 0),
-      },
-      commitSha: 'abc1234',
-    })
-
-    // Act
-    const error = (await fixture.run().catch((caught: unknown) => caught)) as ScriptFailedError
-
-    // Assert
-    expect(error).toBeInstanceOf(ScriptFailedError)
-    expect(error.message).toContain(STEP_ID.syncCommit)
-    const run = await onlyRunRecord(fixture)
-    const sshSteps = run.steps.filter((step) => step.kind === 'ssh')
-    expect(sshSteps.map((step) => step.stepId)).toEqual([STEP_ID.syncCommit])
-    expect(sshSteps[0]?.exitCode).toBe(1)
-  })
-
-  it('commit sha 非法时在碰任何资源之前失败', async () => {
-    const fixture = await createFixture({
-      behavior: { instances: [makeInstance()] },
-      commitSha: 'abc; rm -rf /',
-    })
-
-    await expect(fixture.run()).rejects.toBeInstanceOf(ConfigError)
-    expect(fixture.provider.actions()).toEqual([])
   })
 })
 
@@ -1320,7 +1329,7 @@ describe('run：失败报错的现场信息', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
       },
     })
 
@@ -1339,7 +1348,7 @@ describe('run：失败报错的现场信息', () => {
       profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
       },
     })
 
@@ -1377,7 +1386,7 @@ describe('run：账本投影失败', () => {
       profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('deploy.sh') ? 1 : 0),
+        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
       },
     })
     const brokenPlanStore: PlanStore = {
@@ -1404,7 +1413,6 @@ describe('run：账本投影失败', () => {
         planId: fixture.plan.id,
         profile: fixture.profile,
         project: fixture.project,
-        commitSha: null,
       })
       .catch((caught: unknown) => caught)) as HumanRequiredError
 
@@ -1436,7 +1444,6 @@ describe('run：装配自检', () => {
         planId: fixture.plan.id,
         profile: fixture.profile,
         project: fixture.project,
-        commitSha: null,
       }),
     ).rejects.toBeInstanceOf(ConfigError)
   })
@@ -1475,7 +1482,6 @@ describe('run：装配自检', () => {
       planId: fixture.plan.id,
       profile: fixture.profile,
       project: fixture.project,
-      commitSha: null,
       runId: 'run-fixed-001',
     })
 
@@ -1520,7 +1526,6 @@ describe('run：装配自检', () => {
         planId: fixture.plan.id,
         profile: fixture.profile,
         project: fixture.project,
-        commitSha: null,
         runId: 'run-fixed-002',
       }),
     ).rejects.toBeInstanceOf(ConfigError)
@@ -1554,271 +1559,3 @@ async function onlyRunRecord(fixture: Fixture): Promise<Run> {
   }
   return record
 }
-
-describe('run：环境变量注入', () => {
-  /** 一个绝不该出现在日志、执行记录或 JSON 输出里的取值。 */
-  const SECRET_VALUE = 'sk-live-do-not-leak-9f8e7d6c'
-
-  it('取值只经 provider.exec 的 options.env 下发，命令里只有变量名', async () => {
-    // Arrange：本机环境里有这个变量。
-    process.env['DEPLOYDECK_SPEC_TOKEN'] = SECRET_VALUE
-    try {
-      const fixture = await createFixture({
-        profile: { env: { DEPLOYDECK_SPEC_TOKEN: '说明文字' } },
-        behavior: { instances: [makeInstance()] },
-      })
-
-      // Act
-      const summary = await fixture.run()
-
-      // Assert：取值经 env 通道到了远端。
-      // 只有带 `envNames` 的步骤（部署脚本与启动脚本）才有 env；健康检查不声明变量，本就不带。
-      const execCalls = fixture.provider.calls.filter((call) => call.action === 'exec')
-      expect(execCalls.length).toBeGreaterThan(0)
-      const withEnv = execCalls.filter((call) => call.detail['env'] !== undefined)
-      expect(withEnv.length).toBeGreaterThan(0)
-      for (const call of withEnv) {
-        const env = call.detail['env'] as Record<string, string>
-        expect(env['DEPLOYDECK_SPEC_TOKEN']).toBe(SECRET_VALUE)
-      }
-      // 所有命令里都只有变量名，没有取值。
-      for (const call of execCalls) {
-        expect(String(call.detail['command'])).not.toContain(SECRET_VALUE)
-      }
-      void summary
-    } finally {
-      delete process.env['DEPLOYDECK_SPEC_TOKEN']
-    }
-  })
-
-  it('取值不出现在步骤日志文件、Run 记录与 --json 载荷里（三处）', async () => {
-    // Arrange
-    process.env['DEPLOYDECK_SPEC_TOKEN'] = SECRET_VALUE
-    try {
-      const fixture = await createFixture({
-        profile: { env: { DEPLOYDECK_SPEC_TOKEN: '说明文字' } },
-        behavior: { instances: [makeInstance()] },
-      })
-
-      // Act
-      const summary = await fixture.run()
-
-      // Assert 1：每个 SSH 步骤的日志文件里没有取值。
-      const run = await fixture.readRun(summary.runId)
-      const sshSteps = run.steps.filter((step) => step.kind === 'ssh')
-      expect(sshSteps.length).toBeGreaterThan(0)
-      for (const step of sshSteps) {
-        // 这份假 provider 把 stdout 写进日志文件；真实通道写的是完整命令输出。
-        // 无论哪种，取值都不允许出现。
-        const written = await readFile(step.logPath, 'utf8')
-        expect(written).not.toContain(SECRET_VALUE)
-        // 变量名在命令模板里，这是允许的；取值不允许。只有声明了 env 的步骤才带自检前缀。
-        if (step.stepId !== STEP_ID.healthCheck) {
-          expect(step.command).toContain('DEPLOYDECK_SPEC_TOKEN')
-        }
-      }
-
-      // Assert 2：Run 记录的 JSON 全文里没有取值。
-      const runsDirectory = await fixture.store.resolve(RUNS_DIRECTORY)
-      const recordText = await readFile(join(runsDirectory, `${summary.runId}.jsonc`), 'utf8')
-      expect(recordText).not.toContain(SECRET_VALUE)
-
-      // Assert 3：--json 载荷（RunSummary）序列化后没有取值。
-      expect(JSON.stringify(summary)).not.toContain(SECRET_VALUE)
-      for (const step of summary.steps) {
-        expect(step.command).not.toContain(SECRET_VALUE)
-        expect(step.stderrTail).not.toContain(SECRET_VALUE)
-        expect(step.stdoutTail).not.toContain(SECRET_VALUE)
-      }
-    } finally {
-      delete process.env['DEPLOYDECK_SPEC_TOKEN']
-    }
-  })
-
-  it('本机缺声明的变量时在发命令之前失败，不静默落空', async () => {
-    // Arrange：Profile 声明了一个本机没有的变量。
-    const fixture = await createFixture({
-      profile: { env: { DEPLOYDECK_SPEC_ABSENT_TOKEN: '说明' } },
-      behavior: { instances: [makeInstance()] },
-    })
-
-    // Act
-    const error = await fixture.run().catch((caught: unknown) => caught)
-
-    // Assert：一次 exec 都没发出去，错误里点名缺的是哪个变量。
-    expect(error).toBeInstanceOf(ConfigError)
-    expect((error as Error).message).toContain('DEPLOYDECK_SPEC_ABSENT_TOKEN')
-    const execCalls = fixture.provider.calls.filter((call) => call.action === 'exec')
-    expect(execCalls).toEqual([])
-  })
-})
-
-describe('run：一次性引导', () => {
-  it('首次执行真跑引导，并写下 bootstrap/<instanceId>.jsonc', async () => {
-    const fixture = await createFixture({
-      profile: { bootstrapScript: 'scripts/bootstrap.sh' },
-      behavior: { instances: [makeInstance()] },
-    })
-
-    const summary = await fixture.run()
-
-    const run = await fixture.readRun(summary.runId)
-    const bootstrapStep = run.steps.find((step) => step.stepId === STEP_ID.bootstrapScript)
-    expect(bootstrapStep?.skipped).toBe(false)
-    const recordPath = await fixture.store.resolve(`bootstrap/${INSTANCE_ID}.jsonc`)
-    const recordText = await readFile(recordPath, 'utf8')
-    expect(recordText).toContain(INSTANCE_ID)
-    expect(recordText).toContain('trans-dev')
-  })
-
-  it('引导记录已存在时不再执行脚本，执行记录里留一条跳过痕迹', async () => {
-    // Arrange：先跑一次，让引导记录落盘。
-    const fixture = await createFixture({
-      profile: { bootstrapScript: 'scripts/bootstrap.sh' },
-      behavior: { instances: [makeInstance()] },
-    })
-    await fixture.run()
-    const execCountAfterFirstRun = fixture.provider.calls.filter(
-      (call) => call.action === 'exec',
-    ).length
-
-    // Act：同一个 fixture 再跑一次（同一状态目录、同一实例）。
-    // 第二次要一份新的生效计划：第一次执行成功后计划仍是 active，可直接复用。
-    const second = await fixture.engine.run({
-      planId: fixture.plan.id,
-      profile: fixture.profile,
-      project: fixture.project,
-      commitSha: null,
-      runId: 'run-second-pass',
-    })
-
-    // Assert 1：引导脚本没有被再执行一次。
-    const secondRunExecCalls = fixture.provider.calls
-      .filter((call) => call.action === 'exec')
-      .slice(execCountAfterFirstRun)
-    expect(
-      secondRunExecCalls.some((call) => String(call.detail['command']).includes('bootstrap.sh')),
-    ).toBe(false)
-
-    // Assert 2：执行记录里有这一步，且标着跳过。
-    const run = await fixture.readRun(second.runId)
-    const bootstrapStep = run.steps.find((step) => step.stepId === STEP_ID.bootstrapScript)
-    expect(bootstrapStep).toBeDefined()
-    expect(bootstrapStep?.skipped).toBe(true)
-    // 「目标达成过」记 0，不是 null（null 会被当失败收尾）。
-    expect(bootstrapStep?.exitCode).toBe(0)
-    expect(bootstrapStep?.stderrTail).toContain('跳过')
-    // 时间字段是真值，且几乎同时。
-    expect(bootstrapStep?.startedAt.length).toBeGreaterThan(0)
-    expect(bootstrapStep?.finishedAt.length).toBeGreaterThan(0)
-    expect(
-      Math.abs(
-        Date.parse(bootstrapStep?.startedAt ?? '') - Date.parse(bootstrapStep?.finishedAt ?? ''),
-      ),
-    ).toBe(0)
-  })
-
-  it('引导失败时不写记录，实例仍留着，下次执行会重新跑引导', async () => {
-    const fixture = await createFixture({
-      profile: { bootstrapScript: 'scripts/bootstrap.sh' },
-      behavior: {
-        instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('bootstrap.sh') ? 2 : 0),
-      },
-    })
-
-    // Act 1：第一次执行，引导失败。
-    const error = await fixture.run().catch((caught: unknown) => caught)
-    expect(error).toBeInstanceOf(ScriptFailedError)
-
-    // Assert 1：记录没写。
-    const recordPath = await fixture.store.resolve(`bootstrap/${INSTANCE_ID}.jsonc`)
-    await expect(readFile(recordPath, 'utf8')).rejects.toThrow()
-    // 实例仍在：stray 收尾只停机不销毁。
-    expect(fixture.provider.actions()).not.toContain('destroy')
-    expect((await onlyRunRecord(fixture)).state).toBe('stray')
-
-    // Act 2：修好之后重跑，引导会再执行一次（记录没写，所以不会被判成已跑过）。
-    // 把 exec 换成「引导也成功」的版本：模拟人修好了原因。
-    fixture.provider.calls.length = 0
-    const failingExec = fixture.provider.exec.bind(fixture.provider)
-    fixture.provider.exec = async (execInstanceId, command, options) => {
-      if (!command.includes('bootstrap.sh')) {
-        return await failingExec(execInstanceId, command, options)
-      }
-      fixture.provider.calls.push({ action: 'exec', detail: { instanceId: execInstanceId, command } })
-      await writeFile(options.logPath, '', 'utf8')
-      return {
-        exitCode: 0,
-        stdoutTail: '',
-        stderrTail: '',
-        stdoutBytes: 0,
-        stderrBytes: 0,
-        durationMs: 1,
-        timedOut: false,
-      }
-    }
-    // 第一次失败后计划已转 escalated，重跑要一份新计划：这是既有裁决，不是引导的逻辑。
-    const retryPlan = await fixture.planService.createPlan({
-      profile: fixture.profile,
-      provider: { id: fixture.provider.id, capabilities: fixture.provider.capabilities },
-    })
-    await fixture.engine
-      .run({
-        planId: retryPlan.id,
-        profile: fixture.profile,
-        project: fixture.project,
-        commitSha: null,
-        runId: 'run-retry',
-      })
-      .catch(() => undefined)
-
-    // Assert 2：引导脚本又被执行了一次。
-    const retriedExec = fixture.provider.calls.filter((call) => call.action === 'exec')
-    expect(
-      retriedExec.some((call) => String(call.detail['command']).includes('bootstrap.sh')),
-    ).toBe(true)
-  })
-})
-
-describe('run：数据盘就绪步骤', () => {
-  it('克隆路径执行数据盘就绪步骤，失败消息写明已读字节、等待时长与超时阈值', async () => {
-    // Arrange：克隆路径，数据盘采样以非 0 退出结束。
-    const fixture = await createFixture({
-      profile: { cloneSourceInstanceName: 'trans-template' },
-      behavior: {
-        instances: [makeInstance({ instanceId: CLONE_SOURCE_ID, name: 'trans-template' })],
-        exitCodeFor: (command) => (command.includes('df -B1') ? 1 : 0),
-        stdoutFor: (command) => (command.includes('df -B1') ? '1048576\n' : ''),
-      },
-    })
-
-    // Act
-    const error = (await fixture.run().catch((caught: unknown) => caught)) as ScriptFailedError
-
-    // Assert：三个量都在消息里。
-    expect(error).toBeInstanceOf(ScriptFailedError)
-    expect(error.message).toContain('数据盘未在')
-    expect(error.message).toContain('1048576')
-    expect(error.message).toContain(String(DATA_DISK_READY_TIMEOUT_SECONDS))
-    expect(error.message).toContain('连续两次采样不变')
-    expect(error.message).toContain('实例本身是好的')
-  })
-
-  it('数据盘步骤排在启动脚本之前执行', async () => {
-    const fixture = await createFixture({
-      profile: { cloneSourceInstanceName: 'trans-template' },
-      behavior: {
-        instances: [makeInstance({ instanceId: CLONE_SOURCE_ID, name: 'trans-template' })],
-      },
-    })
-
-    const summary = await fixture.run()
-
-    const sshSteps = summary.steps.filter((step) => step.kind === 'ssh').map((step) => step.stepId)
-    expect(sshSteps.indexOf(STEP_ID.dataDiskReady)).toBeGreaterThanOrEqual(0)
-    expect(sshSteps.indexOf(STEP_ID.dataDiskReady)).toBeLessThan(
-      sshSteps.indexOf(STEP_ID.startScript),
-    )
-  })
-})

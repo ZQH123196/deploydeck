@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ConfigError } from '../../errors.js'
+import { ConfigError, HumanRequiredError } from '../../errors.js'
 import type { CredentialsPort } from '../../ssh/credentials.js'
 import type { SshCredentials } from '../../ssh/ports.js'
 import { createStateStore } from '../../state/store.js'
@@ -19,7 +19,9 @@ import {
  * 判据：
  * - `--json` 输出恰好 host / port / user / password 四个键。
  * - 密码只出现在 stdout。日志与状态目录里都不出现。
- * - 不加 `--json` 时按人读格式打印，密码照样打出来。
+ * - 不加 `--json` 时按人读格式打印，密码照样打出来——但只在 stdout 是终端时。
+ * - stdout 不是终端时人读模式拒绝输出密码（退出码 2），且拒绝发生在取凭据之前。
+ * - `--json` 不受 tty 限制：它是给机器读的，stdout 落点由调用方决定。
  *
  * 隔离：凭据端口是假对象，不连浏览器。状态目录用本机临时目录，
  * 只用来验证「命令没有写任何东西」和「密码没有落盘」。
@@ -27,6 +29,11 @@ import {
 
 const INSTANCE_ID = 'af9c49bd44-8ee624d7'
 const PASSWORD = 'zq7Kp2mNxR4t'
+
+/** 真终端的替身。人读模式只认 `isTTY === true`。 */
+const TTY = { isTTY: true }
+/** 被重定向或管道的 stdout：`process.stdout.isTTY` 为 undefined。 */
+const NOT_A_TTY = { isTTY: undefined }
 
 const temporaryParents: string[] = []
 
@@ -164,7 +171,7 @@ describe('creds：--json 输出', () => {
     }
 
     // Act
-    await runCredsCommand({ deps: harness.deps, json: true }, { instanceId: INSTANCE_ID }, async () => port)
+    await runCredsCommand({ deps: harness.deps, json: true }, { instanceId: INSTANCE_ID }, async () => port, TTY)
 
     // Assert
     const lines = harness.stdout.text().split('\n').filter((line) => line.length > 0)
@@ -190,7 +197,7 @@ describe('creds：--json 输出', () => {
     }
 
     await expect(
-      runCredsCommand({ deps: harness.deps, json: true }, { instanceId: INSTANCE_ID }, async () => port),
+      runCredsCommand({ deps: harness.deps, json: true }, { instanceId: INSTANCE_ID }, async () => port, TTY),
     ).rejects.toThrow(/控制台结构已变/)
     expect(closed).toBe(1)
   })
@@ -200,10 +207,15 @@ describe('creds：--json 输出', () => {
     let opened = false
 
     await expect(
-      runCredsCommand({ deps: harness.deps, json: true }, { instanceId: '  ' }, async () => {
-        opened = true
-        throw new Error('不应打开凭据通道')
-      }),
+      runCredsCommand(
+        { deps: harness.deps, json: true },
+        { instanceId: '  ' },
+        async () => {
+          opened = true
+          throw new Error('不应打开凭据通道')
+        },
+        TTY,
+      ),
     ).rejects.toBeInstanceOf(ConfigError)
     expect(opened).toBe(false)
   })
@@ -219,7 +231,12 @@ describe('creds：密码不外泄', () => {
     }
 
     // Act
-    await runCredsCommand({ deps: harness.deps, json: false }, { instanceId: INSTANCE_ID }, async () => port)
+    await runCredsCommand(
+      { deps: harness.deps, json: false },
+      { instanceId: INSTANCE_ID },
+      async () => port,
+      TTY,
+    )
 
     // Assert：三处互相独立地不出现密码。
     expect(harness.stdout.text()).toContain(PASSWORD)
@@ -237,7 +254,12 @@ describe('creds：人读格式', () => {
       close: async () => undefined,
     }
 
-    await runCredsCommand({ deps: harness.deps, json: false }, { instanceId: INSTANCE_ID }, async () => port)
+    await runCredsCommand(
+      { deps: harness.deps, json: false },
+      { instanceId: INSTANCE_ID },
+      async () => port,
+      TTY,
+    )
 
     expect(harness.stdout.text().split('\n').filter((line) => line.length > 0)).toEqual([
       'host: region-44.autodl.com',
@@ -251,5 +273,69 @@ describe('creds：人读格式', () => {
     const result = toCredsCommandResult(CREDENTIALS)
     expect(result).toEqual(CREDENTIALS)
     expect(formatCredsHumanReadable(result)[3]).toBe(`password: ${PASSWORD}`)
+  })
+})
+
+describe('creds：明文密码不许落盘', () => {
+  it('人读模式下 stdout 不是终端时拒绝输出密码，退出码 2，且不打开凭据通道', async () => {
+    // Arrange：`deploydeck creds <id> >> ops.log` 就是这种形状。
+    const harness = await createHarness({})
+    let opened = false
+
+    // Act
+    const error = await runCredsCommand(
+      { deps: harness.deps, json: false },
+      { instanceId: INSTANCE_ID },
+      async () => {
+        opened = true
+        throw new Error('不应打开凭据通道')
+      },
+      NOT_A_TTY,
+    ).catch((caught: unknown) => caught)
+
+    // Assert：退出码 2，stdout 一个字都没有，凭据根本没被取出来。
+    expect(error).toBeInstanceOf(HumanRequiredError)
+    expect((error as HumanRequiredError).exitCode).toBe(2)
+    expect((error as HumanRequiredError).code).toBe('HUMAN_REQUIRED')
+    expect((error as Error).message).toContain('--json')
+    expect(opened).toBe(false)
+    expect(harness.stdout.text()).toBe('')
+  })
+
+  it('人读模式下拿不到 isTTY（管道、CI）同样拒绝', async () => {
+    // 判据是 `isTTY !== true` 一律当非终端：读不到 tty 的场景恰好也是会落盘的场景。
+    const harness = await createHarness({})
+
+    await expect(
+      runCredsCommand(
+        { deps: harness.deps, json: false },
+        { instanceId: INSTANCE_ID },
+        async () => {
+          throw new Error('不应打开凭据通道')
+        },
+        { isTTY: 'yes' as unknown as boolean },
+      ),
+    ).rejects.toBeInstanceOf(HumanRequiredError)
+  })
+
+  it('--json 在 stdout 不是终端时照常输出，不受 tty 限制', async () => {
+    // Arrange：--json 是给机器读的，`creds --json | jq` 是正常用法。
+    const harness = await createHarness({})
+    const port: CredentialsPort = {
+      readCredentials: async () => CREDENTIALS,
+      close: async () => undefined,
+    }
+
+    // Act
+    await runCredsCommand(
+      { deps: harness.deps, json: true },
+      { instanceId: INSTANCE_ID },
+      async () => port,
+      NOT_A_TTY,
+    )
+
+    // Assert
+    const payload = JSON.parse(harness.stdout.text()) as Record<string, unknown>
+    expect(payload['password']).toBe(PASSWORD)
   })
 })

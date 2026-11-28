@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { ConsoleInstanceSnapshot } from '../../domain/instance.js'
 import type { Plan } from '../../domain/plan.js'
 import type { Profile } from '../../domain/profile.js'
-import { ConfigError, PowerOnFailedError } from '../../errors.js'
+import { ConfigError, PowerOffFailedError, PowerOnFailedError } from '../../errors.js'
 import type { PowerOnMode } from '../../console/ports.js'
 import type { Provider } from '../../providers/provider.js'
 import { createPlanStore } from '../../plan/plan-store.js'
@@ -94,11 +94,6 @@ function createProfile(overrides: Partial<Profile> = {}): Profile {
     ttlMinutes: 60,
     budgetCapYuan: 20,
     onDeployFailure: 'keep-container',
-    requirePinnedCommit: false,
-    deployScript: 'deploy.sh',
-    startScript: 'start.sh',
-    env: {},
-    bootstrapEnv: {},
     ...overrides,
   }
 }
@@ -277,7 +272,8 @@ describe('power：off 只关机', () => {
     })
   })
 
-  it('动作返回后状态不是已关机即报错，不静默当成功', async () => {
+  it('动作返回后状态不是已关机即抛 PowerOffFailedError（不是「开机失败」）', async () => {
+    // Arrange
     const harness = await createHarness({
       snapshots: [
         [createSnapshot({ status: 'running', statusRaw: '运行中' })],
@@ -286,9 +282,40 @@ describe('power：off 只关机', () => {
       plans: [createPlan()],
     })
 
-    await expect(
-      runPowerCommand({ deps: harness.deps, json: false }, options({ action: 'off' })),
-    ).rejects.toThrow(/不是已关机/)
+    // Act
+    const error = await runPowerCommand(
+      { deps: harness.deps, json: false },
+      options({ action: 'off' }),
+    ).catch((caught: unknown) => caught)
+
+    // Assert：两条路径的码必须分开，日志按码分叉。
+    expect(error).toBeInstanceOf(PowerOffFailedError)
+    expect((error as PowerOffFailedError).code).toBe('POWER_OFF_FAILED')
+    expect((error as Error).message).toContain('关机失败')
+    expect((error as Error).message).not.toContain('开机失败')
+  })
+
+  it('开机返回后状态不是运行中时抛 PowerOnFailedError（不是「关机失败」）', async () => {
+    // Arrange：形态对得上，但动作返回后列表还没到运行中。
+    const harness = await createHarness({
+      snapshots: [
+        [createSnapshot({ status: 'stopped', statusRaw: '已关机', noGpuMode: null })],
+        [createSnapshot({ status: 'stopped', statusRaw: '已关机', noGpuMode: null })],
+      ],
+      plans: [createPlan()],
+      profiles: [createProfile({ powerOnMode: 'gpu' })],
+    })
+
+    // Act
+    const error = await runPowerCommand(
+      { deps: harness.deps, json: false },
+      options({ action: 'on' }),
+    ).catch((caught: unknown) => caught)
+
+    // Assert
+    expect(error).toBeInstanceOf(PowerOnFailedError)
+    expect((error as PowerOnFailedError).code).toBe('POWER_ON_FAILED')
+    expect((error as Error).message).toContain('不是运行中')
   })
 })
 

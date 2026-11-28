@@ -52,13 +52,17 @@ deploydeck status --json
 | `profile list` | 列出配置目录里的全部部署配置 |
 | `plan create` | 创建一份计划（授权窗口） |
 | `plan show [planId]` | 列出全部生效计划，或显示单份 |
-| `run` | 在生效计划下执行部署 |
+| `run` | 在生效计划下获取实例并做健康检查 |
 | `status` | 查看生效计划、绑定实例的状态、单价、花费与账本摘要 |
 | `teardown <planId>` | 销毁计划绑定的实例，确认消失后写账本并关闭计划 |
 | `login` | 打开专用 Chrome，等人登录完成 |
 | `guard` | 前台常驻守护：过期计划销毁、预算熔断、余额告警 |
 | `shell <instanceId>` | 连到运行中实例的交互式终端 |
-| `shell <instanceId> -- <command>` | 在 PTY 里跑一条命令并返回退出码 |
+| `shell <instanceId> -- <command>` | 用登录 shell 跑一条命令并返回远端退出码 |
+| `power <instanceId>` | 开机或关机，并核实终态 |
+| `switch <instanceId>` | 关机 → 按目标形态开机 → 复验形态 |
+| `creds <instanceId>` | 读取实例的 SSH 登录信息 |
+| `tunnel <instanceId>` | 把实例的远端端口转发到本机回环 |
 | `plan extend` | 未实现（Phase 3），退出码 2 |
 | `ledger` | 未实现（Phase 3），退出码 2 |
 
@@ -72,8 +76,8 @@ deploydeck profile list [--json]
 
 读 `<配置目录>/profiles/`。任一文件非法时一次报完全部问题，退出码 2。
 
-人读输出一行一份配置，列：ID、项目、provider、开机形态、时长、预算、失败后策略、是否锁定 commit。
-开机形态列写「有卡」或「无卡」，对应 Profile 的 `powerOnMode`。
+人读输出一行一份配置，列：ID、项目、provider、开机、时长(分)、预算(元)、失败后。
+开机列写「有卡」或「无卡」，对应 Profile 的 `powerOnMode`。
 
 `--json` 输出形状：
 
@@ -136,8 +140,8 @@ deploydeck plan show [planId] [--balance] [--json]
 ### 2.4 `run`
 
 ```bash
-deploydeck run --plan <planId> [--commit <sha>] [--run-id <id>] [--json]
-deploydeck run --profile <profileId> [--create-plan] [--commit <sha>] [--run-id <id>] [--json]
+deploydeck run --plan <planId> [--run-id <id>] [--json]
+deploydeck run --profile <profileId> [--create-plan] [--run-id <id>] [--json]
 ```
 
 `--plan` 与 `--profile` 必须且只能给一个。
@@ -147,15 +151,22 @@ deploydeck run --profile <profileId> [--create-plan] [--commit <sha>] [--run-id 
 | `--plan <planId>` | 直接用这份计划 |
 | `--profile <profileId>` | 找该 Profile 的生效计划：恰好一份用它；多于一份报错并列出 id；一份都没有则失败 |
 | `--create-plan` | 显式授权 `--profile` 在没有生效计划时新建一份。只能与 `--profile` 一起用 |
-| `--commit <sha>` | 部署的代码版本，4-40 位十六进制。Profile 的 `requirePinnedCommit=true` 时必填。给了它时引擎先执行 `sync-commit` 步骤：`fetch` → `checkout --force` → 回验 HEAD；仓库不存在时先按 `project.repository` 克隆 |
 | `--run-id <id>` | 指定执行 id。测试注入固定值用；默认由 CLI 生成 `run-<时间戳>-<随机>` |
+
+`run` 的步骤固定：获取实例（开机复用或克隆）、等 SSH 就绪、读单价复核预算与余额、设置平台定时关机、健康检查。
+失败即停，后续步骤不执行。
+
+判据：`run` 成功只保证「实例已获取、已连通、健康检查通过」。它不保证业务服务可用。
+引擎在实例里执行的远端命令只有健康检查一条。
+
+判据：装环境、拉代码、起服务不由 `run` 执行。用 `shell` 自己跑，见本文 `shell` 一节。
 
 两条路径都要过「有生效计划」这一关（spec 第 9.1 节）。没有生效计划时 `--profile` 报业务失败
 （退出码 1），错误信息给出 `deploydeck plan create --profile <id>` 与 `--create-plan` 两条出路；
 `run` 自己不会创建计划。
 
 顺序判据：CLI 先定 run id、建 `runs/<runId>/`，再把 provider 的 `logDir` 指到该目录，
-最后把同一个 id 交给执行引擎。控制台截图因此落进本次 run 的目录。
+最后把同一个 id 交给执行引擎。控制台证据因此落进本次 run 的目录。
 
 未登录（控制台页面出现登录入口）时退出码 2，且不会创建 provider：不点任何按钮、不动任何实例。
 
@@ -184,8 +195,7 @@ deploydeck run --profile <profileId> [--create-plan] [--commit <sha>] [--run-id 
       "stdoutBytes": 0,
       "stderrBytes": 0,
       "logPath": "/home/.../runs/run-20261125-023500-1a2b/logs/power-on.log",
-      "screenshotPaths": [],
-      "skipped": false
+      "screenshotPaths": []
     }
   ]
 }
@@ -193,11 +203,11 @@ deploydeck run --profile <profileId> [--create-plan] [--commit <sha>] [--run-id 
 
 走 `--profile --create-plan` 且当场新建计划时，多一个 `createdPlanId` 字段。
 
-步骤里的 `skipped: true` 表示这一步没有执行，因为它要达成的目标此前已经达成过。
-当前只有引导脚本（`bootstrap-script`）会这样：同一实例的引导成功跑过一次之后，重跑 `run` 会记一条跳过。
-跳过时 `exitCode` 是 `0`，`stderrTail` 写着跳过依据（引导记录写于何时），
-`startedAt` 与 `finishedAt` 都是真值且相差接近 0。
-要强制重跑引导，删掉状态目录里的 `bootstrap/<instanceId>.jsonc`。
+判据：
+
+1. `steps` 只含实际跑过的步骤。任一步失败后，后续步骤不出现在这里。
+2. `commitSha` 恒为 `null`：引擎不锁定代码版本。
+3. `screenshotPaths` 恒为空数组：`Provider` 端口没有把截图路径回传的位置。
 
 ### 2.5 `status`
 
@@ -350,17 +360,22 @@ deploydeck shell <instanceId> -- <command...>
 
 两种形态：
 
-| 形态 | 判据 | 需要本地 tty |
-|---|---|---|
-| 交互 | 没给 `--` 之后的命令 | 是 |
-| 非交互 | 给了 `--` 之后的命令 | 否 |
+| 形态 | 判据 | 需要本地 tty | 远端通道 |
+|---|---|---|---|
+| 交互 | 没给 `--` 之后的命令 | 是 | PTY |
+| 非交互 | 给了 `--` 之后的命令 | 否 | `exec`，不开 PTY |
 
-**连接前置校验**（顺序固定，任一步不过都不建立 SSH 连接）：
+判据：非交互形态走 `exec`，不开 PTY。PTY 会话的结束事件依赖远端 shell 主动退出，
+远端退出后本地可能收不到，命令跑得再对也会卡到超时。
+
+**连接前置校验**（任一步不过都不建立 SSH 连接）：
 
 1. 交互形态先查本地 tty。不是 tty 抛 `INTERACTIVE_TERMINAL_REQUIRED`（退出码 2）。
 2. 打开控制台通道并判登录态。未登录抛 `LOGIN_REQUIRED`（退出码 2）。
 3. 读实例列表。实例不在列表抛 `INSTANCE_NOT_FOUND`（退出码 1）。
 4. 判实例状态。不是运行中抛 `INSTANCE_NOT_RUNNING`（退出码 1）。
+
+两种形态各判一次第 3、4 步：交互形态由终端通道判，非交互形态由命令在开 `exec` 之前判。
 
 **不做的检查**：
 
@@ -368,21 +383,32 @@ deploydeck shell <instanceId> -- <command...>
 - 不读单价、不设定时关机、不写账本、不改执行记录。
 - 不自动开机。要连已关机实例，先自己把它开起来。
 
-**会话行为**：
+**交互形态的会话行为**：
 
 1. 分配 PTY（`$TERM` 由 `--term` 给出，默认 `xterm-256color`）。
 2. 窗口尺寸跟随本地终端。本地终端改变尺寸时通知远端。
 3. 主机密钥指纹校验规则与 `run` 完全一致：首次记录，变化即 `HOST_KEY_CHANGED`（退出码 2）。
-4. 交互形态下远端字节直接写进真实终端，不写进 stdout 抽象。stdin 直接转发给远端。
+4. 远端字节直接写进真实终端，不写进 stdout 抽象。stdin 直接转发给远端。
+
+**非交互形态的行为**：
+
+1. `--` 之后的全部参数用空格拼成一条命令，记作原文。
+2. 引擎把原文包成 `bash -lc '<原文>'` 在远端执行。判据：命令用登录 shell 执行，
+   环境与交互终端一致。原文里的单引号先按 shell 规则转义，原文语义不变。
+3. 超时 600 秒。超时被终止即 `SHELL_FAILED`（退出码 2）。
+4. 完整输出落盘到 `<状态目录>/shell/<instanceId>/command.log`。`exec` 只回尾部摘要，本地不攒全量。
+5. 人读模式回读落盘文件全文写进终端，不写尾部摘要。输出非空时末尾补一行完整输出的路径。
+6. `--json` 模式只输出一个对象，`stderrTail` 非空时写 stderr。
 
 **退出码**：
 
 | 情况 | 退出码 |
 |---|---|
-| 会话正常结束 | 远端 shell 的退出码 |
-| 非交互形态下远端命令退出码非 0 | 远端退出码（经 `ShellFailedError` 转成 0/1/2 由 `errors.ts` 裁决） |
-| 没拿到远端退出码（连接中断等） | 2（`SHELL_FAILED`） |
+| 交互形态正常结束 | 远端 shell 的退出码 |
+| 非交互形态下远端命令退出码非 0 | 2（`SHELL_FAILED`） |
+| 没拿到远端退出码（超时、连接中断等） | 2（`SHELL_FAILED`） |
 | 没有本地 tty（交互形态） | 2（`INTERACTIVE_TERMINAL_REQUIRED`） |
+| 实例不在列表里 | 1（`INSTANCE_NOT_FOUND`） |
 | 实例不在运行中 | 1（`INSTANCE_NOT_RUNNING`） |
 
 判据：没拿到退出码不得当 0。远端命令是否执行完未知，必须人工核对。
@@ -398,7 +424,136 @@ deploydeck shell <instanceId> -- <command...>
 }
 ```
 
-判据：交互形态与 `--json` 互斥，同时给出即抛 `SHELL_FAILED`（退出码 2）。
+判据：
+
+1. `command` 字段是命令原文，不是包装后的 `bash -lc '...'`。引擎会把命令包成 `bash -lc`，但字段报原文。
+2. 交互形态与 `--json` 互斥，同时给出即抛 `SHELL_FAILED`（退出码 2）。
+
+### 2.10 `power`
+
+```bash
+deploydeck power <instanceId> (--on | --off) [--gpu | --no-gpu] [--profile <id>] [--json]
+```
+
+开机或关机一台实例，输出动作结束后的控制台终态。
+
+| 参数 | 含义 |
+|---|---|
+| `--on` / `--off` | 必选其一，且只能给一个。两者都给或都不给抛 `CONFIG_INVALID`（退出码 2） |
+| `--gpu` / `--no-gpu` | 覆盖目标形态。两个同时给抛 `CONFIG_INVALID`（退出码 2） |
+| `--profile <id>` | 目标形态取自这份部署配置。不给时取实例所属计划的部署配置 |
+
+判据：
+
+1. 目标形态的优先级：`--gpu` / `--no-gpu` > `--profile` > 实例所属计划。三处都拿不到即 `CONFIG_INVALID`，不猜成有卡。
+2. 只开关机。不建计划、不读单价、不设定时关机、不写账本、不改计划状态。
+3. 终态以列表事实为准：`--on` 后必须是运行中，`--off` 后必须是已关机。不符即报错，不静默当成功。
+4. 开机失败报 `POWER_ON_FAILED`（退出码 1），不降级形态。关机失败报 `POWER_OFF_FAILED`（退出码 1）。
+5. 控制台截图落 `<状态目录>/power/<instanceId>/`。同一实例反复开关会覆盖同名截图。
+
+`--json` 输出形状：
+
+```json
+{
+  "instanceId": "af9c49bd44-8ee624d7",
+  "action": "on",
+  "powerOnMode": "no-gpu",
+  "status": "running",
+  "statusRaw": "运行中"
+}
+```
+
+`powerOnMode` 在 `--off` 时也给：它是下次按配置开机的形态。
+
+### 2.11 `switch`
+
+```bash
+deploydeck switch <instanceId> (--gpu | --no-gpu) [--json]
+```
+
+把实例切到指定的开机形态。内部顺序固定：关机 → 按目标形态开机 → 复验形态。
+
+判据：
+
+1. `--gpu` 与 `--no-gpu` 必选其一。都不给抛 `CONFIG_INVALID`（退出码 2）。
+2. 实例已经是目标形态且运行中时直接返回，不关机重开。重复关机会打断正在跑的服务。
+3. 切换后实例仍在，`instanceId` 不变。本命令没有任何销毁动作。
+4. 不读单价、不读单价缓存、不写状态。形态换了单价不同，不判成单价漂移。
+5. 关机后状态不是已关机即 `POWER_OFF_FAILED`（退出码 1），切换中止。
+6. 复验形态不一致即 `INSTANCE_FORM_MISMATCH`（退出码 2）。实例已保留，未销毁。
+7. 实例不在控制台列表里即 `CONFIG_INVALID`（退出码 2），在第一步之前就失败。
+
+`--json` 输出形状：
+
+```json
+{
+  "instanceId": "af9c49bd44-8ee624d7",
+  "targetMode": "gpu",
+  "observedNoGpuMode": false,
+  "status": "running",
+  "statusRaw": "运行中"
+}
+```
+
+`observedNoGpuMode` 是复验读到的实测形态：`true` 无卡、`false` 有卡、`null` 页面没给出。
+
+### 2.12 `creds`
+
+```bash
+deploydeck creds <instanceId> [--json]
+```
+
+读取一台实例的 SSH 登录信息：主机、端口、用户、密码。
+存在理由只有一个：密码在控制台页面上是掩码，人只能靠本命令拿到明文。
+
+判据：
+
+1. 密码只写 stdout。不落盘、不进日志、不进错误消息。
+2. 人读输出四行，顺序是 `host:`、`port:`、`user:`、`password:`。密码在最后一行，便于复制。
+3. **人读模式要求 stdout 是终端。** 被管道或重定向时拒绝输出，抛 `HUMAN_REQUIRED`（退出码 2）。
+4. **拒绝发生在取凭据之前。** 此时不开浏览器、不读控制台，一条凭据都不取出来。
+5. `--json` 不受第 3 条限制：它本来就是给机器读的。
+6. 只读。除控制台截图（落 `<状态目录>/creds/<instanceId>/`）外不写任何文件，不改实例状态。
+
+`--json` 输出形状：
+
+```json
+{ "host": "region-xx.autodl.com", "port": 20345, "user": "root", "password": "<明文>" }
+```
+
+### 2.13 `tunnel`
+
+```bash
+deploydeck tunnel <instanceId> --ports <本地端口>:<远端端口> [--json]
+```
+
+SSH 本地端口转发。前台运行，直到按 `Ctrl+C`。
+
+判据：
+
+1. 端口号必须是 1–65535 的十进制整数。非法即 `CONFIG_INVALID`（退出码 2），不猜、不纠正、不退回默认端口。
+2. `--ports` 只接受恰好一个冒号。三段输入与空段都不是本命令的参数形式。
+3. 只监听 `127.0.0.1`，不暴露到局域网。
+4. 远端目标恒为实例自己的 `127.0.0.1`。本命令不做跳板机。
+5. 本地端口被占用时报 `TUNNEL_LOCAL_PORT_IN_USE`（退出码 1），不静默重试、不换端口。
+   判据是真实监听的 `EADDRINUSE`，不做预检试绑。
+6. 一次调用只开一次浏览器会话。凭据读取、主机指纹校验与转发合成一次控制台会话。
+7. 主机密钥指纹校验规则与 `run` 一致。
+8. 收到 `SIGINT` 或 `SIGTERM` 时先关转发再返回。`Ctrl+C` 是正常退出，不是失败。
+9. 转发异常断开即报错，不静默保持一个断掉的监听。
+10. 每个本地连接开一条转发。适合临时连一次调试端口，不承担长期服务。
+
+`--json` 输出形状在建立转发后输出一次：
+
+```json
+{
+  "instanceId": "af9c49bd44-8ee624d7",
+  "localPort": 6006,
+  "remotePort": 6006,
+  "listenHost": "127.0.0.1",
+  "remoteHost": "127.0.0.1"
+}
+```
 
 ## 3. 例行操作
 
@@ -457,16 +612,10 @@ deploydeck status --json | jq '.plans[] | { planId, instanceId, spentYuan }'
 | 退出码 | 含义 | 例子 |
 |---|---|---|
 | 0 | 成功 | 命令完成并能读到结果 |
-| 1 | 业务失败 | 计划不存在或已过期、脚本失败、预算不足、健康检查失败 |
-| 2 | 需要人工 | 配置非法、未登录、克隆超时、实例未确认消失、克隆配额耗尽、命令未实现、没有本地 tty、终端会话丢失退出码 |
+| 1 | 业务失败 | 计划不存在或已过期、预算不足、余额不足、健康检查失败、实例不在运行中、端口被占用 |
+| 2 | 需要人工 | 配置非法、未登录、克隆超时、实例未确认消失、克隆配额耗尽、命令未实现、没有本地 tty、会话丢失退出码、人读模式的 `creds` 不是终端 |
 
 错误类自带 `exitCode`（`src/errors.ts`），CLI 只透传，不另建映射表。
-
-**远端退出码 78（`EX_CONFIG`）**：deploydeck 进程不会以 78 退出。
-它出现在 SSH 步骤记录的远端退出码里，含义是「声明的环境变量根本没送到远端进程」，
-来源是部署配置的 `env` / `bootstrapEnv`。出现它时不要去读脚本逻辑，先在本机设置这些变量。
-命令前缀用 `test -n "${VAR+x}" || exit 78` 自检：SSH 的 `env` 请求可能被服务端按 `AcceptEnv`
-白名单静默丢弃，数据面收不到失败信号，只能由命令自己判。
 
 ### 5.1 错误行格式
 

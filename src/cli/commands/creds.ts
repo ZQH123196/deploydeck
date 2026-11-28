@@ -1,5 +1,4 @@
-import { join } from 'node:path'
-import { ConfigError } from '../../errors.js'
+import { ConfigError, HumanRequiredError } from '../../errors.js'
 import type { CredentialsPort } from '../../ssh/credentials.js'
 import type { SshCredentials } from '../../ssh/ports.js'
 import { writeJson, writeLine } from '../output.js'
@@ -16,6 +15,10 @@ import type { CommandContext } from './shared.js'
  *   命令不另写一套，也不读剪贴板。
  * - 只读：除了凭据动作自己的两张截图（落证据目录）之外不写任何文件，不改实例状态，不建计划。
  * - 人读模式下密码照样打出来。这不是缺陷，是这条命令存在的理由。
+ * - 人读模式要求 stdout 是终端。`deploydeck creds <id> >> ops.log` 会把明文密码写进磁盘，
+ *   而那条命令看起来和平时没有区别。不是 tty 即抛 `HumanRequiredError`（退出码 2），
+ *   提示改用 `--json` 或重定向到终端。拒绝发生在打开凭据通道之前：没用上的凭据不许被取出来。
+ * - `--json` 不受这条限制：它本来就是给机器读的，stdout 的落点由调用方自己决定。
  */
 
 /** 凭据证据目录名。它落在状态目录 runs 根下，与其它命令的现场目录并列。 */
@@ -24,6 +27,11 @@ export const CREDS_EVIDENCE_DIRECTORY = 'creds'
 export interface CredsCommandOptions {
   /** 目标实例 ID。 */
   readonly instanceId: string
+}
+
+/** 人读模式判断 stdout 是否终端时吃的形状。生产用 `process.stdout`。 */
+export interface CredsOutputStream {
+  readonly isTTY?: boolean | undefined
 }
 
 /**
@@ -36,6 +44,24 @@ export interface CredsCommandResult {
   readonly port: number
   readonly user: string
   readonly password: string
+}
+
+/**
+ * 人读模式的 stdout 必须是终端。
+ *
+ * 判据：`isTTY !== true` 一律当「不是终端」。管道、重定向、CI 都读不到 `isTTY`，
+ * 它们恰好也是会落盘的那些场景。宁可让人看到一条明确的错误，也不要静默把密码写进文件。
+ */
+export function requireTerminalForPassword(stream: CredsOutputStream): void {
+  if (stream.isTTY === true) {
+    return
+  }
+  throw new HumanRequiredError(
+    '人读模式会把明文密码写到 stdout，而当前 stdout 不是终端（被重定向或管道了）。' +
+      '继续下去密码会落到磁盘上。' +
+      '要用脚本读凭据就加 `--json`；要人看就在终端里直接运行本命令。' +
+      '未读取任何凭据。',
+  )
 }
 
 /**
@@ -77,9 +103,14 @@ export async function runCredsCommand(
   context: CommandContext,
   options: CredsCommandOptions,
   openCredentials: (options: { readonly logDir: string }) => Promise<CredentialsPort>,
+  stdoutStream: CredsOutputStream = process.stdout,
 ): Promise<void> {
   if (options.instanceId.trim().length === 0) {
     throw new ConfigError('instanceId 不能为空。')
+  }
+  // 判据放在取凭据之前：被拒绝的命令不该先从控制台把明文密码取出来。
+  if (!context.json) {
+    requireTerminalForPassword(stdoutStream)
   }
 
   // 证据目录口径：不带 run 的命令一律 <stateDir>/<命令名>/<instanceId>。

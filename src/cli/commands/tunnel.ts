@@ -1,6 +1,4 @@
-import { join } from 'node:path'
-import { ConfigError, TunnelLocalPortInUseError } from '../../errors.js'
-import type { CredentialsPort } from '../../ssh/credentials.js'
+import { ConfigError } from '../../errors.js'
 import type { ForwardedPort } from '../../ssh/ssh-channel.js'
 import { writeJson, writeLine } from '../output.js'
 import type { CommandContext } from './shared.js'
@@ -10,11 +8,14 @@ import type { CommandContext } from './shared.js'
  *
  * 判据：
  * - 端口号必须是 1–65535 的十进制整数。非法即抛 `ConfigError`，不猜、不纠正、不退回默认端口。
- * - 本地端口已被占用时立即报错（`TunnelLocalPortInUseError`），不静默重试、不换端口。
- *   占用检测由本命令先试绑一次完成：等转发建好才发现占用，会把端口冲突伪装成连接失败。
- * - 凭据读取与主机指纹校验复用 SSH 适配层。本命令只负责编排：
- *   开凭据通道 → 试绑本地端口 → 开转发 → 等中止 → 清理。
- * - 前台运行。收到 `SIGINT`（Ctrl+C）或 `SIGTERM` 时先关监听、再关凭据通道，然后正常返回。
+ * - 本地端口已被占用时报 `TunnelLocalPortInUseError`，不静默重试、不换端口。
+ *   占用只有一个判据：真实监听的 `EADDRINUSE`。本命令**不做**预检试绑：
+ *   「先试绑、关掉、再监听」的两次 `listen` 之间端口可以被别人抢走，预检只降低概率，
+ *   构不成判据，还会让占用看起来像是本命令自己检出来的。
+ * - 一次命令调用只开一次浏览器会话。凭据读取、主机指纹校验与转发都归 `openForward`：
+ *   本命令不开凭据通道。同一条命令开两次浏览器等于两个标签页，第二个容易读到脏状态。
+ * - 本命令只负责编排：开转发 → 等中止 → 清理。
+ * - 前台运行。收到 `SIGINT`（Ctrl+C）或 `SIGTERM` 时先关转发，然后正常返回。
  *   Ctrl+C 是这个命令的正常退出方式，不是失败。
  * - 再来的重复信号被忽略：一次退出只清理一次，避免清理到一半被打断。
  *
@@ -22,7 +23,12 @@ import type { CommandContext } from './shared.js'
  * 不承担长期服务。转发异常断开即报错，不静默保持一个断掉的监听。
  */
 
-/** 转发证据目录名。它落在状态目录下，凭据动作的两张截图落这里。 */
+/**
+ * 转发证据目录名。它落在状态目录下。
+ *
+ * 控制台证据（取凭据时的两张截图）由 `openForward` 的装配写在这里，
+ * 本命令不直接写这个目录。
+ */
 export const TUNNEL_EVIDENCE_DIRECTORY = 'tunnel'
 
 /** 只监听回环地址。转发不得暴露到局域网，这是判据，不是可配置默认值。 */
@@ -95,15 +101,18 @@ export function parseTunnelPorts(spec: string): TunnelPorts {
 /**
  * 一次转发的全部外部依赖。
  *
- * 拆出来是为了让编排（试绑 → 开转发 → 等中止 → 清理）能单测：
+ * 拆出来是为了让编排（开转发 → 等中止 → 清理）能单测：
  * 自动测试不得建立真实 SSH 连接，也不得真的占用端口。
+ *
+ * 这里没有「端口预检」也没有「凭据通道」：前者是竞态，后者会开第二个浏览器标签页。
  */
 export interface TunnelDependencies {
-  /** 试绑本地端口。绑不上时抛 `TunnelLocalPortInUseError`。 */
-  assertLocalPortFree(localPort: number, remotePort: number): Promise<void>
-  /** 打开凭据通道。凭据本身不使用：它只用来确认实例存在并释放浏览器通道。 */
-  openCredentials(options: { readonly logDir: string }): Promise<CredentialsPort>
-  /** 打开转发。`signal` 中止时实现方负责关掉通道。 */
+  /**
+   * 打开转发。这是本命令唯一一次控制台会话。
+   *
+   * 判据：端口被占用由实现方翻译成 `TunnelLocalPortInUseError`；凭据在实现方内部读取。
+   * `signal` 中止时实现方负责关掉通道。
+   */
   openForward(request: {
     readonly instanceId: string
     readonly localPort: number
@@ -120,8 +129,9 @@ export interface TunnelDependencies {
 /**
  * 转发编排。
  *
- * 顺序判据：先试绑端口，再开凭据通道，最后开转发。端口冲突是最常见的失败，
- * 放在最前面就能在碰浏览器之前报出来。
+ * 顺序判据：先注册信号、再开转发、然后等中止、最后清理。
+ * 端口占用与实例状态都由 `openForward` 在第一次控制台会话里判出来，
+ * 本命令不再另做一次判断：判两次等于两个事实来源。
  */
 export async function runTunnel(
   context: CommandContext,
@@ -136,8 +146,6 @@ export async function runTunnel(
     options.instanceId,
   )
 
-  await deps.assertLocalPortFree(ports.localPort, ports.remotePort)
-
   const controller = new AbortController()
   const stop = (): void => {
     if (controller.signal.aborted) {
@@ -147,7 +155,6 @@ export async function runTunnel(
   }
   const disposers = [deps.onSignal('SIGINT', stop), deps.onSignal('SIGTERM', stop)]
 
-  const credentials = await deps.openCredentials({ logDir })
   let forwarding: ForwardedPort
   try {
     forwarding = await deps.openForward({
@@ -163,7 +170,6 @@ export async function runTunnel(
     for (const dispose of disposers) {
       dispose()
     }
-    await credentials.close()
     throw error
   }
 
@@ -188,7 +194,6 @@ export async function runTunnel(
       dispose()
     }
     await forwarding.close()
-    await credentials.close()
     context.deps.logger.info('tunnel.closed', {
       instanceId: options.instanceId,
       localPort: ports.localPort,

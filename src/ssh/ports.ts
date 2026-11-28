@@ -18,22 +18,6 @@ export interface SshExecOptions {
   readonly timeoutSeconds: number
   /** 完整输出的落盘路径。调用方负责给出。 */
   readonly logPath: string
-  /**
-   * 只注入本命令进程的环境变量。
-   *
-   * 判据：值不进 `command`。`command` 会被写进执行记录、逐字进日志、在报错消息里回显，
-   * 值写在命令里就再也收不回来。实现方必须把值交给会话，不得拼进命令字符串。
-   * 这是唯一允许出现取值的通道。
-   *
-   * 边界（已读 ssh2 1.17.0 源码核实）：协议层与库实现**都不保证失败可见**。
-   * ssh2 的 `client.exec(command, {env}, cb)` 调 `reqEnv` 时没有传回调，
-   * 于是 `want_reply` 置 0，服务端丢弃请求时客户端收不到任何错误。
-   * 更关键的是 `reqEnv` 不进库里的 `todo` 队列，`reqExec` 紧随其后直接发出，
-   * **即使补上回调也来不及阻止命令执行**。
-   * 这不是库的缺陷，是协议层「服务端可以用 `AcceptEnv` 白名单丢弃」与库实现共同给出的
-   * 既有边界。所以调用方不要指望靠这条通道判断注入成功：命令自己必须以环境变量在场为前置条件。
-   */
-  readonly env?: Readonly<Record<string, string>>
 }
 
 /**

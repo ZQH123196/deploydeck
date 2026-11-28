@@ -113,7 +113,6 @@ function createSsh2Session(client: Client, getConnectionFailure: () => Error | u
     async exec(
       command: string,
       handlers: SshSessionExecHandlers,
-      env?: Readonly<Record<string, string>>,
     ): Promise<SshSessionExecOutcome> {
       if (closed) {
         throw new SshError('SSH_CONNECT_FAILED', 'SSH 会话已关闭，不能执行命令。')
@@ -122,7 +121,6 @@ function createSsh2Session(client: Client, getConnectionFailure: () => Error | u
       if (earlyFailure !== undefined) {
         throw mapSessionFailure(earlyFailure)
       }
-      const execOptions = env === undefined || Object.keys(env).length === 0 ? {} : { env }
 
       return await new Promise<SshSessionExecOutcome>((resolve, reject) => {
         let settled = false
@@ -134,7 +132,7 @@ function createSsh2Session(client: Client, getConnectionFailure: () => Error | u
           action()
         }
 
-        client.exec(command, execOptions, (error: Error | undefined, channel: ClientChannel) => {
+        client.exec(command, (error: Error | undefined, channel: ClientChannel) => {
           if (error !== undefined) {
             settle(() => {
               reject(mapSessionFailure(error))

@@ -10,6 +10,7 @@ import {
 import {
   buildLedgerEntry,
   closePlanWithLedger,
+  findInstanceEntry,
   markPlanEscalated,
   requireRunAccounting,
 } from '../../plan/settlement.js'
@@ -28,8 +29,26 @@ export interface TeardownCommandResult {
   readonly planId: string
   readonly instanceId: string
   readonly state: PlanState
-  /** 本次新写入的账本行。已经结算过时为 null（不重复记账）。 */
+  /**
+   * 本次新写入的账本行。该实例生命周期已有账本行时为 null。
+   *
+   * 为 null 时看 `accountedStoppedAt`：那一行的 `stoppedAt` 就是计费终点。
+   */
   readonly ledgerEntry: LedgerEntry | null
+  /**
+   * 该实例在账本里已封口的计费终点。`ledgerEntry` 为 null 时给出这一行的值。
+   *
+   * 判据：运维要能只读这一份输出就回答「钱停在几点」。只写「未重复记账」回答不了。
+   */
+  readonly accountedStoppedAt: string | null
+  /**
+   * 该实例的计费终点是否已封口。
+   *
+   * `true` 表示账本里这一笔已经记全，本次没有新增行；
+   * `false` 表示本次新增了行（`ledgerEntry` 非空）。
+   * 两者互斥，读者不必自己从 `ledgerEntry` 反推。
+   */
+  readonly settledBeforeThisRun: boolean
   readonly spentYuan: number
   readonly budgetCapYuan: number
   /** 已花费达到或超过预算上限。 */
@@ -44,6 +63,10 @@ export interface TeardownCommandResult {
  *
  * 记账口径：账本是事实，`plan.spentYuan` 是账本的投影。账本每封口一行，就把金额记回计划，
  * 同一份计划的下一次执行才能看见已经烧掉的钱。
+ *
+ * 计费终点判据（M1）：该实例已有账本行时，那一行的 `stoppedAt` 就是计费终点。
+ * 此时本次不得再造 entry —— 停机成功那一刻账已经封了，用当前钟点造的量会被结算层丢弃，
+ * 而丢弃不可见，账本会永久低估。这种情形本次只做「关闭计划」，不写账。
  */
 export async function runTeardownCommand(
   context: CommandContext,
@@ -72,11 +95,12 @@ export async function runTeardownCommand(
   // 账本快照显式区分「文件不存在」与「空账本」：文件丢失时继续结算会重复记账。
   const ledgerSnapshot = await stores.ledger.readSnapshot()
   assertLedgerNotLost(plan, ledgerSnapshot)
-  const alreadyAccounted =
-    ledgerSnapshot.status === 'present' &&
-    ledgerSnapshot.entries.some(
-      (entry) => entry.planId === planId && entry.instanceId === instanceId,
-    )
+  const existingEntry = await findInstanceEntry(stores.ledger, planId, instanceId)
+
+  // 判据：本次将写账时，账本需要的事实必须在销毁之前就取齐。
+  // 销毁是不可撤回的动作；先销毁再发现缺字段，实例已经没了而账还没记，等于把计费终点弄丢。
+  // 已有账本行时不必取这些字段：那一行已经把计费终点封住。
+  const accounting = existingEntry === null ? requireRunAccounting(run) : null
 
   const logDir = await stores.stateStore.resolve(`${RUNS_DIRECTORY}/${run.id}`)
   const session = await context.deps.openProvider({ logDir })
@@ -87,27 +111,18 @@ export async function runTeardownCommand(
     snapshot = snapshots.find((candidate) => candidate.instanceId === instanceId)
 
     if (snapshot === undefined) {
-      if (!alreadyAccounted) {
+      if (existingEntry === null) {
         throw new HumanRequiredError(
           `实例 ${instanceId} 已不在控制台实例列表里，但账本没有它的记录，无法确定停止时刻与金额。` +
             `计划 ${planId} 保持原状态，未做任何改动。请人工核对账本与状态目录。`,
         )
       }
       const closed = await closePlanWithLedger(stores, planId, instanceId, null)
-      emitTeardownResult(context, {
-        planId,
-        instanceId,
-        state: closed.plan.state,
-        ledgerEntry: null,
-        spentYuan: closed.plan.spentYuan,
-        budgetCapYuan: closed.plan.budgetCapYuan,
-        budgetExhausted: closed.plan.spentYuan >= closed.plan.budgetCapYuan,
-      })
+      recordTeardownClosed(context, planId, instanceId, run.id, closed)
+      emitTeardownResult(context, teardownResult(planId, instanceId, closed))
       return
     }
 
-    // 账本需要的事实全部来自执行记录。缺一个就抛人工错误，不从旁路兜底。
-    const accounting = requireRunAccounting(run)
     const outcome = await session.provider.destroy(instanceId)
     if (outcome.state === 'escalated') {
       await markPlanEscalated(stores, planId)
@@ -117,39 +132,68 @@ export async function runTeardownCommand(
       )
     }
 
-    const entry = buildLedgerEntry({
-      planId,
-      runId: run.id,
-      instanceId,
-      gpuSpec: accounting.gpuSpec,
-      startedAt: accounting.startedAt,
-      stoppedAt: beijingIso(new Date(context.deps.clock.now())),
-      unitPriceYuanPerHour: accounting.unitPriceYuanPerHour,
-    })
-
+    // 已有账本行时不构造 entry：计费终点已封口，不拿当前钟点造第二个终点。
+    const entry =
+      accounting === null
+        ? null
+        : buildLedgerEntry({
+            planId,
+            runId: run.id,
+            instanceId,
+            ...accounting,
+            stoppedAt: beijingIso(new Date(context.deps.clock.now())),
+          })
     const closed = await closePlanWithLedger(stores, planId, instanceId, entry)
-    const ledgerEntry = closed.writtenEntry
-    context.deps.logger.info('teardown.closed', {
-      planId,
-      instanceId,
-      runId: run.id,
-      amountYuan: ledgerEntry === null ? 0 : ledgerEntry.amountYuan,
-      spentYuan: closed.plan.spentYuan,
-      budgetExhausted: closed.plan.spentYuan >= closed.plan.budgetCapYuan,
-      alreadyAccounted,
-    })
-    emitTeardownResult(context, {
-      planId,
-      instanceId,
-      state: closed.plan.state,
-      ledgerEntry,
-      spentYuan: closed.plan.spentYuan,
-      budgetCapYuan: closed.plan.budgetCapYuan,
-      budgetExhausted: closed.plan.spentYuan >= closed.plan.budgetCapYuan,
-    })
+    recordTeardownClosed(context, planId, instanceId, run.id, closed)
+    emitTeardownResult(context, teardownResult(planId, instanceId, closed))
   } finally {
     await session.close()
   }
+}
+
+/**
+ * `teardown` 的最终结果形状。
+ *
+ * 判据：`ledgerEntry` 与 `accountedStoppedAt` 必须恰好给出一个「计费终点」来源：
+ * 本次新增行时前者有值，之前已封口时后者有值。
+ */
+function teardownResult(
+  planId: string,
+  instanceId: string,
+  closed: Awaited<ReturnType<typeof closePlanWithLedger>>,
+): TeardownCommandResult {
+  const settledBeforeThisRun = closed.writtenEntry === null
+  return {
+    planId,
+    instanceId,
+    state: closed.plan.state,
+    ledgerEntry: closed.writtenEntry,
+    // 本次没写行时，计费终点就是账本里那一行的 `stoppedAt`。
+    accountedStoppedAt: settledBeforeThisRun ? (closed.existingEntry?.stoppedAt ?? null) : null,
+    settledBeforeThisRun,
+    spentYuan: closed.plan.spentYuan,
+    budgetCapYuan: closed.plan.budgetCapYuan,
+    budgetExhausted: closed.plan.spentYuan >= closed.plan.budgetCapYuan,
+  }
+}
+
+function recordTeardownClosed(
+  context: CommandContext,
+  planId: string,
+  instanceId: string,
+  runId: string,
+  closed: Awaited<ReturnType<typeof closePlanWithLedger>>,
+): void {
+  context.deps.logger.info('teardown.closed', {
+    planId,
+    instanceId,
+    runId,
+    wroteLedgerEntry: closed.writtenEntry !== null,
+    amountYuan: closed.writtenEntry === null ? 0 : closed.writtenEntry.amountYuan,
+    accountedStoppedAt: closed.writtenEntry?.stoppedAt ?? closed.existingEntry?.stoppedAt ?? null,
+    spentYuan: closed.plan.spentYuan,
+    budgetExhausted: closed.plan.spentYuan >= closed.plan.budgetCapYuan,
+  })
 }
 
 /**
@@ -195,13 +239,18 @@ function emitTeardownResult(context: CommandContext, result: TeardownCommandResu
     return
   }
   writeLine(context.deps.stdout, `已销毁实例 ${result.instanceId}（计划 ${result.planId} 已关闭）`)
-  if (result.ledgerEntry === null) {
-    writeLine(context.deps.stdout, '  账本：该实例生命周期已有记录，本次未重复记账。')
-  } else {
+  if (result.ledgerEntry !== null) {
     writeLine(
       context.deps.stdout,
       `  账本：新增一行，金额 ${formatYuan(result.ledgerEntry.amountYuan)} 元` +
         `（单价 ${formatYuan(result.ledgerEntry.unitPriceYuanPerHour)} 元/时）`,
+    )
+  } else {
+    // 判据：文案必须让人读出「本次没记新账」与「那笔账记到哪一刻」，不能只说「未重复记账」。
+    writeLine(
+      context.deps.stdout,
+      `  账本：本次没有新增账本行。该实例的费用已在停机时刻 ${String(result.accountedStoppedAt)} 封口，` +
+        '金额已记在计划已花费里。',
     )
   }
   writeLine(

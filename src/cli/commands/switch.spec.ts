@@ -2,7 +2,11 @@ import { mkdir, mkdtemp, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { ConsoleInstanceSnapshot } from '../../domain/instance.js'
-import { InstanceFormMismatchError, PowerOnFailedError } from '../../errors.js'
+import {
+  InstanceFormMismatchError,
+  PowerOffFailedError,
+  PowerOnFailedError,
+} from '../../errors.js'
 import type { Provider } from '../../providers/provider.js'
 import { createStateStore } from '../../state/store.js'
 import type { CliDependencies } from '../dependencies.js'
@@ -273,9 +277,15 @@ describe('switch：判据 1（实例仍在，instanceId 不变）', () => {
       ],
     })
 
-    await expect(
-      runSwitchCommand({ deps: harness.deps, json: false }, options({ targetMode: 'no-gpu' })),
-    ).rejects.toThrow(/不是已关机/)
+    const error = await runSwitchCommand(
+      { deps: harness.deps, json: false },
+      options({ targetMode: 'no-gpu' }),
+    ).catch((caught: unknown) => caught)
+
+    // 判据：关机后状态不对是运行期事实不符，报 `POWER_OFF_FAILED`，不是 `CONFIG_INVALID`。
+    expect(error).toBeInstanceOf(PowerOffFailedError)
+    expect((error as PowerOffFailedError).code).toBe('POWER_OFF_FAILED')
+    expect((error as Error).message).toContain('不是已关机')
     expect(harness.calls.some((call) => call.startsWith('powerOn'))).toBe(false)
   })
 

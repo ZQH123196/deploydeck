@@ -17,12 +17,8 @@
   "ttlMinutes": 480,
   "budgetCapYuan": 200,
 
-  // 部署失败后实例立即销毁。依次执行关机、释放、验证消失。
-  "onDeployFailure": "destroy-container",
-
-  // 生产必须锁定 commit。线上跑的是哪份代码必须可追溯。
-  "requirePinnedCommit": true,
-
-  "deployScript": "scripts/deploy.sh",
-  "startScript": "scripts/start.sh"
+  // 部署失败后容器怎么办。当前两个取值行为相同：保留容器并停机，不自动销毁。
+  // 销毁入口只有 teardown 命令一条；失败时容器要留下来给人查现场。
+  // 这里保留 destroy-container 只为不改动既有生产配置的取值。
+  "onDeployFailure": "destroy-container"
 }

@@ -2,7 +2,7 @@
 
 > **部分内容已被取代。** 本文假设单价来自 API、平台定时关机由 API 设置。实测表明两者都必须从控制台取得。以 [Phase 2 spec](specs/deploydeck-phase2.md) 为准。
 >
-> 仍然有效的部分：Profile 字段语义、`onDeployFailure` 与 `requirePinnedCommit` 两条开关互相独立、预算熔断判据、日志保留判据。
+> 仍然有效的部分：Profile 字段语义、`onDeployFailure` 开关的判据、预算熔断判据、日志保留判据。
 
 ## 1. 为什么需要计划
 
@@ -34,14 +34,12 @@ Run      计划下的一次动作。记录每一步结果。
 | `instanceNamePattern` | 是 | 实例命名。控制台有同名实例时复用它，没有时用它创建 |
 | `gpuPreference` | 是 | 算力规格优先级。左端优先级最高 |
 | `regionPreference` | 否 | 地区优先级 |
+| `powerOnMode` | 否 | 开机形态。缺省 `gpu` |
 | `cloneDataDisk` | 否 | 克隆实例时是否一起拷贝数据盘。默认是 |
 | `cloneSourceInstanceName` | 否 | 克隆源实例的名字或 ID。走克隆路径时必填 |
 | `ttlMinutes` | 是 | 本次计划的默认可用分钟数 |
 | `budgetCapYuan` | 是 | 本次计划的预算上限，单位元 |
-| `onDeployFailure` | 是 | 部署失败后容器怎么办。取值见 3.1 |
-| `requirePinnedCommit` | 是 | 是否强制指定 commit。取值见 3.2 |
-| `deployScript` | 是 | 项目仓库内的部署脚本相对路径 |
-| `startScript` | 是 | 项目仓库内的启动脚本相对路径 |
+| `onDeployFailure` | 否 | 部署失败后容器怎么办。缺省 `keep-container`。取值见 3.1 |
 
 ### 3.1 onDeployFailure
 
@@ -49,47 +47,35 @@ Run      计划下的一次动作。记录每一步结果。
 
 | 取值 | 部署失败后容器怎么办 |
 |---|---|
-| `keep-container` | 容器继续运行。到计划过期时刻自动销毁。期间计费。 |
-| `destroy-container` | 容器立即销毁。依次执行关机、释放、验证消失。 |
+| `keep-container` | 容器保留，实例停机。人可进去查现场。到计划过期时刻由 `guard` 销毁。 |
+| `destroy-container` | 当前与 `keep-container` 行为相同：保留容器并停机，不自动销毁。 |
 
 默认值是 `keep-container`。
 
-理由：失败时要能进容器查现场。生产配置显式写 `destroy-container` 即可。
+判据：自动判定失败一律不停机销毁容器，只停机止损。销毁入口只有 `teardown` 命令一条。
+
+理由：销毁不可撤回。失败后要能进容器查现场；自动销毁会把现场一起抹掉。
+`destroy-container` 保留取值只为兼容已有配置与字段语义，执行层对它只记一条 warn 日志。
 
 判据：`plan create` 的输出必须打印本次取用的策略。人每次都能看见。
 
-### 3.2 requirePinnedCommit
+### 3.2 规格选择链
 
-这个字段只管代码版本。它不影响容器在失败后是否继续运行。
-
-| 取值 | 含义 |
-|---|---|
-| 是 | 部署前必须给出 commit sha。部署器把容器里的仓库切到该 commit 再构建。仓库不存在时先按 Project 的 `repository` 克隆；切完回验 `git rev-parse HEAD` 等于该 sha，不等即失败。 |
-| 否 | 允许使用容器里的当前工作区。 |
-
-生产配置取“是”。开发配置取“否”。
-
-理由：线上跑的是哪份代码必须可追溯。
-
-注意：两条开关互相独立。任意组合都合法。
-
-### 3.3 规格选择链
-
-`gpuPreference` 是一个有序列表。引擎按顺序尝试。
+`gpuPreference` 是一个有序列表。克隆时按顺序从选主机页面挑第一档可用规格。
 
 ```text
 for spec of gpuPreference:
-    尝试 create(spec)
+    尝试按该规格选主机
     成功 → 使用该规格，结束
     失败 → 记录失败原因，试下一档
 全部失败 → 整体失败，报出每一档的失败原因
 ```
 
-判据：不允许跳档，不允许“先建低配再升级”。每次部署只创建一个容器。
+判据：不允许跳档，不允许“先建低配再升级”。每次取实例只得到一个实例。
 
 理由：先建再升会产生两次计费窗口和一次中间状态。
 
-### 3.4 克隆源实例
+### 3.3 克隆源实例
 
 控制台的克隆功能以一台**已关机实例**为模板。没有源实例，克隆不出任何东西。
 
@@ -101,7 +87,8 @@ for spec of gpuPreference:
 3. 列表里有多台同名实例                  → 报错，让人先清理
 4. 没有同名实例                          → 按 cloneSourceInstanceName 找源实例克隆
    ├ 配置里没写源实例                    → 报错，列出可用的已关机实例供人选
-   ├ 找到多台同名源实例                  → 报错，列出 ID
+   ├ 找不到源实例                        → 报错，列出可用的已关机实例
+   ├ 命中多台源实例                      → 报错，列出 ID
    └ 源实例不是已关机                    → 先关机，再克隆
 ```
 
@@ -247,6 +234,6 @@ spentYuan = Σ over 容器 (pricePerHourYuan × runningHours)
 
 判据：部署器在容器销毁前，必须先把本步日志落盘并 flush。
 
-理由：`destroy-container` 策略下，容器消失后现场只剩本机日志。
+理由：容器消失后（`teardown`、`guard` 销毁），现场只剩本机日志。
 
 判据：日志里不得出现凭据明文。凭据只记引用名。

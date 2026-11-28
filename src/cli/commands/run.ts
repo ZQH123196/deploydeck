@@ -5,7 +5,6 @@ import { RUNS_DIRECTORY } from '../../engine/run-store.js'
 import type { Plan } from '../../domain/plan.js'
 import type { Profile } from '../../domain/profile.js'
 import {
-  formatNullable,
   formatYuan,
   writeJson,
   writeLine,
@@ -22,7 +21,6 @@ import {
 export interface RunCommandOptions {
   readonly plan?: string
   readonly profile?: string
-  readonly commit?: string
   readonly runId?: string
   /** 没有生效计划时，允许 `--profile` 新建一份。 */
   readonly createPlan?: boolean
@@ -84,7 +82,6 @@ export async function runRunCommand(
       planId: plan.id,
       profile,
       project,
-      commitSha: options.commit ?? null,
       runId,
     })
   } finally {
@@ -224,7 +221,6 @@ function formatRunSummary(
     `  部署配置：${profile.id}`,
     `  模式：${summary.mode === 'reuse' ? '开机复用' : '克隆'}`,
     `  实例：${summary.instanceId}`,
-    `  commit：${formatNullable(summary.commitSha)}`,
     `  单价：${formatYuan(summary.unitPriceYuanPerHour)} 元/时`,
     `  平台定时关机：${summary.timedShutdownAt}`,
     `  失败策略：${formatOnDeployFailure(profile.onDeployFailure)}`,

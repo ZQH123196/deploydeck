@@ -1,5 +1,10 @@
 import type { ConsoleInstanceSnapshot } from '../../domain/instance.js'
-import { ConfigError, InstanceFormMismatchError, PowerOnFailedError } from '../../errors.js'
+import {
+  ConfigError,
+  InstanceFormMismatchError,
+  PowerOffFailedError,
+  PowerOnFailedError,
+} from '../../errors.js'
 import type { PowerOnMode, PowerPort } from '../../console/ports.js'
 import type { Provider } from '../../providers/provider.js'
 import { writeJson, writeLine } from '../output.js'
@@ -19,6 +24,8 @@ import { matchesTargetPowerOnMode } from './power.js'
  *    形态换了单价自然不同，把这次差价判成「单价漂移」就会误删实例。
  * 3. 任一步失败时停下并保留实例，不销毁。失败后不重试、不回滚形态，
  *    实例停在那一刻的状态，由人决定下一步。
+ * 4. 失败码按失败环节给，不按命令名给：关机后状态不对是 `POWER_OFF_FAILED`，
+ *    不是 `CONFIG_INVALID`。配置错是「让人去改配置文件」，这条是运行期事实不符。
  *
  * 复验判据：`noGpuMode` 为 true 是无卡，false 是有卡。目标与复验不一致即报错，
  * 错误消息里写实测形态。null 同样算不一致。
@@ -75,8 +82,11 @@ export async function switchInstanceForm(
   // 读不到说明实例已经不在列表里，实例 ID 这个前提失效，切换必须在这里停下。
   const stopped = await requireInstance(ports, options.instanceId)
   if (stopped.status !== 'stopped') {
-    throw new ConfigError(
-      `实例 ${options.instanceId} 关机后状态是「${stopped.statusRaw}」，不是已关机，切换中止。`,
+    // 运行期事实不符，不是配置错：`ConfigError` 会把人引向改配置文件。
+    throw new PowerOffFailedError(
+      options.instanceId,
+      `关机后状态是「${stopped.statusRaw}」，不是已关机，切换中止。`,
+      stopped.statusRaw,
     )
   }
 

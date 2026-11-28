@@ -21,11 +21,9 @@ export type DeploydeckErrorCode =
   | 'HOST_KEY_CHANGED'
   | 'PLAN_INVALID'
   | 'BUDGET_EXCEEDED'
-  | 'PINNED_COMMIT_REQUIRED'
   | 'INSTANCE_NAME_AMBIGUOUS'
   | 'CLONE_SOURCE_MISSING'
   | 'BALANCE_INSUFFICIENT'
-  | 'SCRIPT_FAILED'
   | 'HEALTH_CHECK_FAILED'
   | 'SSH_AUTH_FAILED'
   | 'SSH_CONNECT_FAILED'
@@ -45,26 +43,13 @@ export type DeploydeckErrorCode =
   | 'INTERACTIVE_TERMINAL_REQUIRED'
   | 'SHELL_FAILED'
   | 'POWER_ON_FAILED'
+  | 'POWER_OFF_FAILED'
   | 'INSTANCE_FORM_MISMATCH'
   | 'TUNNEL_LOCAL_PORT_IN_USE'
 
 export const EXIT_OK: ExitCode = 0
 export const EXIT_BUSINESS_FAILURE: ExitCode = 1
 export const EXIT_HUMAN_REQUIRED: ExitCode = 2
-
-/**
- * 远端脚本自检失败：声明的环境变量根本没送到远端进程。
- *
- * 取值 78 来自 sysexits 的 `EX_CONFIG`。它**不是 deploydeck 进程的退出码**：
- * deploydeck 自身只有 0/1/2 三种（`ExitCode`），它出现在 SSH 步骤的远端退出码里。
- *
- * 判据：必须是独立取值。脚本在缺变量时可能自己退出 1，混在一起时读日志的人
- * 分不清「脚本失败」与「环境根本没送到」。出现 78 时不要去读脚本逻辑，先查本机环境变量。
- *
- * 产出方是 `src/engine/steps.ts` 的命令前缀（SSH 的 `env` 请求可能被服务端静默丢弃，
- * 数据面拿不到失败信号，只能让命令自己判）。
- */
-export const REMOTE_ENV_NOT_INJECTED_EXIT_CODE = 78
 
 /** 所有 deploydeck 抛出错误的基类。携带稳定错误码与退出码。 */
 export class DeploydeckError extends Error {
@@ -225,24 +210,6 @@ export class BudgetExceededError extends DeploydeckError {
 }
 
 /**
- * 部署配置要求锁定 commit，但这次执行没有给出 commit。
- *
- * 它属于配置与请求的冲突，不是环境问题：补上 commit 就能继续，所以退出码是业务失败。
- * 判据见 docs/plan-and-budget.md 第 3.2 节。
- */
-export class PinnedCommitRequiredError extends DeploydeckError {
-  constructor(profileId: string) {
-    super(
-      'PINNED_COMMIT_REQUIRED',
-      `部署配置 ${profileId} 要求锁定 commit（requirePinnedCommit=true），` +
-        '但本次执行没有给出 commit sha。未做任何动作。',
-      EXIT_BUSINESS_FAILURE,
-    )
-    this.name = 'PinnedCommitRequiredError'
-  }
-}
-
-/**
  * 列表里有多台同名实例，无法判定该用哪一台。
  *
  * 名字不唯一时猜错就是部署到别人的机器上，所以不猜：列出 ID 让人先清理。
@@ -282,14 +249,6 @@ export class BalanceInsufficientError extends DeploydeckError {
   constructor(message: string) {
     super('BALANCE_INSUFFICIENT', message, EXIT_BUSINESS_FAILURE)
     this.name = 'BalanceInsufficientError'
-  }
-}
-
-/** 部署脚本或启动脚本失败。 */
-export class ScriptFailedError extends DeploydeckError {
-  constructor(message: string) {
-    super('SCRIPT_FAILED', message, EXIT_BUSINESS_FAILURE)
-    this.name = 'ScriptFailedError'
   }
 }
 
@@ -566,5 +525,31 @@ export class TunnelLocalPortInUseError extends DeploydeckError {
       EXIT_BUSINESS_FAILURE,
     )
     this.name = 'TunnelLocalPortInUseError'
+  }
+}
+
+/**
+ * 关机失败：动作返回后实例状态不是已关机。
+ *
+ * 判据（与 `PowerOnFailedError` 分开）：两条路径的结论不同，读日志的人必须一眼分开。
+ * 开机失败沿用 `POWER_ON_FAILED`，措辞是「开机失败」；关机失败用 `POWER_OFF_FAILED`，
+ * 措辞是「关机失败」。共用一个码时，「关机后仍是运行中」会被读成「开机失败」。
+ *
+ * 与 `PowerOffTimeoutError` 的区别：那条是等关机超时，这条是动作返回后的终态不符。
+ * 退出码 1：实例可能仍在计费，但重试一次关机就能继续，不需要人排查配置。
+ */
+export class PowerOffFailedError extends DeploydeckError {
+  constructor(
+    instanceId: string,
+    detail: string,
+    lastStatusRaw: string,
+  ) {
+    super(
+      'POWER_OFF_FAILED',
+      `实例 ${instanceId} 关机失败（最后状态：${lastStatusRaw}）：${detail}` +
+        '实例可能仍在计费，请到控制台确认，或重试一次关机。未做任何降级动作。',
+      EXIT_BUSINESS_FAILURE,
+    )
+    this.name = 'PowerOffFailedError'
   }
 }
