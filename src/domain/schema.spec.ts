@@ -32,22 +32,20 @@ function makeProfile(): Record<string, unknown> {
 function makeProject(): Record<string, unknown> {
   return {
     id: 'trans-app',
-    workdir: '/root/trans_app',
-    healthCheck: 'curl -fsS http://127.0.0.1:6006/health',
   }
 }
 
 function makeStepResult(): Record<string, unknown> {
   return {
-    stepId: 'health-check',
-    kind: 'ssh',
-    command: 'cd "/root/trans_app" && curl -fsS http://127.0.0.1:6006/health',
+    stepId: 'timed-shutdown',
+    kind: 'console',
+    command: 'setTimedShutdown(af9c49bd44-8ee624d7, 2026-01-01T00:55)',
     exitCode: 0,
     startedAt: '2026-01-01T00:00:00+08:00',
     finishedAt: '2026-01-01T00:00:01+08:00',
     stdoutTail: '',
     stderrTail: '',
-    logPath: '/state/runs/run-1/logs/health-check.log',
+    logPath: '/state/runs/run-1/logs/timed-shutdown.log',
   }
 }
 
@@ -104,7 +102,7 @@ describe('ProjectSchema', () => {
     expect(ProjectSchema.safeParse(makeProject()).success).toBe(true)
   })
 
-  it.each([['id'], ['workdir'], ['healthCheck']])('缺 %s 时拒绝', (field) => {
+  it.each([['id']])('缺 %s 时拒绝', (field) => {
     const partial = makeProject()
     delete partial[field]
 
@@ -124,12 +122,20 @@ describe('ProjectSchema', () => {
     expect(parsed.data).not.toHaveProperty(field)
   })
 
-  it('解析结果只有 id、workdir 与 healthCheck', () => {
-    expect(Object.keys(ProjectSchema.parse(makeProject())).sort()).toEqual([
-      'healthCheck',
-      'id',
-      'workdir',
-    ])
+  it.each([
+    ['workdir', '/root/trans_app'],
+    ['healthCheck', 'curl -fsS http://127.0.0.1:6006/health'],
+  ])('已删除的字段 %s 不进解析结果', (field, value) => {
+    // 判据：引擎不在实例里执行使用者的命令，所以清单不承载目录与命令。
+    // schema 是 strip 型，只能断言结果里没有它；有人加回 schema 时这条会变红。
+    const parsed = ProjectSchema.safeParse({ ...makeProject(), [field]: value })
+
+    expect(parsed.success).toBe(true)
+    expect(parsed.data).not.toHaveProperty(field)
+  })
+
+  it('解析结果只有 id', () => {
+    expect(Object.keys(ProjectSchema.parse(makeProject())).sort()).toEqual(['id'])
   })
 })
 

@@ -20,6 +20,7 @@ import { DEFAULT_TERM } from '../ssh/shell-channel.js'
 import type { PowerOnMode } from '../console/ports.js'
 import type { PowerAction } from './commands/power.js'
 import { runPowerCommand } from './commands/power.js'
+import { runProbeCommand } from './commands/probe.js'
 import { runSwitchCommand } from './commands/switch.js'
 import { runCredsCommand } from './commands/creds.js'
 import { runTunnel } from './commands/tunnel.js'
@@ -288,6 +289,21 @@ function registerSwitchCommand(program: Command, deps: CliDependencies): void {
 }
 
 /**
+ * `probe`：确认一台实例能不能连上并执行一条命令。
+ *
+ * action 只做参数解析与调用命令函数。会话装配、证据目录都在 `dependencies.ts`。
+ */
+function registerProbeCommand(program: Command, deps: CliDependencies): void {
+  withJsonOption(
+    program
+      .command('probe <instanceId>')
+      .description('确认实例能不能连上并执行一条命令。不建计划、不改实例状态'),
+  ).action(async (instanceId: string, _options: unknown, command: Command) => {
+    await runProbeCommand(contextOf(deps, command), { instanceId })
+  })
+}
+
+/**
  * `creds`：读实例的 SSH 登录信息。密码只出现在 stdout。
  *
  * `--json` 无额外限制；人读模式要求 stdout 是终端，否则拒绝（退出码 2），
@@ -384,6 +400,7 @@ export function buildProgram(deps: CliDependencies): Command {
   registerShellCommand(program, deps)
   registerPowerCommand(program, deps)
   registerSwitchCommand(program, deps)
+  registerProbeCommand(program, deps)
   registerCredsCommand(program, deps)
   registerTunnelCommand(program, deps)
   registerLoginCommand(program, deps)

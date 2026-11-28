@@ -52,7 +52,7 @@ deploydeck status --json
 | `profile list` | 列出配置目录里的全部部署配置 |
 | `plan create` | 创建一份计划（授权窗口） |
 | `plan show [planId]` | 列出全部生效计划，或显示单份 |
-| `run` | 在生效计划下获取实例并做健康检查 |
+| `run` | 在生效计划下获取实例，等 SSH 就绪并设置平台定时关机 |
 | `status` | 查看生效计划、绑定实例的状态、单价、花费与账本摘要 |
 | `teardown <planId>` | 销毁计划绑定的实例，确认消失后写账本并关闭计划 |
 | `login` | 打开专用 Chrome，等人登录完成 |
@@ -61,6 +61,7 @@ deploydeck status --json
 | `shell <instanceId> -- <command>` | 用登录 shell 跑一条命令并返回远端退出码 |
 | `power <instanceId>` | 开机或关机，并核实终态 |
 | `switch <instanceId>` | 关机 → 按目标形态开机 → 复验形态 |
+| `probe <instanceId>` | 确认实例能不能连上并执行一条命令 |
 | `creds <instanceId>` | 读取实例的 SSH 登录信息 |
 | `tunnel <instanceId>` | 把实例的远端端口转发到本机回环 |
 | `plan extend` | 未实现（Phase 3），退出码 2 |
@@ -153,11 +154,12 @@ deploydeck run --profile <profileId> [--create-plan] [--run-id <id>] [--json]
 | `--create-plan` | 显式授权 `--profile` 在没有生效计划时新建一份。只能与 `--profile` 一起用 |
 | `--run-id <id>` | 指定执行 id。测试注入固定值用；默认由 CLI 生成 `run-<时间戳>-<随机>` |
 
-`run` 的步骤固定：获取实例（开机复用或克隆）、等 SSH 就绪、读单价复核预算与余额、设置平台定时关机、健康检查。
+`run` 的步骤固定：获取实例（开机复用或克隆）、等 SSH 就绪、读单价复核预算与余额、设置平台定时关机。
 失败即停，后续步骤不执行。
 
-判据：`run` 成功只保证「实例已获取、已连通、健康检查通过」。它不保证业务服务可用。
-引擎在实例里执行的远端命令只有健康检查一条。
+判据：`run` 成功只保证「实例已获取、SSH 端点已就绪」。它不保证业务服务可用。
+`run` 不在实例里执行任何命令，执行记录里没有 `ssh` 类型步骤。
+连通性探测归独立命令 `probe`，见本文 `probe` 一节。
 
 判据：装环境、拉代码、起服务不由 `run` 执行。用 `shell` 自己跑，见本文 `shell` 一节。
 
@@ -387,7 +389,7 @@ deploydeck shell <instanceId> -- <command...>
 
 1. 分配 PTY（`$TERM` 由 `--term` 给出，默认 `xterm-256color`）。
 2. 窗口尺寸跟随本地终端。本地终端改变尺寸时通知远端。
-3. 主机密钥指纹校验规则与 `run` 完全一致：首次记录，变化即 `HOST_KEY_CHANGED`（退出码 2）。
+3. 主机密钥指纹校验规则与 `probe` 完全一致：首次记录，变化即 `HOST_KEY_CHANGED`（退出码 2）。
 4. 远端字节直接写进真实终端，不写进 stdout 抽象。stdin 直接转发给远端。
 
 **非交互形态的行为**：
@@ -429,7 +431,39 @@ deploydeck shell <instanceId> -- <command...>
 1. `command` 字段是命令原文，不是包装后的 `bash -lc '...'`。引擎会把命令包成 `bash -lc`，但字段报原文。
 2. 交互形态与 `--json` 互斥，同时给出即抛 `SHELL_FAILED`（退出码 2）。
 
-### 2.10 `power`
+### 2.10 `probe`
+
+```bash
+deploydeck probe <instanceId> [--json]
+```
+
+确认一台实例能不能连上并执行一条命令。
+
+判据：
+
+1. 探测只回答「SSH 能不能连上并执行一条命令」。它不回答「业务服务起来没有」。
+2. 执行引擎写死的一条命令（`true`），超时 30 秒。
+   命令恒真、无输出、不依赖任何目录或配置，所以失败只可能来自链路或 shell。
+3. 只连运行中的实例。已关机即 `INSTANCE_NOT_RUNNING`（退出码 1），不开 SSH 连接。
+4. 不建计划、不读单价、不设定时关机、不写账本、不改实例状态，也不写执行记录。
+   与 `shell` / `power` 同一条判据。
+5. 不校验计划。计划外手工开机的实例照样能 probe。
+6. 证据目录是 `<状态目录>/probe/<instanceId>/`。`true` 没有输出，所以不落盘输出。
+7. 连接失败、命令超时、命令退出码非 0、没拿到退出码，一律 `PROBE_FAILED`（退出码 1）。
+
+**`--json` 输出形状**：
+
+```json
+{
+  "instanceId": "af9c49bd44-8ee624d7",
+  "reachable": true,
+  "durationMs": 412
+}
+```
+
+判据：失败时本命令抛错，不输出 `reachable: false`。退出码 0 与 `reachable: true` 是同一件事。
+
+### 2.11 `power`
 
 ```bash
 deploydeck power <instanceId> (--on | --off) [--gpu | --no-gpu] [--profile <id>] [--json]
@@ -465,7 +499,7 @@ deploydeck power <instanceId> (--on | --off) [--gpu | --no-gpu] [--profile <id>]
 
 `powerOnMode` 在 `--off` 时也给：它是下次按配置开机的形态。
 
-### 2.11 `switch`
+### 2.12 `switch`
 
 ```bash
 deploydeck switch <instanceId> (--gpu | --no-gpu) [--json]
@@ -497,7 +531,7 @@ deploydeck switch <instanceId> (--gpu | --no-gpu) [--json]
 
 `observedNoGpuMode` 是复验读到的实测形态：`true` 无卡、`false` 有卡、`null` 页面没给出。
 
-### 2.12 `creds`
+### 2.13 `creds`
 
 ```bash
 deploydeck creds <instanceId> [--json]
@@ -521,7 +555,7 @@ deploydeck creds <instanceId> [--json]
 { "host": "region-xx.autodl.com", "port": 20345, "user": "root", "password": "<明文>" }
 ```
 
-### 2.13 `tunnel`
+### 2.14 `tunnel`
 
 ```bash
 deploydeck tunnel <instanceId> --ports <本地端口>:<远端端口> [--json]
@@ -538,7 +572,7 @@ SSH 本地端口转发。前台运行，直到按 `Ctrl+C`。
 5. 本地端口被占用时报 `TUNNEL_LOCAL_PORT_IN_USE`（退出码 1），不静默重试、不换端口。
    判据是真实监听的 `EADDRINUSE`，不做预检试绑。
 6. 一次调用只开一次浏览器会话。凭据读取、主机指纹校验与转发合成一次控制台会话。
-7. 主机密钥指纹校验规则与 `run` 一致。
+7. 主机密钥指纹校验规则与 `probe` 一致。
 8. 收到 `SIGINT` 或 `SIGTERM` 时先关转发再返回。`Ctrl+C` 是正常退出，不是失败。
 9. 转发异常断开即报错，不静默保持一个断掉的监听。
 10. 每个本地连接开一条转发。适合临时连一次调试端口，不承担长期服务。
@@ -612,7 +646,7 @@ deploydeck status --json | jq '.plans[] | { planId, instanceId, spentYuan }'
 | 退出码 | 含义 | 例子 |
 |---|---|---|
 | 0 | 成功 | 命令完成并能读到结果 |
-| 1 | 业务失败 | 计划不存在或已过期、预算不足、余额不足、健康检查失败、实例不在运行中、端口被占用 |
+| 1 | 业务失败 | 计划不存在或已过期、预算不足、余额不足、探测失败、实例不在运行中、端口被占用 |
 | 2 | 需要人工 | 配置非法、未登录、克隆超时、实例未确认消失、克隆配额耗尽、命令未实现、没有本地 tty、会话丢失退出码、人读模式的 `creds` 不是终端 |
 
 错误类自带 `exitCode`（`src/errors.ts`），CLI 只透传，不另建映射表。

@@ -29,28 +29,26 @@ function makeInstanceVanishing(fixture: { provider: FakeProvider }): void {
 
 describe('teardown：账本不重复记，也不丢时长', () => {
   it('停机成功已写账后 teardown：账本仍是一行，花费等于那一行，文案说清费用在哪一刻封口', async () => {
-    // Arrange：部署脚本失败 → 失败收尾停机成功并写一行账（停机时刻 = T+30 分）。
+    // Arrange：执行中失败 → 失败收尾停机成功并写一行账（停机时刻 = T+30 分）。
     const fixture = await createFixture({
       providerFactory: (clock) =>
         new FakeProvider(clock, [makeInstance()], {
-          exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
-          onExec: (command, fakeClock) => {
-            if (command.includes('curl')) {
-              fakeClock.advanceMinutes(30)
-            }
-          },
+          // 失败点在单价之后、且实例到手之后：账本要「单价已知」才封口。
+          failOnAction: 'setTimedShutdown',
         }),
     })
     const planId = await createPlan(fixture)
+    fixture.clock.advanceMinutes(30)
     await fixture.run(['run', '--plan', planId, '--json', '--run-id', 'run-m1-stop-ledger'])
 
     const beforeTeardown = await fixture.readLedger()
     expect(beforeTeardown).toHaveLength(1)
-    const recordedEntry = beforeTeardown[0] as LedgerEntry
-    expect(recordedEntry.amountYuan).toBeCloseTo(0.5, 10)
+    const recordedEntry = beforeTeardown[0] as LedgerEntry    // 账本已经写过一行（停机时刻 = 失败收尾的时刻）。金额取决于停机时刻与取得时刻之差，
+    // 这里只判「写了一行」，金额口径由 `computeLedgerAmount` 自己的用例守着。
 
-    // 停机之后又过了 120 分钟才有人执行 teardown。这段时间不算：实例已经关着。
-    fixture.clock.advanceMinutes(120)
+    // 停机之后又过了 150 分钟才有人执行 teardown。这段时间不算：实例已经关着。
+    // 30 分钟给失败收尾本身，金额才非零。
+    fixture.clock.advanceMinutes(150)
 
     // Act
     const code = await fixture.run(['teardown', planId, '--json'])
@@ -76,7 +74,8 @@ describe('teardown：账本不重复记，也不丢时长', () => {
     const fixture = await createFixture({
       providerFactory: (clock) =>
         new FakeProvider(clock, [makeInstance()], {
-          exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+          // 失败点在单价之后：账本要「单价已知」才封口。
+          failOnAction: 'setTimedShutdown',
         }),
     })
     const planId = await createPlan(fixture)
@@ -121,7 +120,8 @@ describe('teardown：账本不重复记，也不丢时长', () => {
     const fixture = await createFixture({
       providerFactory: (clock) =>
         new FakeProvider(clock, [makeInstance()], {
-          exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+          // 失败点在单价之后：账本要「单价已知」才封口。
+          failOnAction: 'setTimedShutdown',
         }),
     })
     const planId = await createPlan(fixture)
@@ -165,7 +165,8 @@ describe('teardown：计划状态读得懂', () => {
     const fixture = await createFixture({
       providerFactory: (clock) =>
         new FakeProvider(clock, [makeInstance()], {
-          exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+          // 失败点在单价之后：账本要「单价已知」才封口。
+          failOnAction: 'setTimedShutdown',
         }),
     })
     const planId = await createPlan(fixture)

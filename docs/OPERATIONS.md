@@ -14,7 +14,7 @@ deploydeck 是一个部署工具箱，不是全自动部署器。它只负责两
 它把一次云端实例获取收敛成一条链路：
 
 ```text
-申请计划 → 获取实例 → 等 SSH 就绪 → 健康检查 → 结束
+申请计划 → 获取实例 → 等 SSH 就绪 → 设置平台定时关机 → 结束
 ```
 
 三件事由它保证：
@@ -25,7 +25,8 @@ deploydeck 是一个部署工具箱，不是全自动部署器。它只负责两
 
 装环境、拉代码、起服务不在链路里。它们由使用者自己在实例上执行，见 §2.4。
 
-判据：`run` 成功只保证「实例已获取、已连通、健康检查通过」。它不保证业务服务可用。
+判据：`run` 成功只保证「实例已获取、SSH 已就绪（`ssh-ready` 步骤通过）」。它不保证业务服务可用。
+引擎不在实例里执行任何使用者的命令。连通性探测归独立命令 `probe`，见 §5.9。
 
 deploydeck 不构建镜像、不管本地部署、不替代 AutoDL 控制台。
 
@@ -34,7 +35,7 @@ deploydeck 不构建镜像、不管本地部署、不替代 AutoDL 控制台。
 | 名词 | 一句话含义 |
 |---|---|
 | 部署配置（Profile） | 一个场景怎么取实例：实例名、算力规格优先级、开机形态、时长、预算、失败策略 |
-| 项目清单（Project） | 实例内目录与健康检查命令 |
+| 项目清单（Project） | 项目标识。它不承载任何要引擎执行的文本 |
 | 计划（Plan） | 一次授权窗口：能用多久、最多花多少 |
 | 执行（Run） | 计划下的一次实例获取动作，含逐步日志 |
 | 实例 | AutoDL 控制台里的一台容器实例 |
@@ -69,23 +70,18 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
 | 字段 | 必填 | 含义 |
 |---|---|---|
 | `id` | 是 | 项目标识。文件名去掉 `.jsonc` 必须等于它 |
-| `workdir` | 是 | 实例内的项目目录，例如 `/root/my-project`。健康检查命令在它里面执行 |
-| `healthCheck` | 是 | 健康检查命令。退出码 0 即通过 |
 
 ```jsonc
 {
-  "id": "my-project",
-  "workdir": "/root/my-project",
-  "healthCheck": "curl -fsS http://127.0.0.1:6006/health"
+  "id": "my-project"
 }
 ```
 
 判据：
 
-1. `workdir` 必须是绝对路径，且不能以 `/` 结尾。含双引号或换行的取值在生成步骤时即报错。
-2. 引擎把健康检查拼成 `cd "<workdir>" && <healthCheck>` 执行。引号里的 `~` 不展开，所以不用相对路径。
-3. `healthCheck` 不能为空。它必须能在实例内跑通。
-4. 服务没有健康端点时，改用该服务确实可用的探活命令。否则 `run` 会以健康检查失败告终。
+1. 项目清单只有 `id`。它不承载实例内目录，也不承载任何命令：引擎执行的唯一远端命令由引擎写死。
+2. `workdir` 与 `healthCheck` 已删除。写进去不报错，但引擎不读它们。
+3. 服务是否起来、怎么查，由使用者自己判断：用 `shell <instanceId> -- <命令>` 跑自己的检查。
 
 ### 2.3 部署配置 `profiles/<id>.jsonc`
 
@@ -167,8 +163,8 @@ deploydeck 不认识任何具体项目。接入一个项目只需在配置目录
 
 ### 2.4 哪些事引擎不做
 
-`run` 只做三件事：获取实例（开机复用或克隆）、等 SSH 就绪、健康检查。
-它不碰实例里的代码与环境。
+`run` 只做三件事：获取实例（开机复用或克隆）、等 SSH 就绪、设置平台定时关机。
+它不碰实例里的代码与环境，也不在实例里执行任何命令。
 
 判据：装环境、拉代码、起服务都不由引擎执行。引擎里没有对应的字段，也没有对应的步骤。
 
@@ -212,8 +208,8 @@ deploydeck shell <instanceId> -- 'cd /root/my-project && npm ci'
 ### 2.5 接入检查清单
 
 1. 配置目录里放好 `projects/<id>.jsonc` 与 `profiles/<id>.jsonc`。
-2. 项目清单的 `workdir` 在被部署的实例里真实存在，取值是绝对路径、不以 `/` 结尾。
-3. 项目清单的 `healthCheck` 已经在这台实例的 `workdir` 里手工跑通过，退出码 0。
+2. 项目清单只有一个 `id`，取值与 `profiles/<id>.jsonc` 的 `project` 字段一致。
+3. 服务是否起来、怎么查，已经写好在实例上能跑通的形态，接入时经 `shell --` 执行。
 4. 控制台里有一台**已关机**实例，名字或 ID 等于 `cloneSourceInstanceName`。它是克隆模板。
 5. 环境准备与启动命令已经写好在实例上能跑通的形态，接入时经 `shell --` 执行。
 6. 执行 `deploydeck profile list`，确认配置能被解析。
@@ -343,9 +339,8 @@ flowchart TB
   F --> G[读单价, 复核预算与余额]
   G -- 超限 --> Z2[停机保留实例, 退出码 1]
   G -- 通过 --> H[设置平台定时关机]
-  H --> L{健康检查}
-  L -- 通过 --> OK[成功]
-  L -- 失败 --> M{停机}
+  H --> OK[成功]
+  H -- 任一步失败, 且实例已到手 --> M{停机}
   M -- 成功 --> N[run 记 stray, 计划转 stopped-pending-settlement]
   M -- 失败 --> O[run 记 stray, 计划转 escalated]
 ```
@@ -358,8 +353,8 @@ flowchart TB
 4. 单价只从控制台读取。与上次观测偏差超过 20% 时停下，不按未知价格继续。
 5. 预算或余额不足时**立即停机并保留实例**，退出码 1。不做「先跑完再说」，也不销毁实例。
 6. 成功时实例**继续运行**。`run` 不等同于「部署完就关机」。
-7. 健康检查是引擎唯一在实例里执行的远端命令。它证明实例已连通，不证明业务服务可用。
-8. 健康检查超时 120 秒，在项目清单的 `workdir` 里执行。
+7. `run` 不在实例里执行任何命令。它证明实例已到手、SSH 端点已就绪，不证明业务服务可用。
+8. 要确认「这台机器能不能连上并执行一条命令」，用 `probe <instanceId>`（§5.9）。
 
 `--json` 输出含 `runId`、`mode`（`reuse` 或 `clone`）、`instanceId`、逐步结果与日志路径。
 
@@ -416,6 +411,34 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard
 不做第三层兜底：`guard` 不扫描「运行中但没有生效计划」的实例。
 这类实例会一直计费，必须人工处理。判据与后果见 `docs/plan-and-budget.md` 第 5.2 节。
 处理入口是 `deploydeck power <instanceId> --off`。
+
+### 5.9 探测这台机器能不能连上
+
+```bash
+deploydeck probe <instanceId>
+```
+
+它只回答一个问题：这台实例能不能连上并执行一条命令。
+
+判据：
+
+1. 执行一条引擎写死的命令（`true`），超时 30 秒。它不读任何配置，也不执行使用者的任何命令。
+2. 只连**运行中**的实例。已关机时报 `INSTANCE_NOT_RUNNING`，退出码 1，不开 SSH 连接。
+3. 不建计划、不读单价、不设定时关机、不写账本、不改实例状态。与 `shell` 同一条判据。
+4. 不校验计划。计划外手工开机的实例照样能 probe。
+5. 连接失败、超时、命令退出码非 0 一律报 `PROBE_FAILED`，退出码 1。
+6. 证据目录是 `<状态目录>/probe/<instanceId>/`。`true` 没有输出，所以不落盘输出。
+7. `--json` 输出 `instanceId`、`reachable`（恒为 `true`，失败时抛错）、`durationMs`。
+
+它不回答「服务起来没有」。服务是否就绪用使用者自己的判据确认，见 §6。
+
+典型用法：
+
+```bash
+deploydeck run --plan <planId>
+deploydeck probe <instanceId>
+deploydeck shell <instanceId> -- 'cd /root/my-project && npm ci'
+```
 
 ## 6. 进容器
 
@@ -490,7 +513,7 @@ deploydeck shell <instanceId> -- '<命令>'
 1. 密码取自控制台 SSH 登录列，只用一次。不落盘、不进日志、不进错误消息。
 2. 主机密钥指纹照样校验。首次记录，变化即 `HOST_KEY_CHANGED`，退出码 2。
 3. 交互形态的输出直接进你的屏幕，不经 deploydeck 的 stdout 抽象，因此不进 `--json`。
-4. shell 命令的包法与主机密钥校验规则与 `run` 的健康检查步骤完全一致。
+4. shell 命令的包法与主机密钥校验规则与 `probe` 完全一致：两者都走同一条控制台会话与同一套凭据。
 
 ## 7. 命令速查
 
@@ -499,7 +522,8 @@ deploydeck shell <instanceId> -- '<命令>'
 | `profile list` | 列出全部部署配置 | 否 |
 | `plan create --profile <id>` | 创建计划（授权窗口） | 否 |
 | `plan show [planId] [--balance]` | 查看计划。`--balance` 读账户余额 | 带 `--balance` 时需要 |
-| `run --plan <id>` / `run --profile <id>` | 执行：取实例、等 SSH 就绪、健康检查 | 是 |
+| `run --plan <id>` / `run --profile <id>` | 执行：取实例、等 SSH 就绪、设置平台定时关机 | 是 |
+| `probe <instanceId>` | 确认实例能不能连上并执行一条命令 | 是 |
 | `status` | 查看计划、实例、花费、账本 | 有生效计划时需要 |
 | `teardown <planId>` | 销毁实例、记账、关闭计划 | 是 |
 | `login` | 打开专用 Chrome 等人登录 | 是 |
@@ -551,7 +575,7 @@ deploydeck status --json
 | 退出码 | 含义 | 集成方该做什么 |
 |---|---|---|
 | 0 | 成功 | 读 stdout 的 JSON，继续下一步 |
-| 1 | 业务失败 | 修正输入后重试。例如计划无效、预算不足、余额不足、健康检查失败、实例不在运行中 |
+| 1 | 业务失败 | 修正输入后重试。例如计划无效、预算不足、余额不足、探测失败、实例不在运行中 |
 | 2 | 需要人工 | **停止自动重试**，转人工。例如未登录、配置非法、克隆超时、实例未确认消失、配额耗尽、命令未实现、人读模式的 `creds` 不是终端 |
 
 判据：退出码 1 可由程序自行处理；退出码 2 一律交给人。把退出码 2 当退出码 1 重试会放大问题，
@@ -582,7 +606,7 @@ deploydeck status --json
 | `PLAN_INVALID` | 1 | 没有生效计划，或计划已过期 |
 | `BUDGET_EXCEEDED` | 1 | 超出预算上限 |
 | `BALANCE_INSUFFICIENT` | 1 | 账户余额不足 |
-| `HEALTH_CHECK_FAILED` | 1 | 健康检查未通过：退出码非 0，或超过 120 秒被终止 |
+| `PROBE_FAILED` | 1 | 探测未通过：连不上实例、命令超时（30 秒）、或探测命令退出码非 0 |
 | `LOGIN_REQUIRED` | 2 | 控制台未登录 |
 | `CONFIG_INVALID` | 2 | 配置目录里的文件非法，或命令行参数非法 |
 | `CLONE_QUOTA_EXHAUSTED` | 2 | 当日克隆次数用尽 |
@@ -685,10 +709,9 @@ deploydeck teardown "$plan_id" --json
 | `budget-recheck` | 预算复核 | 写缓存后 |
 | `balance-recheck` | 余额复核 | 预算复核后 |
 | `timed-shutdown` | 设置平台定时关机 | 余额复核通过后 |
-| `health-check` | 健康检查 | 设置定时关机后 |
 | `power-off-on-failure` | 失败收尾的停机保留 | 实例到手后任一步失败时 |
 
-判据：`health-check` 是唯一的 `ssh` 类型步骤。它是引擎在实例里执行的唯一远端命令。
+判据：执行记录里没有 `ssh` 类型步骤。`run` 不在实例里执行任何命令；连通性探测只在 `probe` 里做，不进执行记录。
 
 ## 10. 出问题时
 

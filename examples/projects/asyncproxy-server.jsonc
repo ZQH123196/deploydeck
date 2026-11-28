@@ -1,16 +1,6 @@
 // 项目清单：asyncProxyServer。
 // 它随被部署的项目走，不进 deploydeck 仓库。
-// 步骤不写在这里：引擎按本文件的 healthCheck 生成内置步骤。
+// 这里只有项目标识：引擎不在实例里执行任何使用者的命令。
 {
-  "id": "asyncproxy-server",
-
-  // 实例内的项目目录。与生产部署保持一致。
-  "workdir": "/root/asyncProxyServer",
-
-  // 部署后的健康检查。退出码 0 即通过。
-  // 端口取 asyncProxyServer 的 .env.example 默认值 PORT=6006（容器内监听 0.0.0.0:6006）。
-  // 注意：该服务的 FastAPI 当前只注册了 /v1/audio/async/* 与 /download 路由，
-  // 仓库里没有 /health。首次真机运行前必须人工确认线上版本是否提供 /health；
-  // 若没有，把这里改成该服务实际可用的探活命令，否则健康检查会以 404 判失败。
-  "healthCheck": "curl -fsS http://127.0.0.1:6006/health"
+  "id": "asyncproxy-server"
 }

@@ -12,7 +12,6 @@ import {
   CloneQuotaExhaustedError,
   ConfigError,
   DeploydeckError,
-  HealthCheckFailedError,
   HumanRequiredError,
   InstanceNotFoundError,
   isDeploydeckErrorWithCode,
@@ -36,7 +35,6 @@ import {
   resolvePriceSlot,
 } from '../plan/price-cache.js'
 import type { Provider } from '../providers/provider.js'
-import type { SshExecResult } from '../ssh/ports.js'
 import type { LedgerEntry } from '../state/ledger.js'
 import type { LedgerStore } from '../state/ledger-store.js'
 import type { Clock } from '../util/clock.js'
@@ -51,16 +49,15 @@ import {
 import { decideAcquisition } from './acquisition.js'
 import type { RunLayout, RunStore } from './run-store.js'
 import { stepLogFilePath } from './run-store.js'
-import { planDeploySteps, type PlannedStep } from './steps.js'
 
 /**
  * 执行引擎。
  *
- * 顺序判据见 docs/specs/deploydeck-phase2.md 第 4 节与第 10 节：
- * 计划校验 → 取实例（开机复用或克隆）→ 等 SSH 就绪 → 读单价复核预算 → 设定时关机
- * → 健康检查 → 收尾。任一步失败即停，后续步骤不执行。
+ * 顺序判据：计划校验 → 取实例（开机复用或克隆）→ 等 SSH 就绪 → 读单价复核预算
+ * → 设定时关机 → 收尾。任一步失败即停，后续步骤不执行。
  *
- * `run` 成功只保证「实例已获取、已连通、健康检查通过」。引擎不执行使用者的任何命令。
+ * `run` 的产出只有一件事：一台能 SSH 的实例。它不判断业务服务是否可用，
+ * 也不执行任何远端命令。连通性探测归 `probe` 命令，见 `PROBE_COMMAND`。
  *
  * 全部外部行为都经端口注入：控制台动作、SSH、状态存储、时钟、日志。
  * 本文件不出现浏览器、CDP、ssh2 的具体实现。
@@ -94,7 +91,7 @@ export const BALANCE_WARN_BELOW_YUAN = 0
 /**
  * 引擎自己的步骤 id（控制台动作与内置判定）。
  *
- * 健康检查的 id 定义在 `steps.ts`：那一步是 `steps.ts` 生成的，这里只留引擎自己的动作。
+ * 判据：`run` 不产生 `ssh` 类型步骤，所以这里没有远端命令的 id。
  */
 const ENGINE_STEP_ID = {
   instanceSelect: 'instance-select',
@@ -284,8 +281,7 @@ async function runOnce(
    */
   function instanceForensicsHint(): string {
     return (
-      `进容器查现场：项目目录 ${project.workdir}；` +
-      'SSH 登录方式：控制台实例列表的 SSH 登录列给出主机与端口，用 root 加密码登录。' +
+      '进容器查现场：控制台实例列表的 SSH 登录列给出主机与端口，用 root 加密码登录。' +
       `本机现场：${layout.logDirectory}。`
     )
   }
@@ -401,92 +397,6 @@ async function runOnce(
       planId: currentPlan.id,
       stepId: input.stepId,
       exitCode,
-      logPath,
-    })
-    return result
-  }
-
-  /** 在实例里跑一条命令。日志文件由 SSH 通道写：完整输出落盘，Run 记录只留尾部与字节数。 */
-  async function runSshStep(step: PlannedStep): Promise<SshExecResult> {
-    const logPath = stepLogFilePath(layout, step.stepId)
-    logger.info('run.step.start', {
-      runId,
-      planId: currentPlan.id,
-      stepId: step.stepId,
-      kind: step.kind,
-      command: step.command,
-      timeoutSeconds: step.timeoutSeconds,
-      logPath,
-    })
-    const startedStepAt = clockIso()
-
-    let result: SshExecResult
-    try {
-      result = await provider.exec(instanceId, step.command, {
-        timeoutSeconds: step.timeoutSeconds,
-        logPath,
-      })
-    } catch (error: unknown) {
-      const finishedStepAt = clockIso()
-      // SSH 通道连上之后才创建日志文件。连接失败时文件不存在，这里补一行错误，
-      // 保证 Run 记录里的 logPath 一定读得到东西。命令中途断线时文件已存在，
-      // 追加而不是覆盖：已经产生的输出不能被抹掉。
-      try {
-        await appendFile(
-          logPath,
-          `${jsonLine({ event: 'step.error', time: finishedStepAt, stepId: step.stepId, error: describeError(error) })}\n`,
-          'utf8',
-        )
-      } catch (logError: unknown) {
-        logger.warn('run.step.log-write-failed', {
-          runId,
-          planId: currentPlan.id,
-          stepId: step.stepId,
-          logPath,
-          error: describeError(logError),
-        })
-      }
-      await appendStep({
-        stepId: step.stepId,
-        kind: step.kind,
-        command: step.command,
-        exitCode: null,
-        startedAt: startedStepAt,
-        finishedAt: finishedStepAt,
-        stdoutTail: '',
-        stderrTail: describeError(error),
-        stdoutBytes: 0,
-        stderrBytes: 0,
-        logPath,
-        screenshotPaths: [],
-      })
-      throw error
-    }
-
-    const finishedStepAt = clockIso()
-    await appendStep({
-      stepId: step.stepId,
-      kind: step.kind,
-      command: step.command,
-      exitCode: result.exitCode,
-      startedAt: startedStepAt,
-      finishedAt: finishedStepAt,
-      stdoutTail: result.stdoutTail,
-      stderrTail: result.stderrTail,
-      stdoutBytes: result.stdoutBytes,
-      stderrBytes: result.stderrBytes,
-      logPath,
-      screenshotPaths: [],
-    })
-    logger.info('run.step.finish', {
-      runId,
-      planId: currentPlan.id,
-      stepId: step.stepId,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      stdoutBytes: result.stdoutBytes,
-      stderrBytes: result.stderrBytes,
-      durationMs: result.durationMs,
       logPath,
     })
     return result
@@ -831,7 +741,7 @@ async function runOnce(
     await planStore.save(currentPlan)
   }
 
-  // ── 5. 取实例 ──
+  // ── 6. 取实例 ──
   let acquired: AcquiredInstance
   try {
     acquired = await acquireInstance()
@@ -913,7 +823,7 @@ async function runOnce(
   await bindPlanInstance(instanceId)
 
   try {
-    // ── 6. 等 SSH 就绪 ──
+    // ── 7. 等 SSH 就绪 ──
     await runEngineStep({
       stepId: ENGINE_STEP_ID.sshReady,
       kind: 'builtin',
@@ -923,7 +833,7 @@ async function runOnce(
       summaryOf: () => ({ instanceId, timeoutMs: SSH_READY_TIMEOUT_MS }),
     })
 
-    // ── 7. 读单价 ──
+    // ── 8. 读单价 ──
     const remainingMinutes = Math.max(
       1,
       Math.floor(minutesBetweenIso(clockIso(), currentPlan.expiresAt)),
@@ -944,7 +854,7 @@ async function runOnce(
     unitPriceYuanPerHour = quote.unitPriceYuanPerHour
     await updateRecord({ unitPriceYuanPerHour })
 
-    // ── 8. 单价漂移 ──
+    // ── 9. 单价漂移 ──
     // 先比较再写缓存：漂移时不能把新价写进缓存，否则「清掉缓存再重试」这个方法就失效了。
     // 缓存按开机形态分槽：有无卡单价不同源，同一个槽比较必然被判成漂移。
     const priceSlot = resolvePriceSlot({
@@ -999,7 +909,7 @@ async function runOnce(
       }),
     })
 
-    // ── 9. 预算复核 ──
+    // ── 10. 预算复核 ──
     // 超预算时它只抛 BudgetExceededError，不销毁实例（spec 第 9.2 节）；
     // 停机保留由本函数的外层 catch 统一做。
     await runEngineStep({
@@ -1020,7 +930,7 @@ async function runOnce(
       }),
     })
 
-    // ── 10. 余额熔断 ──
+    // ── 11. 余额熔断 ──
     const projectedCostYuan = estimateRunCostYuan(quote.unitPriceYuanPerHour, quote.ttlMinutes)
     const balanceDecision = await runEngineStep({
       stepId: ENGINE_STEP_ID.balanceRecheck,
@@ -1054,7 +964,7 @@ async function runOnce(
       )
     }
 
-    // ── 11. 设置平台定时关机 ──
+    // ── 12. 设置平台定时关机 ──
     // 时间基准以控制台服务器时间为准（spec 第 7.4 节）：本机时钟可能偏。
     const receipt = await runEngineStep({
       stepId: ENGINE_STEP_ID.timedShutdown,
@@ -1089,16 +999,9 @@ async function runOnce(
       serverTime: receipt.serverTime,
     })
 
-    // ── 12. 健康检查 ──
-    // 退出码已经表达一切，不加额外判据。
-    for (const step of planDeploySteps({ project })) {
-      const result = await runSshStep(step)
-      if (result.timedOut || result.exitCode !== 0) {
-        throw healthCheckFailure(step, result)
-      }
-    }
-
     // ── 13. 收尾 ──
+    // 到这里实例已到手、SSH 已就绪、单价与预算已复核、定时关机已设上。
+    // 不在这里跑任何远端命令：服务是否可用由使用者自己判断。
     await updateRecord({ state: 'succeeded', finishedAt: clockIso() })
     logger.info('run.succeeded', {
       runId,
@@ -1197,25 +1100,6 @@ function isConsoleInstanceSnapshot(value: unknown): value is ConsoleInstanceSnap
     typeof (value as { readonly gpuSpec?: unknown }).gpuSpec === 'string' &&
     (value as { readonly gpuSpec: string }).gpuSpec.length > 0
   )
-}
-
-/** 健康检查未通过。它是 `run` 唯一的远端步骤，失败分类只有这一种。 */
-function healthCheckFailure(step: PlannedStep, result: SshExecResult): HealthCheckFailedError {
-  const outcome = result.timedOut
-    ? `超时（${String(step.timeoutSeconds)} 秒）被终止`
-    : `退出码 ${String(result.exitCode)}`
-  const detail = tailOf(result.stderrTail.trim().length > 0 ? result.stderrTail : result.stdoutTail)
-  return new HealthCheckFailedError(
-    `步骤 ${step.stepId} 失败：${outcome}。命令：${step.command}。` +
-      (detail.length > 0 ? `输出尾部：${detail}` : '没有输出。'),
-  )
-}
-
-/** 错误消息里的输出尾部。完整输出在日志文件里，这里只留够定位的几行。 */
-function tailOf(text: string): string {
-  const lines = text.split('\n')
-  const tail = lines.slice(-8).join('\n')
-  return tail.length > 1200 ? tail.slice(-1200) : tail
 }
 
 /**

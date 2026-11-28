@@ -40,6 +40,7 @@ export type DeploydeckErrorCode =
   | 'INSTANCE_NOT_FOUND'
   | 'POWER_OFF_TIMEOUT'
   | 'INSTANCE_NOT_RUNNING'
+  | 'PROBE_FAILED'
   | 'INTERACTIVE_TERMINAL_REQUIRED'
   | 'SHELL_FAILED'
   | 'POWER_ON_FAILED'
@@ -252,7 +253,28 @@ export class BalanceInsufficientError extends DeploydeckError {
   }
 }
 
-/** 健康检查未通过。 */
+/**
+ * 探测未通过：SSH 连不上、命令没返回，或命令退出码非 0。
+ *
+ * 判据：探测只回答「这台机器能不能连上并执行一条命令」。`true` 恒真，
+ * 所以失败原因只有链路与传输两类。退出码 1：链路恢复后重试即可，不用人排查配置。
+ */
+export class ProbeFailedError extends DeploydeckError {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super('PROBE_FAILED', message, EXIT_BUSINESS_FAILURE)
+    this.name = 'ProbeFailedError'
+    if (options?.cause !== undefined) {
+      this.cause = options.cause
+    }
+  }
+}
+
+/**
+ * 健康检查未通过。
+ *
+ * 已无消费者：`run` 不再做健康检查，探测改用固定命令并报 `PROBE_FAILED`。
+ * 错误码保留，不删：码表是稳定接口，删码会让读历史日志的人找不到对应含义。
+ */
 export class HealthCheckFailedError extends DeploydeckError {
   constructor(message: string) {
     super('HEALTH_CHECK_FAILED', message, EXIT_BUSINESS_FAILURE)

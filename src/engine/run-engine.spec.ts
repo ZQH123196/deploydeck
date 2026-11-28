@@ -24,7 +24,6 @@ import {
   CloneTimeoutError,
   ConfigError,
   ConsoleParseError,
-  HealthCheckFailedError,
   HumanRequiredError,
   InstanceNotGoneError,
   PlanInvalidError,
@@ -49,7 +48,6 @@ import type { Clock } from '../util/clock.js'
 import { beijingIso, formatBeijingMinute, parseBeijingDateTimeText } from '../util/time.js'
 import { createRunEngine, PRICE_DRIFT_THRESHOLD_RATIO, SSH_READY_TIMEOUT_MS, type RunEngine, type RunSummary } from './run-engine.js'
 import { createRunStore, RUNS_DIRECTORY, type RunStore } from './run-store.js'
-import { STEP_ID } from './steps.js'
 
 /**
  * 工单 10 执行引擎的验收用例。
@@ -130,8 +128,6 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
     id: 'trans-app',
-    workdir: '/root/trans_app',
-    healthCheck: 'curl -fsS http://127.0.0.1:6006/health',
     ...overrides,
   }
 }
@@ -168,6 +164,7 @@ type ProviderAction =
   | 'readBalance'
   | 'destroy'
   | 'waitUntilReady'
+  /** 数据面出口。`run` 不该调用它；用例断言的是「一次都没被调用」。 */
   | 'exec'
 
 interface ProviderCall {
@@ -188,10 +185,8 @@ interface FakeProviderBehavior {
   readonly readBalance?: () => Promise<number>
   readonly destroy?: (instanceId: string) => Promise<TeardownOutcome>
   readonly waitUntilReady?: (instanceId: string, timeoutMs: number) => Promise<void>
-  /** 某条命令的 stdout。默认空串。 */
-  readonly stdoutFor?: (command: string) => string
-  /** 某条命令的退出码。默认 0。 */
-  readonly exitCodeFor?: (command: string) => number
+  /** 让指定步骤的动作失败。`run` 里一个远端命令都没有，失败只能由控制台动作或内置判定制造。 */
+  readonly failOnAction?: ProviderAction
 }
 
 const DEFAULT_CAPABILITIES: ProviderCapabilities = {
@@ -228,8 +223,17 @@ class FakeProvider implements Provider {
     return this.calls.map((call) => call.action)
   }
 
+  /**
+   * 记一次动作；`failOnAction` 命中时在这里失败。
+   *
+   * 判据：失败点必须显式指定，不靠命令文本里的字样猜。
+   * `run` 没有远端命令，所以失败只能由控制台动作或内置判定制造。
+   */
   private record(action: ProviderAction, detail: Record<string, unknown> = {}): void {
     this.calls.push({ action, detail })
+    if (this.behavior.failOnAction === action) {
+      throw new Error(`${action} 失败（测试注入）`)
+    }
   }
 
   private serverNow(): string {
@@ -290,6 +294,9 @@ class FakeProvider implements Provider {
   }
 
   async readPriceQuote(instanceId: string, ttlMinutes: number): Promise<PriceQuote> {
+    if (this.behavior.failOnAction === 'readPriceQuote') {
+      throw new Error('readPriceQuote 失败（测试注入）')
+    }
     this.record('readPriceQuote', { instanceId, ttlMinutes })
     if (this.behavior.readPriceQuote !== undefined) {
       return await this.behavior.readPriceQuote(instanceId, ttlMinutes)
@@ -343,21 +350,25 @@ class FakeProvider implements Provider {
     }
   }
 
+
+  /**
+   * 数据面出口。
+   *
+   * 判据：`run` 不调用它。留成假实现只为让假 provider 满足 `Provider` 端口约定；
+   * 用例断言的是「一次都没被调用」，不是「调用结果对不对」。
+   */
   async exec(
     instanceId: string,
     command: string,
     options: SshExecOptions,
   ): Promise<SshExecResult> {
     this.record('exec', { instanceId, command, logPath: options.logPath })
-    const stdout = this.behavior.stdoutFor?.(command) ?? ''
-    const exitCode = this.behavior.exitCodeFor?.(command) ?? 0
-    // 模拟真实 SSH 端口的行为：完整输出落盘，返回值只带尾部与字节数。
-    await writeFile(options.logPath, stdout, 'utf8')
+    await writeFile(options.logPath, '', 'utf8')
     return {
-      exitCode,
-      stdoutTail: stdout,
+      exitCode: 0,
+      stdoutTail: '',
       stderrTail: '',
-      stdoutBytes: Buffer.byteLength(stdout, 'utf8'),
+      stdoutBytes: 0,
       stderrBytes: 0,
       durationMs: 1,
       timedOut: false,
@@ -477,13 +488,16 @@ function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1
 }
 
-/** Run 记录里 SSH 步骤的顺序。控制台动作与内置判定不参与这个断言。 */
-function sshStepIds(run: Run): string[] {
-  return run.steps.filter((step) => step.kind === 'ssh').map((step) => step.stepId)
+/**
+ * 判据：`run` 不产生 `ssh` 类型步骤。引擎在实例里执行的命令只有 `probe` 一条，
+ * 它不在 `run` 里跑。有人把远端命令加回 `run` 时，这条断言会变红。
+ */
+function expectNoRemoteSteps(run: Run): void {
+  expect(run.steps.filter((step) => step.kind === 'ssh')).toEqual([])
 }
 
 describe('run：开机复用路径', () => {
-  it('实例已关机时开机，步骤顺序为部署脚本 → 启动脚本 → 健康检查', async () => {
+  it('实例已关机时开机，Run 不执行任何远端命令', async () => {
     const fixture = await createFixture({ behavior: { instances: [makeInstance()] } })
 
     const summary = await fixture.run()
@@ -493,10 +507,10 @@ describe('run：开机复用路径', () => {
     expect(summary.instanceId).toBe(INSTANCE_ID)
     expect(summary.state).toBe('succeeded')
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    expectNoRemoteSteps(run)
   })
 
-  it('实例已运行时不开机，直接跑部署脚本 → 启动脚本 → 健康检查', async () => {
+  it('实例已运行时不开机，直接走完引擎步骤', async () => {
     const fixture = await createFixture({
       behavior: { instances: [makeInstance({ status: 'running', statusRaw: '运行中' })] },
     })
@@ -506,10 +520,10 @@ describe('run：开机复用路径', () => {
     expect(fixture.provider.actions()).not.toContain('powerOn')
     expect(summary.mode).toBe('reuse')
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    expectNoRemoteSteps(run)
   })
 
-  it('开机失败（无可用 GPU）时自动走克隆，只跑启动脚本与健康检查', async () => {
+  it('开机失败（无可用 GPU）时自动走克隆，Run 不执行任何远端命令', async () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
@@ -525,12 +539,12 @@ describe('run：开机复用路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).sourceInstanceId).toBe(INSTANCE_ID)
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    expectNoRemoteSteps(run)
   })
 })
 
 describe('run：克隆路径', () => {
-  it('没有同名实例时按部署配置的克隆源克隆，只跑启动脚本与健康检查', async () => {
+  it('没有同名实例时按部署配置的克隆源克隆，Run 不执行任何远端命令', async () => {
     const fixture = await createFixture({
       profile: { cloneSourceInstanceName: 'trans-template' },
       behavior: {
@@ -546,12 +560,12 @@ describe('run：克隆路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).sourceInstanceId).toBe(CLONE_SOURCE_ID)
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    expectNoRemoteSteps(run)
     // 克隆产物要绑定到计划上：下一次执行靠 plan.instanceId 命中「已绑定实例」那条。
     expect((await fixture.readPlan()).instanceId).toBe(summary.instanceId)
   })
 
-  it('cloneDataDisk 只决定克隆参数，不改变步骤序列：克隆路径都只跑启动脚本与健康检查', async () => {
+  it('cloneDataDisk 只决定克隆参数，不改变步骤序列', async () => {
     const fixture = await createFixture({
       profile: { cloneSourceInstanceName: 'trans-template', cloneDataDisk: false },
       behavior: {
@@ -565,7 +579,7 @@ describe('run：克隆路径', () => {
     const cloneCall = fixture.provider.calls.find((call) => call.action === 'clone')
     expect((cloneCall?.detail['request'] as CloneRequest).cloneDataDisk).toBe(false)
     const run = await fixture.readRun(summary.runId)
-    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    expectNoRemoteSteps(run)
   })
 
   it('克隆源未关机时先关机再克隆', async () => {
@@ -802,24 +816,24 @@ describe('run：前置校验零动作', () => {
 })
 
 describe('run：失败分叉', () => {
-  it('健康检查失败时 Run 为 stray、计划转待结算，实例停机保留且不销毁', async () => {
+  it('实例到手后失败时 Run 为 stray、计划转待结算，实例停机保留且不销毁', async () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
 
-    const error = await fixture.run().catch((caught: unknown) => caught)
+    await fixture.run().catch(() => undefined)
 
-    expect(error).toBeInstanceOf(HealthCheckFailedError)
     // 判据：自动判定失败只停机，不销毁。销毁入口只剩 teardown。
     expect(fixture.provider.actions()).not.toContain('destroy')
     expect(fixture.provider.actions()).toContain('powerOff')
     expect(instanceStatusIn(fixture)).toBe('stopped')
     const run = await onlyRunRecord(fixture)
     expect(run.state).toBe('stray')
-    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    expectNoRemoteSteps(run)
     // 判据（M2）：停机成功 = 钱停了。计划状态必须说「已停机、待结算」，
     // 不能说 escalated —— 那个状态的含义是「实例未确认消失，钱可能还在烧」。
     expect((await fixture.readPlan()).state).toBe('stopped-pending-settlement')
@@ -833,7 +847,8 @@ describe('run：失败分叉', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
         powerOff: async () => {
           throw new Error('控制台关机按钮没响应')
         },
@@ -854,13 +869,15 @@ describe('run：失败分叉', () => {
     const stopped = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
     const powerOffFailed = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
         powerOff: async () => {
           throw new Error('控制台关机按钮没响应')
         },
@@ -882,7 +899,8 @@ describe('run：失败分叉', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
 
@@ -920,24 +938,25 @@ describe('run：失败分叉', () => {
     expect((await fixture.readPlan()).state).toBe('escalated')
   })
 
-  it('健康检查失败且 destroy-container：仍不销毁，只停机保留', async () => {
+  it('实例到手后失败且 destroy-container：仍不销毁，只停机保留', async () => {
     const fixture = await createFixture({
       profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
 
     const error = await fixture.run().catch((caught: unknown) => caught)
 
-    expect(error).toBeInstanceOf(HealthCheckFailedError)
+    expect(error).toBeInstanceOf(Error)
     // 判据：onDeployFailure 不再引起自动销毁，实例留在列表里。
     expect(fixture.provider.actions()).not.toContain('destroy')
     expect(instanceStatusIn(fixture)).toBe('stopped')
     const run = await onlyRunRecord(fixture)
     expect(run.state).toBe('stray')
-    expect(sshStepIds(run)).toEqual([STEP_ID.healthCheck])
+    expectNoRemoteSteps(run)
     expect((error as Error).message).toContain('teardown')
   })
 
@@ -945,7 +964,8 @@ describe('run：失败分叉', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
         powerOff: async () => {
           throw new Error('控制台关机按钮没响应')
         },
@@ -955,7 +975,7 @@ describe('run：失败分叉', () => {
     const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
 
     // 判据：停机失败不改变分类，原错误照旧抛；处置办法与「实例仍在」写进同一条消息。
-    expect(error).toBeInstanceOf(HealthCheckFailedError)
+    expect(error).toBeInstanceOf(Error)
     expect(fixture.provider.actions()).not.toContain('destroy')
     expect(instanceStatusIn(fixture)).not.toBe('stopped')
     expect(error.message).toContain('停机失败（Error：控制台关机按钮没响应）')
@@ -1196,26 +1216,14 @@ describe('run：定时关机与日志', () => {
     expect(summary.timedShutdownAt).toBe(expected)
   })
 
-  it('每步日志文件真的落盘，路径与 StepResult.logPath 一致，stdoutBytes 与写入字节一致', async () => {
-    const fixture = await createFixture({
-      behavior: {
-        instances: [makeInstance()],
-        stdoutFor: (command) => `output of ${command}\n第二行\n`,
-      },
-    })
+  it('run 没有任何远端步骤：SSH 通道一次都不被调用', async () => {
+    const fixture = await createFixture({ behavior: { instances: [makeInstance()] } })
 
     const summary = await fixture.run()
 
-    const run = await fixture.readRun(summary.runId)
-    const expectedLogDirectory = join(fixture.stateDir, RUNS_DIRECTORY, summary.runId, 'logs')
-    const sshSteps = run.steps.filter((step) => step.kind === 'ssh')
-    expect(sshSteps).toHaveLength(1)
-    for (const step of sshSteps) {
-      expect(step.logPath).toBe(join(expectedLogDirectory, `${step.stepId}.log`))
-      const written = await readFile(step.logPath, 'utf8')
-      expect(written).toBe(`output of ${step.command}\n第二行\n`)
-      expect(step.stdoutBytes).toBe(Buffer.byteLength(written, 'utf8'))
-    }
+    // 判据：引擎不在实例里执行任何命令。远端命令只由 `probe` 跑，它不属于 `run`。
+    expect(fixture.provider.actions()).not.toContain('exec')
+    expectNoRemoteSteps(await fixture.readRun(summary.runId))
   })
 
   it('控制台动作与内置判定也各有一份日志文件，Run 记录里能读到每步命令与退出码', async () => {
@@ -1254,7 +1262,8 @@ describe('run：定时关机与日志', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
 
@@ -1271,7 +1280,8 @@ describe('run：定时关机与日志', () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
     // 让停机时刻比取得实例晚 30 分钟：假时钟不前进时金额恒为 0，看不出投影有没有发生。
@@ -1325,18 +1335,20 @@ describe('run：provider 能力判据', () => {
 })
 
 describe('run：失败报错的现场信息', () => {
-  it('keep-container 的 stray 报错给出 workdir、SSH 登录方式与本机 run 目录', async () => {
+  it('keep-container 的 stray 报错给出本机 run 目录与 SSH 登录方式', async () => {
     const fixture = await createFixture({
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
 
     const error = (await fixture.run().catch((caught: unknown) => caught)) as Error
     const run = await onlyRunRecord(fixture)
 
-    expect(error.message).toContain('/root/trans_app')
+    // 判据：项目清单不承载实例内目录，报错也不能引用一个已不存在的字段。
+    expect(error.message).not.toContain('项目目录')
     expect(error.message).toContain('SSH 登录列')
     expect(error.message).toContain(run.logDir)
     expect(error.message).toContain('deploydeck guard')
@@ -1348,7 +1360,8 @@ describe('run：失败报错的现场信息', () => {
       profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
 
@@ -1386,7 +1399,8 @@ describe('run：账本投影失败', () => {
       profile: { onDeployFailure: 'destroy-container' },
       behavior: {
         instances: [makeInstance()],
-        exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
+        // 失败点在单价之后：账本要「单价已知」才封口。
+        failOnAction: 'setTimedShutdown',
       },
     })
     const brokenPlanStore: PlanStore = {

@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { afterEach, expect } from 'vitest'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type {
   CloneOutcome,
   CloneRequest,
@@ -11,6 +11,7 @@ import type {
   TeardownOutcome,
   TimedShutdownReceipt,
 } from '../console/ports.js'
+import type { InstanceStatusProbe } from '../console/instance-list.js'
 import type { ConsoleInstanceSnapshot } from '../domain/instance.js'
 import type { Plan } from '../domain/plan.js'
 import type { Profile } from '../domain/profile.js'
@@ -100,10 +101,24 @@ export function makeInstance(
 }
 
 export interface FakeProviderBehavior {
-  /** 某条命令的退出码。默认 0。 */
+  /**
+   * 让指定控制台动作失败。
+   *
+   * 判据：`run` 不执行任何远端命令，所以 `exitCodeFor` / `onExec` 造不出 `run` 的失败。
+   * 失败点必须显式指定，不靠命令文本里的字样猜。
+   */
+  readonly failOnAction?: 'setTimedShutdown' | 'powerOff'
+  /** 某条命令的退出码。默认 0。`run` 不会调它，只对 `shell -- <命令>` 这类入口有意义。 */
   readonly exitCodeFor?: (command: string) => number
   /** 命令开始前调用。用例可以在这里推进假时钟，模拟耗时。 */
   readonly onExec?: (command: string, clock: FakeClock) => void
+}
+
+/** 失败注入命中的动作在这里失败。 */
+function failIfRequested(behavior: FakeProviderBehavior, action: string): void {
+  if (behavior.failOnAction === action) {
+    throw new Error(`${action} 失败（测试注入）`)
+  }
 }
 
 /**
@@ -141,6 +156,7 @@ export class FakeProvider implements Provider {
 
   async powerOff(instanceId: string): Promise<void> {
     this.calls.push('powerOff')
+    failIfRequested(this.behavior, 'powerOff')
     this.setStatus(instanceId, 'stopped', '已关机')
   }
 
@@ -172,6 +188,7 @@ export class FakeProvider implements Provider {
 
   async setTimedShutdown(instanceId: string, shutdownAt: string): Promise<TimedShutdownReceipt> {
     this.calls.push('setTimedShutdown')
+    failIfRequested(this.behavior, 'setTimedShutdown')
     void instanceId
     return {
       serverTime: beijingIso(new Date(this.clock.now())),
@@ -330,8 +347,49 @@ export async function createFixture(options: FixtureOptions = {}): Promise<CliFi
     openConsoleSession: async () => {
       throw new Error('测试不应打开真实控制台通道')
     },
+    /*
+     * 假终端通道：`shell -- <命令>` 与 `probe` 共用这一个入口。
+     * 判据：命令照抄到假的 `exec`，状态读数取自假 provider 的实例列表；
+     * PTY 形态不在 CLI 验收里覆盖，要开 PTY 直接失败。
+     */
     openShell: async () => {
-      throw new Error('测试不应打开真实终端通道')
+      return {
+        shell: {
+          openShell: async () => {
+            throw new Error('CLI 验收不该开 PTY：交互形态不是这里的目标')
+          },
+        },
+        readInstanceStatus: async (instanceId: string): Promise<InstanceStatusProbe> => {
+          const snapshot =
+            provider.snapshots.find((candidate) => candidate.instanceId === instanceId) ?? null
+          return snapshot === null
+            ? { instanceId, status: 'unknown', statusRaw: '列表里找不到' }
+            : {
+                instanceId: snapshot.instanceId,
+                status: snapshot.status,
+                statusRaw: snapshot.statusRaw,
+              }
+        },
+        exec: async (
+          instanceId: string,
+          command: string,
+          execOptions: SshExecOptions,
+        ): Promise<SshExecResult> => {
+          const stdout = `output of ${command}\n`
+          await mkdir(dirname(execOptions.logPath), { recursive: true })
+          await writeFile(execOptions.logPath, stdout, 'utf8')
+          return {
+            exitCode: 0,
+            stdoutTail: stdout,
+            stderrTail: '',
+            stdoutBytes: Buffer.byteLength(stdout, 'utf8'),
+            stderrBytes: 0,
+            durationMs: 1,
+            timedOut: false,
+          }
+        },
+        close: async () => undefined,
+      }
     },
     openCredentials: async () => {
       throw new Error('测试不应打开真实凭据通道')

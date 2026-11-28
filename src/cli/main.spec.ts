@@ -259,17 +259,14 @@ describe('CLI：run', () => {
     expect(fixture.provider.calls).toEqual([])
   })
 
-  it('部署失败且 destroy-container 时写账本，并把金额记回计划 spentYuan', async () => {
+  it('执行失败且 destroy-container 时停机保留，金额在失败收尾封口并记回计划', async () => {
+    // 判据：自动判定失败只停机、不销毁（销毁入口只剩 teardown）。停机成功 = 钱停了，
+    // 账本这时封口一行，金额记回计划 spentYuan。失败点定在设定时关机：
+    // 单价在它之前已经读到，账本才有金额可算。
     const fixture = await createFixture({
       providerFactory: (clock) =>
         new FakeProvider(clock, [makeInstance({ name: 'trans-prod' })], {
-          exitCodeFor: (command) => (command.includes('curl') ? 1 : 0),
-          // 部署脚本失败，且耗时 30 分钟：账本金额应当非零。
-          onExec: (command, fakeClock) => {
-            if (command.includes('curl')) {
-              fakeClock.advanceMinutes(30)
-            }
-          },
+          failOnAction: 'setTimedShutdown',
         }),
     })
     const planCode = await fixture.run(['plan', 'create', '--profile', 'trans-prod', '--json'])
@@ -286,11 +283,15 @@ describe('CLI：run', () => {
     ])
 
     expect(code).toBe(1)
-    const plan = await fixture.readPlan(planId)
-    expect(plan.spentYuan).toBeCloseTo(0.5, 10)
+    const run = await fixture.readRun('run-failure-ledger')
+    expect(run.state).toBe('stray')
+    expect(fixture.provider.calls).not.toContain('destroy')
+    expect((await fixture.readPlan(planId)).state).toBe('stopped-pending-settlement')
     const ledger = await fixture.readLedger()
     expect(ledger).toHaveLength(1)
-    expect(ledger[0]?.amountYuan).toBeCloseTo(0.5, 10)
+    // 假时钟不前进时，从取得实例到停机的时长为 0：金额为 0。
+    // 金额口径本身由 `computeLedgerAmount` 的用例守着；这里判的是「一行已封口并投影回计划」。
+    expect(ledger[0]?.amountYuan).toBe((await fixture.readPlan(planId)).spentYuan)
   })
 })
 
@@ -590,6 +591,64 @@ describe('CLI：power / switch / creds / tunnel 的参数面', () => {
     const code = await fixture.run(['power', INSTANCE_ID])
 
     expect(code).not.toBe(0)
+    expect(fixture.provider.calls).toEqual([])
+  })
+})
+
+describe('CLI：probe', () => {
+  it('help 里列出 probe 子命令', async () => {
+    const fixture = await createFixture()
+
+    await fixture.run(['--help'])
+
+    expect(fixture.stdoutText()).toMatch(/^\s+probe /m)
+  })
+
+  it('运行中实例 --json 输出 instanceId、reachable、durationMs，退出码 0', async () => {
+    // Arrange：实例已在运行，probe 不碰计划。
+    const fixture = await createFixture({
+      providerFactory: (clock) =>
+        new FakeProvider(clock, [makeInstance({ status: 'running', statusRaw: '运行中' })]),
+    })
+
+    // Act
+    const code = await fixture.run(['probe', INSTANCE_ID, '--json'])
+
+    // Assert
+    expect(code).toBe(0)
+    const payload = parseSingleJson(fixture)
+    expect(Object.keys(payload).sort()).toEqual(['durationMs', 'instanceId', 'reachable'])
+    expect(payload['instanceId']).toBe(INSTANCE_ID)
+    expect(payload['reachable']).toBe(true)
+  })
+
+  it('实例已关机报 INSTANCE_NOT_RUNNING，退出码 1，不跑任何命令', async () => {
+    // Arrange
+    const fixture = await createFixture()
+
+    // Act
+    const code = await fixture.run(['probe', INSTANCE_ID, '--json'])
+
+    // Assert
+    expect(code).toBe(1)
+    expect(fixture.stderrText().split('\n')[0]).toMatch(/^\[INSTANCE_NOT_RUNNING\] /)
+    expect(fixture.provider.calls).toEqual([])
+  })
+
+  it('不校验计划、不写账本、不建执行记录：计划外的实例照样能 probe', async () => {
+    // Arrange：没有任何计划，实例靠人手工开机。
+    const fixture = await createFixture({
+      providerFactory: (clock) =>
+        new FakeProvider(clock, [makeInstance({ status: 'running', statusRaw: '运行中' })]),
+    })
+
+    // Act
+    const code = await fixture.run(['probe', INSTANCE_ID, '--json'])
+
+    // Assert：判据与 `shell` 相同，计划只是授权窗口，不是连通性判据。
+    expect(code).toBe(0)
+    expect(await fixture.listActivePlans()).toEqual([])
+    expect(await fixture.readLedger()).toEqual([])
     expect(fixture.provider.calls).toEqual([])
   })
 })

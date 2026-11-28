@@ -44,9 +44,10 @@
 | `plans/<planId>.jsonc` | 计划 | 计划命令（工单 09） |
 | `prices/<profileId>-<slot>.jsonc` | 单价缓存：单价、观测时刻、gpuSpec。`slot` 是开机形态，取 `gpu` 或 `no-gpu` | 执行引擎（工单 10） |
 | `runs/<runId>.jsonc` | 执行记录 | 执行引擎（工单 10） |
-| `runs/<runId>/logs/<stepId>.log` | 一步一份：`health-check` 是 SSH 命令完整输出，控制台动作与内置判定是引擎写的开始与结束记录 | 执行引擎与 SSH 通道（工单 10） |
+| `runs/<runId>/logs/<stepId>.log` | 一步一份：控制台动作与内置判定是引擎写的开始与结束记录。`run` 没有 SSH 步骤 | 执行引擎（工单 10） |
 | `runs/<runId>/screenshots/` | 预留目录；当前没有写入者（见 2.1） | — |
 | `shell/<instanceId>/command.log` | `shell -- <命令>` 的完整输出，只覆盖这一形态 | `shell` 命令的非交互形态 |
+| `probe/<instanceId>/` | 探测的证据目录。探测命令 `true` 没有输出，目录里没有产物 | `probe` 命令 |
 | `ledger.jsonl` | 账本 | 账本存储（工单 11） |
 | `ssh-known-hosts.txt` | SSH 主机密钥指纹 | SSH 通道（工单 07） |
 | `chrome-profile/` | 专用 Chrome 的 user-data-dir：控制台登录态与浏览器缓存。仅非 WSL 时使用 | 专用 Chrome 进程 |
