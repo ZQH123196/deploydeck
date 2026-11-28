@@ -227,7 +227,7 @@ export function createAutodlProvider(input: AutodlProviderInput): Provider {
 /**
  * 选项校验。装配错误一律在这里崩：迟到的报错会伪装成控制台或 SSH 的问题。
  */
-function assertProviderOptions(options: AutodlProviderOptions): void {
+export function assertProviderOptions(options: AutodlProviderOptions): void {
   assertHttpUrl(options.consoleUrl, 'consoleUrl')
   if (!Number.isInteger(options.cdpPort) || options.cdpPort < 1 || options.cdpPort > 65535) {
     throw new ConfigError(`cdpPort 必须是 1-65535 的整数，当前值：${String(options.cdpPort)}。`)
