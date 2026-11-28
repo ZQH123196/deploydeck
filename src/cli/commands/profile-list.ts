@@ -1,5 +1,5 @@
 import { writeJson, writeLine, writeTable } from '../output.js'
-import { formatOnDeployFailure, type CommandContext } from './shared.js'
+import { formatOnDeployFailure, formatPowerOnMode, type CommandContext } from './shared.js'
 
 /**
  * `profile list`：列出配置目录里的全部部署配置。
@@ -18,11 +18,12 @@ export async function runProfileListCommand(context: CommandContext): Promise<vo
     return
   }
 
-  const headers = ['ID', '项目', 'provider', '时长(分)', '预算(元)', '失败后', '锁定commit']
+  const headers = ['ID', '项目', 'provider', '开机', '时长(分)', '预算(元)', '失败后', '锁定commit']
   const rows = profiles.map((profile) => [
     profile.id,
     profile.project,
     profile.provider,
+    formatPowerOnMode(profile.powerOnMode),
     String(profile.ttlMinutes),
     String(profile.budgetCapYuan),
     formatOnDeployFailure(profile.onDeployFailure),

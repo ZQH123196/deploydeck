@@ -36,6 +36,9 @@ export const COST_ESTIMATES: readonly CostEstimateItem[] = [
   { caseName: '开关机（含二次确认）', yuan: 0.05 },
   { caseName: '平台定时关机（2 分钟后自动关）', yuan: 0.08 },
   { caseName: '克隆 → 改名 → 释放（约 7 分钟）', yuan: 0.30 },
+  // 无卡模式单价约 0.1 元/时，下面两项合计不超过 10 分钟，取 0.05 元。
+  { caseName: '无卡模式开机 → 关机', yuan: 0.02 },
+  { caseName: '无卡模式下的 SSH 与终端会话', yuan: 0.03 },
 ]
 
 /** 本次真机测试的配置。全部来自环境变量，缺一个就抛错。 */

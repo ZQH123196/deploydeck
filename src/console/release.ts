@@ -138,8 +138,12 @@ export function parseConfirmDialogProbe(raw: unknown): ConfirmDialogProbe {
  * `aria-describedby` 属性，若它指向某个可见弹层，那个弹层就是本行的。
  * 命中不到时退化为「只有一个可见弹层」判据；多个可见且无证据时报 ambiguous，不猜。
  *
- * 可见判据用几何尺寸。通道连上后会注入零时长过渡并把页面置前，此时几何可信；
- * 只看 class 会把停在过渡态的弹层当成可见。
+ * 可见判据（2026-11-26 真机修正）：
+ * 1. `display !== 'none'` 且 `visibility !== 'hidden'`。
+ * 2. **不要求几何尺寸。** Element Plus 的弹层在过渡期间 `opacity: 0`、高度为 0，
+ *    但它是「正在出现」而不是「不存在」。按尺寸判会把刚点开的菜单判成没打开，
+ *    轮询到超时。归属由 `aria-describedby` 正面证据裁决，不靠尺寸。
+ * 3. 「未失效」判据用 `aria-hidden`：Element Plus 关闭弹层时设 `aria-hidden="true"`。
  */
 export function buildLocateVisibleMenuItemScript(input: {
   readonly rowSelector: string
@@ -148,10 +152,10 @@ export function buildLocateVisibleMenuItemScript(input: {
   return `(() => {
   const clean = (text) => (text || '').replace(/\\s+/g, ' ').trim()
 ${buildVerifiedSelectorExpression()}
-  const isVisible = (element) => {
-    if (getComputedStyle(element).display === 'none') return false
-    const rect = element.getBoundingClientRect()
-    return rect.width > 0 && rect.height > 0
+  const isOpen = (element) => {
+    const style = getComputedStyle(element)
+    if (style.display === 'none' || style.visibility === 'hidden') return false
+    return element.getAttribute('aria-hidden') !== 'true'
   }
   const row = document.querySelector(${jsString(input.rowSelector)})
   const hintElements = []
@@ -167,7 +171,7 @@ ${buildVerifiedSelectorExpression()}
   }
   const matchesHint = (popper) =>
     hints.some((hint) => popper.id === hint || [...popper.querySelectorAll('[id]')].some((element) => element.id === hint))
-  const poppers = [...document.querySelectorAll(${jsString(DROPDOWN.popper)})].filter(isVisible)
+  const poppers = [...document.querySelectorAll(${jsString(DROPDOWN.popper)})].filter(isOpen)
   if (poppers.length === 0) return { kind: 'no-visible-popper' }
   const hinted = poppers.filter(matchesHint)
   if (hinted.length > 1) return { kind: 'popper-ambiguous', count: hinted.length }

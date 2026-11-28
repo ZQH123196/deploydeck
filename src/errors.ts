@@ -30,6 +30,7 @@ export type DeploydeckErrorCode =
   | 'SSH_COMMAND_TIMEOUT'
   | 'BROWSER_CHANNEL_FAILED'
   | 'CHROME_LAUNCH_FAILED'
+  | 'CHROME_BACKGROUND_LAUNCH_UNAVAILABLE'
   | 'STATE_FILE_MISSING'
   | 'STATE_FILE_INVALID'
   | 'STATE_LOCK_TIMEOUT'
@@ -37,6 +38,9 @@ export type DeploydeckErrorCode =
   | 'CLONE_TARGET_UNAVAILABLE'
   | 'INSTANCE_NOT_FOUND'
   | 'POWER_OFF_TIMEOUT'
+  | 'INSTANCE_NOT_RUNNING'
+  | 'INTERACTIVE_TERMINAL_REQUIRED'
+  | 'SHELL_FAILED'
 
 export const EXIT_OK: ExitCode = 0
 export const EXIT_BUSINESS_FAILURE: ExitCode = 1
@@ -285,6 +289,19 @@ export class ChromeLaunchError extends DeploydeckError {
 }
 
 /**
+ * 要求后台启动 Chrome，但当前平台没有这种启动方式。
+ *
+ * 判据：后台启动只覆盖 WSL 调 Windows Chrome 这一条路径。其余平台直接拒绝，
+ * 不当事后再重试能修的问题，所以退出码是「需要人工介入」。
+ */
+export class ChromeBackgroundLaunchUnavailableError extends DeploydeckError {
+  constructor(message: string) {
+    super('CHROME_BACKGROUND_LAUNCH_UNAVAILABLE', message, EXIT_HUMAN_REQUIRED)
+    this.name = 'ChromeBackgroundLaunchUnavailableError'
+  }
+}
+
+/**
  * 状态文件不存在。
  *
  * 读状态时缺失即报错，不返回空值：空值会让「账本为空」与「账本文件丢了」看起来一样。
@@ -367,5 +384,59 @@ export class PowerOffTimeoutError extends DeploydeckError {
       EXIT_HUMAN_REQUIRED,
     )
     this.name = 'PowerOffTimeoutError'
+  }
+}
+
+/**
+ * 目标实例不在运行中，SSH 连不上。
+ *
+ * 判据（docs/specs/deploydeck-phase3-shell.md 第 3 节）：终端只连运行中的实例。
+ * 已关机的实例没有 SSH 服务，连它只会拿到一个晦涩的连接超时。
+ *
+ * 退出码 1，不是 2：这是实例当前状态，不是配置错误。等实例运行后重试即可。
+ */
+export class InstanceNotRunningError extends DeploydeckError {
+  constructor(instanceId: string, statusRaw: string) {
+    super(
+      'INSTANCE_NOT_RUNNING',
+      `实例 ${instanceId} 当前状态是「${statusRaw}」，不在运行中，无法建立 SSH 连接。` +
+        '开机后再执行本命令。未打开任何 SSH 连接。',
+      EXIT_BUSINESS_FAILURE,
+    )
+    this.name = 'InstanceNotRunningError'
+  }
+}
+
+/**
+ * 需要交互式终端，但当前进程没有终端。
+ *
+ * 判据：`shell` 与 `shell run` 要转发 stdin 与窗口尺寸，没有 tty 就转发不了。
+ * 这不是可以自动降级的场景：静默退化成非交互会让需要确认的命令假装执行成功。
+ */
+export class InteractiveTerminalRequiredError extends DeploydeckError {
+  constructor() {
+    super(
+      'INTERACTIVE_TERMINAL_REQUIRED',
+      '当前进程没有交互式终端（stdin 不是 tty），无法转发键盘输入与窗口尺寸。' +
+        '请在真正的终端里运行本命令。不带参数的 `shell run` 与本错误无关。',
+      EXIT_HUMAN_REQUIRED,
+    )
+    this.name = 'InteractiveTerminalRequiredError'
+  }
+}
+
+/**
+ * SSH shell 会话失败：通道建立失败、会话中途断开、或命令超时。
+ *
+ * 它不是 `SSH_COMMAND_TIMEOUT`：那条属于非交互的 `exec`，判据是「命令被杀」。
+ * 本错误面前，远端 shell 是否已执行过命令未知，所以退出码是「需要人工」。
+ */
+export class ShellFailedError extends DeploydeckError {
+  constructor(message: string, options?: { readonly cause?: unknown }) {
+    super('SHELL_FAILED', message, EXIT_HUMAN_REQUIRED)
+    this.name = 'ShellFailedError'
+    if (options?.cause !== undefined) {
+      this.cause = options.cause
+    }
   }
 }

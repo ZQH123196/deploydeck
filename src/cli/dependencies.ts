@@ -1,9 +1,11 @@
 import { loadProfiles } from '../config/loader.js'
 import {
+  probeWindowsProfileRoot,
   readProcessEnv,
   resolveBalanceWarnBelowYuan,
   resolveCdpPort,
-  resolveChromeProfileDir,
+  resolveChromeBackgroundLaunch,
+  resolveChromeProfileDirForChrome,
   resolveConfigDir,
   resolveKnownHostsPath,
   resolveProfilesDir,
@@ -12,6 +14,7 @@ import {
 } from '../config/paths.js'
 import { loadProject } from '../config/project-loader.js'
 import { openConsoleSession, type ConsoleSession } from '../console/channel-factory.js'
+import { createInstanceListActions } from '../console/instance-list.js'
 import { CONSOLE_INSTANCE_LIST_URL } from '../console/selectors.js'
 import type { Profile } from '../domain/profile.js'
 import type { Project } from '../domain/project.js'
@@ -19,6 +22,11 @@ import { ConfigError } from '../errors.js'
 import { createStderrLogger, type Logger } from '../logging/logger.js'
 import { AUTODL_CAPABILITIES, AUTODL_PROVIDER_ID, openAutodlProvider } from '../providers/autodl/runtime.js'
 import type { Provider, ProviderCapabilities } from '../providers/provider.js'
+import {
+  createShellPort,
+  DEFAULT_SHELL_CONNECT_TIMEOUT_MS,
+} from '../ssh/shell-channel.js'
+import type { SshShellPort } from '../ssh/ports.js'
 import type { StateStore } from '../state/ports.js'
 import { createStateStore } from '../state/store.js'
 import { systemClock, type Clock } from '../util/clock.js'
@@ -52,6 +60,17 @@ export interface ProviderSession {
   close(): Promise<void>
 }
 
+/**
+ * 一次终端通道会话。
+ *
+ * `shell` 只提供「开一条 shell」这一个动作。关闭会话即释放浏览器通道；
+ * SSH 会话本身的关闭由返回的 `InteractiveShellSession.close()` 负责。
+ */
+export interface ShellSession {
+  readonly shell: SshShellPort
+  close(): Promise<void>
+}
+
 /** provider 的静态能力声明。它不打开浏览器，`plan create` 靠它做前置校验。 */
 export interface ProviderCapabilityDeclaration {
   readonly id: string
@@ -82,6 +101,13 @@ export interface CliDependencies {
   openProvider(options: { readonly logDir: string }): Promise<ProviderSession>
   /** 打开控制台通道，只给 `login` 用。 */
   openConsoleSession(): Promise<ConsoleSession>
+  /**
+   * 打开交互式终端通道。
+   *
+   * 每调用一次都要给定本次会话的证据目录与终端类型。它内部会先读实例状态，
+   * 实例不在运行中即抛 `InstanceNotRunningError`（退出码 1），不建立 SSH 连接。
+   */
+  openShell(options: { readonly logDir: string; readonly term: string }): Promise<ShellSession>
   /** 读 provider 能力声明。不连浏览器。未知 provider 即抛错。 */
   readProviderCapabilities(providerId: string): ProviderCapabilityDeclaration
   /** 创建状态存储。每次调用一个新实例，全部指向同一个状态目录。 */
@@ -128,6 +154,17 @@ export function createRealCliDependencies(
     },
   }
 
+  // WSL 下 profile 要落 Windows 本地磁盘。Windows 目录只能问一次 cmd.exe，结果缓存起来。
+  let chromeProfileDirPromise: Promise<string> | undefined
+  const resolveChromeProfileDir = (): Promise<string> => {
+    chromeProfileDirPromise ??= probeWindowsProfileRoot(env).then((windowsRoot) =>
+      resolveChromeProfileDirForChrome(env, process.platform, windowsRoot),
+    )
+    return chromeProfileDirPromise
+  }
+  // 启动期校验：非法取值在这里崩，不等到第一次开浏览器。
+  const backgroundLaunch = resolveChromeBackgroundLaunch(env)
+
   return {
     configDir,
     stateDir,
@@ -141,7 +178,8 @@ export function createRealCliDependencies(
       const runtime = await openAutodlProvider({
         consoleUrl: CONSOLE_INSTANCE_LIST_URL,
         cdpPort: resolveCdpPort(env),
-        chromeProfileDir: resolveChromeProfileDir(env),
+        chromeProfileDir: await resolveChromeProfileDir(),
+        backgroundLaunch,
         knownHostsPath: resolveKnownHostsPath(stateDir),
         logDir,
         stateDir,
@@ -159,13 +197,54 @@ export function createRealCliDependencies(
       }
     },
 
-    openConsoleSession: async () =>
-      await openConsoleSession({
+    openConsoleSession: async () => {
+      return await openConsoleSession({
         consoleUrl: CONSOLE_INSTANCE_LIST_URL,
         port: resolveCdpPort(env),
-        chromeProfileDir: resolveChromeProfileDir(env),
+        chromeProfileDir: await resolveChromeProfileDir(),
+        backgroundLaunch,
         logger,
-      }),
+      })
+    },
+
+    openShell: async ({ logDir, term }) => {
+      const session = await openConsoleSession({
+        consoleUrl: CONSOLE_INSTANCE_LIST_URL,
+        port: resolveCdpPort(env),
+        chromeProfileDir: await resolveChromeProfileDir(),
+        backgroundLaunch,
+        logger,
+      })
+      // 未登录时直接抛 LoginRequiredError：此时不返回端口，调用方无从建立任何连接。
+      await session.ensureLoggedIn()
+      const shell = createShellPort({
+        context: {
+          channel: session.channel,
+          logDir,
+          timeoutMs: CONSOLE_ACTION_TIMEOUT_MS,
+          pollIntervalMs: CONSOLE_POLL_INTERVAL_MS,
+          clock,
+          logger,
+          instances: createInstanceListActions({
+            channel: session.channel,
+            logDir,
+            timeoutMs: CONSOLE_ACTION_TIMEOUT_MS,
+            pollIntervalMs: CONSOLE_POLL_INTERVAL_MS,
+            clock,
+            logger,
+          }),
+        },
+        knownHostsPath: resolveKnownHostsPath(stateDir),
+        connectTimeoutMs: DEFAULT_SHELL_CONNECT_TIMEOUT_MS,
+        term,
+      })
+      return {
+        shell,
+        close: async () => {
+          await session.close()
+        },
+      }
+    },
 
     readProviderCapabilities: (providerId) => {
       if (providerId === AUTODL_PROVIDER_ID) {

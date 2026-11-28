@@ -3,7 +3,12 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { ConsoleChannel } from '../../console/ports.js'
 import { ConfigError } from '../../errors.js'
-import { createAutodlProvider, openAutodlProvider, type AutodlProviderOptions } from './runtime.js'
+import {
+  assertProviderOptions,
+  createAutodlProvider,
+  openAutodlProvider,
+  type AutodlProviderOptions,
+} from './runtime.js'
 
 /**
  * provider 装配。
@@ -93,7 +98,7 @@ describe('createAutodlProvider', () => {
     expect(provider.capabilities).toEqual({
       create: true,
       powerCycle: true,
-      noGpuMode: false,
+      noGpuMode: true,
       timedShutdown: true,
       accessInfo: true,
       imageSnapshot: false,
@@ -140,6 +145,34 @@ describe('openAutodlProvider 的选项校验', () => {
     await expect(
       openAutodlProvider(makeOptions(parent, { chromeProfileDir: 'relative/chrome-profile' })),
     ).rejects.toBeInstanceOf(ConfigError)
+  })
+
+  it('Windows 盘符路径算绝对路径，不抛 ConfigError', async () => {
+    // WSL 下 Chrome 的 user-data-dir 必须落 Windows 本地磁盘，取值天然是 `C:\...`。
+    // 用 POSIX 的 isAbsolute 判它恒为假，会把唯一可用的取值判成非法，
+    // 回退到状态目录又被 9p 检查拒绝 —— 两条路都走不通，控制台命令全部失败。
+    //
+    // 只测选项校验这层纯函数：`openAutodlProvider` 会连真实 Chrome，
+    // 自动测试不得触发外部进程。
+    const parent = await createTemporaryParent()
+
+    expect(() =>
+      assertProviderOptions(
+        makeOptions(parent, {
+          chromeProfileDir: 'C:\\Users\\example\\AppData\\Local\\deploydeck\\chrome-profile',
+        }),
+      ),
+    ).not.toThrow()
+  })
+
+  it('Windows 盘符路径以后斜杠写也认，反斜杠与正斜杠等价', async () => {
+    const parent = await createTemporaryParent()
+
+    expect(() =>
+      assertProviderOptions(
+        makeOptions(parent, { chromeProfileDir: 'C:/Users/example/AppData/Local/deploydeck/chrome-profile' }),
+      ),
+    ).not.toThrow()
   })
 
   it('known-hosts 落在状态目录外时抛 ConfigError', async () => {

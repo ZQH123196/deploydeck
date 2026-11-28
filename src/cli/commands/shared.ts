@@ -37,6 +37,11 @@ export function createCommandStores(context: CommandContext): CommandStores {
   }
 }
 
+/** 开机形态的人读写法。人读输出只做展示，取值本身不进这个函数。 */
+export function formatPowerOnMode(mode: Profile['powerOnMode']): string {
+  return mode === 'no-gpu' ? '无卡' : '有卡'
+}
+
 /** 按 id 取部署配置。找不到即抛错并列出可用 id，不猜。 */
 export function requireProfile(profiles: readonly Profile[], profileId: string): Profile {
   const profile = profiles.find((candidate) => candidate.id === profileId)

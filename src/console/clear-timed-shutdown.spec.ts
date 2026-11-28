@@ -37,6 +37,7 @@ function createSnapshot(timedShutdownAt: string | null): ConsoleInstanceSnapshot
     balanceWarning: null,
     timedShutdownAt,
     sshCommand: null,
+    noGpuMode: null,
   }
 }
 

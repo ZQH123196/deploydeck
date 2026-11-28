@@ -15,6 +15,11 @@
   "regionPreference": [],
   "cloneDataDisk": true,
 
+  // 开机形态：无卡模式。开发与测试优先走它。
+  // 判据：无卡模式不占 GPU，单价低，主机没有空闲 GPU 也一定能开机。
+  // asyncProxyServer 是纯 CPU 的异步 TTS 代理，不需要算力。
+  "powerOnMode": "no-gpu",
+
   // 克隆源实例：走克隆路径时以这台已关机实例为模板。写名字或实例 ID 都可以。
   // 首次运行前，控制台里必须已经有一台同名、已关机的实例。
   "cloneSourceInstanceName": "asyncproxy-dev",

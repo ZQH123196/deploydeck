@@ -14,6 +14,8 @@ import { ConfigError } from '../../errors.js'
 import type { Logger } from '../../logging/logger.js'
 import type { Provider, ProviderCapabilities } from '../provider.js'
 import { createSshPort } from '../../ssh/channel.js'
+import { createShellPort, DEFAULT_SHELL_CONNECT_TIMEOUT_MS } from '../../ssh/shell-channel.js'
+import type { SshShellPort } from '../../ssh/ports.js'
 import type { Clock } from '../../util/clock.js'
 import { assertPositiveInteger, isInsideOrEqual } from '../../util/validate.js'
 
@@ -35,8 +37,8 @@ export const AUTODL_PROVIDER_ID = 'autodl'
 /**
  * AutoDL 的能力声明。
  *
- * `noGpuMode: false`：控制台能人工用无卡模式开机，但 deploydeck 不使用这条路径
- * （无卡模式由人显式触发，spec 第 7.2 节）。声明为 false 表示「引擎不会走它」，
+ * `noGpuMode: true`：控制台「更多」里有「无卡模式开机」，deploydeck 能走这条路径。
+ * 是否真的走它由部署配置的 `powerOnMode` 决定，引擎不得自行降级或升级。
  * 与 docs/provider-contract.md 第 2 节的能力表一致。
  *
  * `imageSnapshot: false`：控制台有「保存镜像」，但 Phase 2 不做镜像构建，端口也没有对应动作。
@@ -45,7 +47,7 @@ export const AUTODL_PROVIDER_ID = 'autodl'
 export const AUTODL_CAPABILITIES: ProviderCapabilities = {
   create: true,
   powerCycle: true,
-  noGpuMode: false,
+  noGpuMode: true,
   timedShutdown: true,
   accessInfo: true,
   imageSnapshot: false,
@@ -82,6 +84,10 @@ export interface AutodlProviderOptions {
   readonly timeoutMs: number
   /** 等状态变化时的轮询间隔。 */
   readonly pollIntervalMs: number
+  /** 启动 Chrome 时不抢前台。默认 false。真机测试必须置 true。 */
+  readonly backgroundLaunch?: boolean
+  /** 是否由 WSL 启动 Windows Chrome。真机测试必须显式给 true。 */
+  readonly wsl?: boolean
   /** 注入时钟。测试用；真实运行不传。 */
   readonly clock?: Clock
   readonly logger?: Logger
@@ -89,6 +95,13 @@ export interface AutodlProviderOptions {
 
 export interface AutodlRuntime {
   readonly provider: Provider
+  /**
+   * 交互式终端端口。
+   *
+   * 它不进 `Provider`：`Provider` 是执行引擎的依赖，引擎只跑非交互命令。
+   * 终端是给人用的入口，走自己的端口，引擎拿不到它也就不会误用。
+   */
+  readonly shell: SshShellPort
   readonly session: ConsoleSession
   /** 关闭通道。不关闭浏览器：登录态要留到下一次运行。 */
   close(): Promise<void>
@@ -107,6 +120,8 @@ export async function openAutodlProvider(options: AutodlProviderOptions): Promis
     consoleUrl: options.consoleUrl,
     port: options.cdpPort,
     chromeProfileDir: options.chromeProfileDir,
+    backgroundLaunch: options.backgroundLaunch ?? false,
+    ...(options.wsl === undefined ? {} : { wsl: options.wsl }),
     ...(options.logger === undefined ? {} : { logger: options.logger }),
   })
 
@@ -127,8 +142,23 @@ export async function openAutodlProvider(options: AutodlProviderOptions): Promis
     ...(options.logger === undefined ? {} : { logger: options.logger }),
   })
 
+  const shellContext: ConsoleActionContext = {
+    channel: session.channel,
+    logDir: options.logDir,
+    timeoutMs: options.timeoutMs,
+    pollIntervalMs: options.pollIntervalMs,
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+  }
+  const shell = createShellPort({
+    context: { ...shellContext, instances: createInstanceListActions(shellContext) },
+    knownHostsPath: options.knownHostsPath,
+    connectTimeoutMs: DEFAULT_SHELL_CONNECT_TIMEOUT_MS,
+  })
+
   return {
     provider,
+    shell,
     session,
     close: async () => {
       await session.close()
@@ -185,7 +215,7 @@ export function createAutodlProvider(input: AutodlProviderInput): Provider {
     id: AUTODL_PROVIDER_ID,
     capabilities: AUTODL_CAPABILITIES,
     listInstances: async (options) => await instances.listInstances(options),
-    powerOn: async (instanceId) => await power.powerOn(instanceId),
+    powerOn: async (instanceId, mode) => await power.powerOn(instanceId, mode),
     powerOff: async (instanceId) => await power.powerOff(instanceId),
     readCloneQuota: async (sourceInstanceId) => await clone.readCloneQuota(sourceInstanceId),
     clone: async (request) => await clone.clone(request),
@@ -203,7 +233,7 @@ export function createAutodlProvider(input: AutodlProviderInput): Provider {
 /**
  * 选项校验。装配错误一律在这里崩：迟到的报错会伪装成控制台或 SSH 的问题。
  */
-function assertProviderOptions(options: AutodlProviderOptions): void {
+export function assertProviderOptions(options: AutodlProviderOptions): void {
   assertHttpUrl(options.consoleUrl, 'consoleUrl')
   if (!Number.isInteger(options.cdpPort) || options.cdpPort < 1 || options.cdpPort > 65535) {
     throw new ConfigError(`cdpPort 必须是 1-65535 的整数，当前值：${String(options.cdpPort)}。`)
@@ -246,11 +276,19 @@ function assertHttpUrl(value: string, label: string): void {
   }
 }
 
+/** Windows 盘符绝对路径，例如 `C:\Users\x\y` 或 `C:/Users/x/y`。 */
+const WINDOWS_ABSOLUTE_PATH = /^[A-Za-z]:[\\/]/
+
+/**
+ * WSL 下 Chrome 的 user-data-dir 必须落 Windows 本地磁盘，取值天然是 Windows 路径。
+ * 用 POSIX 的 `isAbsolute` 判它恒为假，会把唯一可用的取值判成非法。
+ * 判据：POSIX 绝对路径与 Windows 盘符路径都算绝对。
+ */
 function assertAbsolutePath(value: string, label: string): void {
   if (value.trim().length === 0) {
     throw new ConfigError(`${label} 不能为空。`)
   }
-  if (!isAbsolute(value)) {
+  if (!isAbsolute(value) && !WINDOWS_ABSOLUTE_PATH.test(value)) {
     throw new ConfigError(`${label} 必须是绝对路径，当前值：${value}。`)
   }
 }

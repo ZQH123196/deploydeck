@@ -24,6 +24,14 @@ export async function runLoginCommandWithDependencies(
       consoleUrl: context.deps.consoleUrl,
       timeoutMs: options.timeoutSeconds * 1000,
       clock: context.deps.clock,
+      onWaitStart: ({ timeoutMs }) => {
+        // 界面命令要给可见反馈：不给提示时，等 300 秒看起来就是卡住了。
+        writeLine(
+          context.deps.stderr,
+          `已打开专用 Chrome 窗口，请在窗口里完成 AutoDL 登录。` +
+            `最多等待 ${String(Math.round(timeoutMs / 1000))} 秒。`,
+        )
+      },
     })
     if (context.json) {
       writeJson(context.deps.stdout, result)

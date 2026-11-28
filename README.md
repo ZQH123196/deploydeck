@@ -41,10 +41,13 @@ Phase 2 命令面已接通，真机全链路已实测通过（2026-11-25，AutoD
 | `status`：生效计划、实例状态、单价、花费、账本摘要 | 可用 |
 | `teardown`：销毁、终态验证、账本结算、计划关闭 | 可用 |
 | `login`：打开专用 Chrome 等人登录 | 可用 |
-| `guard`：计划层守护（过期计划销毁、预算熔断、余额告警） | 可用；系统级自启动属 Phase 3 |
+| `shell`：连到运行中实例的交互式终端（PTY），也支持在 PTY 里跑单条命令 | 可用 |
+| 无卡模式开机（`powerOnMode: no-gpu`） | 可用；真机未验证 |
+| `guard`：计划层守护（过期计划销毁、预算熔断、余额告警） | 可用；系统级自启动未实现 |
 | AutoDL provider：控制台动作 + SSH 数据面 | 已接入 |
 | 首批接入样例：asyncProxyServer | 配置就绪；部署脚本与真机未验证 |
-| `plan extend` / `ledger` | 未实现（Phase 3） |
+| `plan extend` / `ledger` | 未实现 |
+| `guard` 系统级自启动 | 未实现 |
 
 未实现的命令打印 `[NOT IMPLEMENTED]`，退出码 2。
 
@@ -57,9 +60,12 @@ Phase 2 命令面已接通，真机全链路已实测通过（2026-11-25，AutoD
 | 常规单测 | `pnpm test` | `src/**/*.spec.ts`，全部假通道，几百毫秒 | 否 |
 | 真机测试 | `pnpm test:e2e` | `e2e/**/*.e2e.test.ts`，连真实控制台与 SSH | **是** |
 
-真机测试会开关机、克隆、释放真实实例。它默认不跑，且必须过授权闸门：三个环境变量
-（开关、源实例 ID、批准的元数）缺一个就拒绝，不做任何控制台动作。
+真机测试会开关机、克隆、释放真实实例，耗时较长。它与常规测试完全分开：
+`pnpm test` 永远不跑它，只能经 `pnpm test:e2e` 显式触发，且必须给三个环境变量
+（开关、源实例 ID、批准的花费额度），缺一个就拒绝，不做任何控制台动作。
 预计花费与授权命令见 `e2e/README.md`。
+
+真机测试的浏览器与人正在用的 Chrome 完全分开：它用独立的 e2e profile，并且后台启动。
 
 ## 快速开始
 
@@ -82,7 +88,9 @@ pnpm dev -- --help
 | `DEPLOYDECK_CONFIG_DIR` | `~/.config/deploydeck` | 存放 `profiles/` 与 `projects/` |
 | `DEPLOYDECK_STATE_DIR` | `~/.local/state/deploydeck` | 存放计划、运行记录、账本、日志 |
 | `DEPLOYDECK_CDP_PORT` | `9222` | 专用 Chrome 的 CDP 端口 |
-| `DEPLOYDECK_CHROME_PROFILE_DIR` | `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir。落状态目录：Chrome 会往里写登录态，配置目录机器只读 |
+| `DEPLOYDECK_CHROME_PROFILE_DIR` | WSL 下 `%LOCALAPPDATA%\deploydeck\chrome-profile`，其余 `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir。不落配置目录：Chrome 会往里写登录态，配置目录机器只读。WSL 下必须落 Windows 本地磁盘，`\\wsl.localhost` 上的 LevelDB 加锁失败会让登录态写不进磁盘 |
+| `DEPLOYDECK_CHROME_LAUNCH_BACKGROUND` | `0` | 后台启动 Chrome：窗口最小化、不抢前台。只支持 WSL 调 Windows Chrome；其他平台置 `1` 会直接报错 |
+| `DEPLOYDECK_WINDOWS_PROFILE_ROOT` | `%LOCALAPPDATA%` | WSL 下 Chrome profile 的 Windows 根目录 |
 | `DEPLOYDECK_CHROME_EXECUTABLE` | 按平台自动查找 | 专用 Chrome 可执行文件绝对路径。自动查找失败时用它指定 |
 | `DEPLOYDECK_BALANCE_WARN_BELOW_YUAN` | 无默认值 | 余额告警阈值，元。只有 `guard` 需要；不配置时 `guard` 启动即报错 |
 
@@ -142,7 +150,8 @@ DEPLOYDECK_BALANCE_WARN_BELOW_YUAN=20 deploydeck guard --once
 ## 文档
 
 - [操作手册](docs/OPERATIONS.md) —— 外部项目怎么接入、怎么跑、机器读者怎么调。**只看一份就从这里开始**
-- [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 本期的设计与验收标准
+- [Phase 2 spec](docs/specs/deploydeck-phase2.md) —— 部署链路的设计与验收标准
+- [Phase 3 spec](docs/specs/deploydeck-phase3-shell.md) —— 交互式终端与无卡模式开机
 - [施工工单](docs/tickets/) —— 按依赖序编号
 - [CLI 命令面](docs/cli.md) —— 命令、参数、`--json` 输出形状、退出码、例行操作
 - [状态目录布局](docs/state-layout.md) —— 计划、执行记录、账本、日志、锁的落点与格式

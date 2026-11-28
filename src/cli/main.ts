@@ -15,9 +15,11 @@ import { DEFAULT_GUARD_INTERVAL_MINUTES, runGuardCommand } from './commands/guar
 import type { CommandContext } from './commands/shared.js'
 import { runLoginCommandWithDependencies } from './commands/login.js'
 import { DEFAULT_LOGIN_TIMEOUT_SECONDS } from '../console/login.js'
+import { DEFAULT_TERM } from '../ssh/shell-channel.js'
 import { runPlanCreateCommand, runPlanShowCommand } from './commands/plan.js'
 import { runProfileListCommand } from './commands/profile-list.js'
 import { runRunCommand } from './commands/run.js'
+import { runShellCommand } from './commands/shell.js'
 import { readPositiveIntegerOption } from './commands/shared.js'
 import { runStatusCommand } from './commands/status.js'
 import { runTeardownCommand } from './commands/teardown.js'
@@ -188,6 +190,40 @@ function registerRunCommands(program: Command, deps: CliDependencies): void {
   })
 }
 
+/**
+ * `shell`：连到运行中实例的交互式终端。
+ *
+ * 两种形态：只给实例 ID 即开交互式 shell；给 `--` 之后的命令即跑一条命令。
+ * 终端流直接取自 `process`，不经注入的输出抽象：交互形态必须把远端字节原样写进真实终端。
+ */
+function registerShellCommand(program: Command, deps: CliDependencies): void {
+  withJsonOption(
+    program
+      .command('shell <instanceId> [command...]')
+      .description(
+        '连到运行中实例的交互式终端。给 -- 之后的命令时在 PTY 里执行该命令并返回退出码。',
+      )
+      .option('--term <term>', '终端类型，写进远端 $TERM', DEFAULT_TERM),
+  ).action(
+    async (
+      instanceId: string,
+      commandParts: readonly string[],
+      commandOptions: { readonly term?: string },
+      command: Command,
+    ) => {
+      await runShellCommand(
+        contextOf(deps, command),
+        {
+          instanceId,
+          command: commandParts.length === 0 ? null : commandParts.join(' '),
+          term: commandOptions.term ?? DEFAULT_TERM,
+        },
+        { stdin: process.stdin, stdout: process.stdout },
+      )
+    },
+  )
+}
+
 function registerLoginCommand(program: Command, deps: CliDependencies): void {
   withJsonOption(
     program
@@ -226,6 +262,7 @@ export function buildProgram(deps: CliDependencies): Command {
   registerProfileCommands(program, deps)
   registerPlanCommands(program, deps)
   registerRunCommands(program, deps)
+  registerShellCommand(program, deps)
   registerLoginCommand(program, deps)
 
   return program

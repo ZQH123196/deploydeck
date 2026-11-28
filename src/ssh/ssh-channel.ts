@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { Client, type ClientChannel, type ConnectConfig } from 'ssh2'
-import { DeploydeckError, SshError } from '../errors.js'
+import { ConfigError, DeploydeckError, SshError } from '../errors.js'
 import type {
   SshConnectRequest,
   SshSession,
@@ -8,6 +8,13 @@ import type {
   SshSessionExecHandlers,
   SshSessionExecOutcome,
 } from './channel.js'
+import type {
+  InteractiveShellSession,
+  OpenShellOptions,
+  ShellSessionHandlers,
+  ShellSessionOutcome,
+  TerminalSize,
+} from './ports.js'
 
 /**
  * ssh2 适配层。
@@ -236,4 +243,199 @@ function describeFailure(error: Error): string {
 function formatTarget(request: SshConnectRequest): string {
   // user 与 host 都不是秘密；密码永远不进来。
   return `${request.user}@${request.host}:${request.port}`
+}
+
+/* ------------------------------------------------------------------ */
+/* 交互式 shell（PTY）                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 打开一条带 PTY 的 shell 通道。
+ *
+ * 判据：PTY 是硬性要求，不允许 `shell(false)` 的降级形态。
+ * 没有 PTY 时远端不会回显、不处理方向键、`sudo` 与 `apt install` 的确认提示全部走不通，
+ * 那等于给用户一个看起来像终端、实际不能用的东西。
+ */
+export async function connectShellWithSsh2(
+  request: SshConnectRequest,
+  handlers: ShellSessionHandlers,
+  options: OpenShellOptions,
+): Promise<InteractiveShellSession> {
+  assertTerminalSize(options.size)
+  const client = new Client()
+  let connectionFailure: Error | undefined
+  let verificationFailure: unknown
+
+  // 错误监听必须在 connect 之前挂上：认证失败后的 error 事件没人接会让进程崩。
+  client.on('error', (error: Error) => {
+    connectionFailure ??= error
+  })
+
+  const connectConfig: ConnectConfig = {
+    host: request.host,
+    port: request.port,
+    username: request.user,
+    password: request.password,
+    readyTimeout: request.timeoutMs,
+    hostVerifier: (hostPublicKey: Buffer, verify: (valid: boolean) => void) => {
+      const fingerprint = toOpenSshSha256Fingerprint(hostPublicKey)
+      request.verifyHostKey(fingerprint).then(
+        () => {
+          verify(true)
+        },
+        (error: unknown) => {
+          verificationFailure = error
+          verify(false)
+        },
+      )
+    },
+  }
+
+  const ready = new Promise<void>((resolve, reject) => {
+    client.once('ready', () => {
+      resolve()
+    })
+    client.once('error', (error: Error) => {
+      reject(mapConnectFailure(error, request, verificationFailure))
+    })
+    client.once('close', () => {
+      reject(new SshError('SSH_CONNECT_FAILED', `SSH 连接在认证完成前关闭：${formatTarget(request)}。`))
+    })
+    client.connect(connectConfig)
+  })
+
+  try {
+    await ready
+  } catch (error: unknown) {
+    client.end()
+    client.destroy()
+    throw error
+  }
+
+  const channel = await new Promise<ClientChannel>((resolve, reject) => {
+    client.shell(
+      {
+        rows: options.size.rows,
+        cols: options.size.columns,
+        term: options.term,
+      },
+      (error: Error | undefined, shellChannel: ClientChannel) => {
+        if (error !== undefined) {
+          reject(mapSessionFailure(error))
+          return
+        }
+        resolve(shellChannel)
+      },
+    )
+  }).catch((error: unknown) => {
+    client.end()
+    client.destroy()
+    throw error instanceof DeploydeckError
+      ? error
+      : mapSessionFailure(error instanceof Error ? error : new Error(String(error)))
+  })
+
+  return createShellSession(client, channel, handlers, () => connectionFailure)
+}
+
+function createShellSession(
+  client: Client,
+  channel: ClientChannel,
+  handlers: ShellSessionHandlers,
+  getConnectionFailure: () => Error | undefined,
+): InteractiveShellSession {
+  let exitCode: number | null = null
+  let receivedExitStatus = false
+  let transportFailure: string | null = null
+  let settled = false
+  let closed = false
+  let resolveWait: (outcome: ShellSessionOutcome) => void = () => undefined
+  const waitPromise = new Promise<ShellSessionOutcome>((resolve) => {
+    resolveWait = resolve
+  })
+
+  const settle = (): void => {
+    if (settled) {
+      return
+    }
+    settled = true
+    resolveWait({
+      exitCode: receivedExitStatus ? exitCode : null,
+      transportFailure,
+    })
+  }
+
+  channel.on('data', (chunk: Buffer) => {
+    handlers.onData(chunk)
+  })
+  // PTY 下 stderr 已经合流到 stdout 通道；这里仍然订阅，
+  // 因为非 PTY 的极端情况下 ssh2 会把错误写进 stderr。
+  channel.stderr.on('data', (chunk: Buffer) => {
+    handlers.onData(chunk)
+  })
+  channel.on('exit', (code?: number | null) => {
+    receivedExitStatus = true
+    exitCode = typeof code === 'number' ? code : null
+  })
+  channel.on('close', () => {
+    const failure = getConnectionFailure()
+    if (failure !== undefined && !receivedExitStatus) {
+      transportFailure = describeFailure(failure)
+    }
+    settle()
+  })
+  channel.on('error', (streamError: Error) => {
+    transportFailure = describeFailure(streamError)
+    settle()
+  })
+
+  const close = (): void => {
+    if (closed) {
+      return
+    }
+    closed = true
+    channel.close()
+    channel.destroy()
+    client.end()
+    client.destroy()
+    // 关闭后连接中断可能不再触发 close，直接把终态交出，避免 wait 永远挂着。
+    if (transportFailure === null && !receivedExitStatus) {
+      transportFailure = '会话被本地主动关闭'
+    }
+    settle()
+  }
+
+  return {
+    write(data: Buffer): void {
+      if (closed) {
+        return
+      }
+      channel.stdin.write(data)
+    },
+    resize(size: TerminalSize): void {
+      if (closed) {
+        return
+      }
+      assertTerminalSize(size)
+      channel.setWindow(size.rows, size.columns, 0, 0)
+    },
+    async wait(): Promise<ShellSessionOutcome> {
+      return await waitPromise
+    },
+    async close(): Promise<void> {
+      close()
+    },
+  }
+}
+
+/** 窗口尺寸必须是正整数。0 列或 0 行会让远端排版出空终端。 */
+function assertTerminalSize(size: TerminalSize): void {
+  for (const [name, value] of [
+    ['columns', size.columns],
+    ['rows', size.rows],
+  ] as const) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new ConfigError(`终端 ${name} 必须是正整数，收到 ${String(value)}。`)
+    }
+  }
 }

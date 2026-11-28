@@ -1,6 +1,6 @@
 # CLI 命令面
 
-> 契约来源：[Phase 2 spec](specs/deploydeck-phase2.md) 第 12 节与各工单验收。
+> 契约来源：[Phase 2 spec](specs/deploydeck-phase2.md) 第 12 节、[Phase 3 spec](specs/deploydeck-phase3-shell.md) 第 3 与第 4 节、各工单验收。
 > 实现入口：`src/cli/main.ts`；命令实现：`src/cli/commands/`；依赖装配：`src/cli/dependencies.ts`。
 > 退出码与错误行格式见本文第 5 节。操作步骤版见 [操作手册](OPERATIONS.md)。
 
@@ -36,8 +36,10 @@ deploydeck status --json
 | `DEPLOYDECK_CONFIG_DIR` | `~/.config/deploydeck` | 配置目录 |
 | `DEPLOYDECK_STATE_DIR` | `~/.local/state/deploydeck` | 状态目录 |
 | `DEPLOYDECK_CDP_PORT` | `9222` | 专用 Chrome 的 CDP 端口 |
-| `DEPLOYDECK_CHROME_PROFILE_DIR` | `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir |
+| `DEPLOYDECK_CHROME_PROFILE_DIR` | WSL 下 `%LOCALAPPDATA%\deploydeck\chrome-profile`，其余 `<状态目录>/chrome-profile` | 专用 Chrome 的 user-data-dir |
+| `DEPLOYDECK_CHROME_LAUNCH_BACKGROUND` | `0` | 后台启动 Chrome：窗口最小化、不抢前台。只支持 WSL 调 Windows Chrome；其他平台置 `1` 会直接报错 |
 | `DEPLOYDECK_CHROME_EXECUTABLE` | 按平台查找 | 专用 Chrome 可执行文件绝对路径 |
+| `DEPLOYDECK_WINDOWS_PROFILE_ROOT` | `%LOCALAPPDATA%` | WSL 下 Chrome profile 的 Windows 根目录 |
 | `DEPLOYDECK_BALANCE_WARN_BELOW_YUAN` | 无 | 余额告警阈值（元）。`guard` 必填，不配则启动报错 |
 
 配置目录下 `profiles/<id>.jsonc` 与 `projects/<id>.jsonc` 分别放部署配置与项目清单。
@@ -55,6 +57,8 @@ deploydeck status --json
 | `teardown <planId>` | 销毁计划绑定的实例，确认消失后写账本并关闭计划 |
 | `login` | 打开专用 Chrome，等人登录完成 |
 | `guard` | 前台常驻守护：过期计划销毁、预算熔断、余额告警 |
+| `shell <instanceId>` | 连到运行中实例的交互式终端 |
+| `shell <instanceId> -- <command>` | 在 PTY 里跑一条命令并返回退出码 |
 | `plan extend` | 未实现（Phase 3），退出码 2 |
 | `ledger` | 未实现（Phase 3），退出码 2 |
 
@@ -67,6 +71,9 @@ deploydeck profile list [--json]
 ```
 
 读 `<配置目录>/profiles/`。任一文件非法时一次报完全部问题，退出码 2。
+
+人读输出一行一份配置，列：ID、项目、provider、开机形态、时长、预算、失败后策略、是否锁定 commit。
+开机形态列写「有卡」或「无卡」，对应 Profile 的 `powerOnMode`。
 
 `--json` 输出形状：
 
@@ -326,6 +333,65 @@ deploydeck guard [--interval-minutes <n>] [--once] [--json]
 }
 ```
 
+### 2.9 `shell`
+
+```bash
+deploydeck shell <instanceId> [--term <term>] [--json]
+deploydeck shell <instanceId> -- <command...>
+```
+
+两种形态：
+
+| 形态 | 判据 | 需要本地 tty |
+|---|---|---|
+| 交互 | 没给 `--` 之后的命令 | 是 |
+| 非交互 | 给了 `--` 之后的命令 | 否 |
+
+**连接前置校验**（顺序固定，任一步不过都不建立 SSH 连接）：
+
+1. 交互形态先查本地 tty。不是 tty 抛 `INTERACTIVE_TERMINAL_REQUIRED`（退出码 2）。
+2. 打开控制台通道并判登录态。未登录抛 `LOGIN_REQUIRED`（退出码 2）。
+3. 读实例列表。实例不在列表抛 `INSTANCE_NOT_FOUND`（退出码 1）。
+4. 判实例状态。不是运行中抛 `INSTANCE_NOT_RUNNING`（退出码 1）。
+
+**不做的检查**：
+
+- 不校验计划。计划外手工开机的实例照样能连。
+- 不读单价、不设定时关机、不写账本、不改执行记录。
+- 不自动开机。要连已关机实例，先自己把它开起来。
+
+**会话行为**：
+
+1. 分配 PTY（`$TERM` 由 `--term` 给出，默认 `xterm-256color`）。
+2. 窗口尺寸跟随本地终端。本地终端改变尺寸时通知远端。
+3. 主机密钥指纹校验规则与 `run` 完全一致：首次记录，变化即 `HOST_KEY_CHANGED`（退出码 2）。
+4. 交互形态下远端字节直接写进真实终端，不写进 stdout 抽象。stdin 直接转发给远端。
+
+**退出码**：
+
+| 情况 | 退出码 |
+|---|---|
+| 会话正常结束 | 远端 shell 的退出码 |
+| 非交互形态下远端命令退出码非 0 | 远端退出码（经 `ShellFailedError` 转成 0/1/2 由 `errors.ts` 裁决） |
+| 没拿到远端退出码（连接中断等） | 2（`SHELL_FAILED`） |
+| 没有本地 tty（交互形态） | 2（`INTERACTIVE_TERMINAL_REQUIRED`） |
+| 实例不在运行中 | 1（`INSTANCE_NOT_RUNNING`） |
+
+判据：没拿到退出码不得当 0。远端命令是否执行完未知，必须人工核对。
+
+**`--json` 输出形状**（只与非交互形态一起用）：
+
+```json
+{
+  "instanceId": "af9c49bd44-8ee624d7",
+  "command": "apt-get update",
+  "exitCode": 0,
+  "transportFailure": null
+}
+```
+
+判据：交互形态与 `--json` 互斥，同时给出即抛 `SHELL_FAILED`（退出码 2）。
+
 ## 3. 例行操作
 
 ### 3.1 首次准备
@@ -384,7 +450,7 @@ deploydeck status --json | jq '.plans[] | { planId, instanceId, spentYuan }'
 |---|---|---|
 | 0 | 成功 | 命令完成并能读到结果 |
 | 1 | 业务失败 | 计划不存在或已过期、脚本失败、预算不足、健康检查失败 |
-| 2 | 需要人工 | 配置非法、未登录、克隆超时、实例未确认消失、克隆配额耗尽、命令未实现 |
+| 2 | 需要人工 | 配置非法、未登录、克隆超时、实例未确认消失、克隆配额耗尽、命令未实现、没有本地 tty、终端会话丢失退出码 |
 
 错误类自带 `exitCode`（`src/errors.ts`），CLI 只透传，不另建映射表。
 

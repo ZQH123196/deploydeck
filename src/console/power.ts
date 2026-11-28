@@ -10,11 +10,23 @@ import { systemClock, type Clock } from '../util/clock.js'
 import { pollUntil } from '../util/poll.js'
 import { confirmMessageBoxIfAsked } from './confirm.js'
 import { jsString } from './dom.js'
+import type { LocatedMenuItemProbe } from './release.js'
+import {
+  buildLocateVisibleMenuItemScript,
+  parseVisibleMenuItemProbe,
+} from './release.js'
 import { buildVerifiedSelectorExpression } from './locate.js'
-import type { ConsoleChannel, ConsoleRuntimeContext, PowerOnOutcome, PowerPort } from './ports.js'
+import type {
+  ConsoleChannel,
+  ConsoleRuntimeContext,
+  PowerOnMode,
+  PowerOnOutcome,
+  PowerPort,
+} from './ports.js'
 import {
   CONSOLE_BUTTON_TAG,
   CONSOLE_NOTICE,
+  DROPDOWN_ITEM_TEXT,
   INSTANCE_BUTTON_TEXT,
   INSTANCE_LIST,
   INSTANCE_LIST_COLUMN,
@@ -49,6 +61,18 @@ const SCREENSHOT = {
 } as const
 
 const NOTICE_SELECTOR = `${CONSOLE_NOTICE.message}, ${CONSOLE_NOTICE.alert}`
+
+/** 「更多」菜单的打开等待上限与重试次数。与释放链取同一组经验值。 */
+const NO_GPU_MENU_OPEN_WAIT_MS = 5_000
+const NO_GPU_MENU_TOGGLE_ATTEMPTS = 2
+
+/**
+ * 「无卡模式开机」的二次确认。
+ *
+ * 实测未确认：控制台弹不弹确认框未知。按「弹了就点确定」处理，
+ * 与开机确认共用同一条实现；不弹也不报错。
+ */
+const NO_GPU_POWER_ON_CONFIRM = { questionPrefix: '确认' } as const
 
 /**
  * 页面提示条的文本。
@@ -322,20 +346,36 @@ export function createPowerActions(context: ConsoleRuntimeContext): PowerPort {
    * 由执行引擎决定是否改走克隆（spec 第 4 节）。找不到实例、页面结构不符、
    * 状态不可开机这三类事实异常仍然抛错：它们不是「开机失败」，不能静默降级成克隆。
    */
-  const powerOn = async (instanceId: string): Promise<PowerOnOutcome> => {
+  const powerOn = async (instanceId: string, mode: PowerOnMode): Promise<PowerOnOutcome> => {
     const initial = await findSnapshot(instanceId)
     if (initial.status !== 'stopped' && initial.status !== 'starting' && initial.status !== 'running') {
       throw new HumanRequiredError(
         `实例 ${instanceId} 当前状态为「${initial.statusRaw}」，无法执行开机。请在控制台确认后重试。`,
       )
     }
+    // 形态判定看状态格标记，不看状态词：无卡开机中的状态词是「开机中」，与有卡相同。
+    const wantedNoGpu = mode === 'no-gpu'
+    if (initial.status === 'running' && initial.noGpuMode !== null && initial.noGpuMode !== wantedNoGpu) {
+      // 运行中但形态不对。切换形态要先关机再开机，会打断正在跑的服务。
+      throw new HumanRequiredError(
+        `实例 ${instanceId} 正在以${initial.noGpuMode ? '无卡' : '有卡'}形态运行，` +
+          `与配置要求的${wantedNoGpu ? '无卡' : '有卡'}模式不一致。` +
+          '切换形态要先关机再开机，会打断正在跑的服务，deploydeck 不会替你重开。' +
+          '请人工决定：接受当前形态，或先关机后重试。',
+      )
+    }
+    // 已经在开机且形态正确：不重复点，直接等它起来。
 
     await screenshot(SCREENSHOT.powerOnBefore)
     if (initial.status === 'stopped') {
       const rowSelector = await locateRow(instanceId)
-      const buttonSelector = await locateButton(rowSelector, INSTANCE_BUTTON_TEXT.powerOn)
-      await channel.click(buttonSelector)
-      await confirmIfAsked(POWER_ON_CONFIRM.questionPrefix, INSTANCE_BUTTON_TEXT.powerOn)
+      if (mode === 'no-gpu') {
+        await startNoGpuPowerOn(rowSelector)
+      } else {
+        const buttonSelector = await locateButton(rowSelector, INSTANCE_BUTTON_TEXT.powerOn)
+        await channel.click(buttonSelector)
+        await confirmIfAsked(POWER_ON_CONFIRM.questionPrefix, INSTANCE_BUTTON_TEXT.powerOn)
+      }
     }
     await screenshot(SCREENSHOT.powerOnAfter)
 
@@ -353,7 +393,17 @@ export function createPowerActions(context: ConsoleRuntimeContext): PowerPort {
         const snapshot = await findSnapshot(instanceId)
         lastStatusRaw = snapshot.statusRaw
         if (snapshot.status === 'running') {
+          // 判据：形态要对着配置。有卡配置遇到无卡实例、无卡配置遇到有卡实例都不算成功。
+          // 形态要和配置一致。标记读不到（null）时按状态词判：控制台改文案时
+          // 不能静默当成「形态正确」，但也不该把一条真在跑的实例永远判成失败。
+          if (snapshot.noGpuMode !== null && snapshot.noGpuMode !== wantedNoGpu) {
+            return undefined
+          }
           return { kind: 'running' }
+        }
+        if (mode === 'no-gpu') {
+          // 无卡模式不依赖空闲 GPU，不存在「无可用 GPU」这一类失败。
+          return undefined
         }
         const hint = findNoGpuHint(await readPageState(instanceId))
         if (hint !== undefined) {
@@ -380,6 +430,47 @@ export function createPowerActions(context: ConsoleRuntimeContext): PowerPort {
         `实例 ${instanceId} 在 ${String(POWER_ON_TIMEOUT_MS / 60_000)} 分钟内未进入运行中` +
         `（最后状态：${lastStatusRaw}）。`,
     }
+  }
+
+  /**
+   * 无卡模式开机：点「更多」→「无卡模式开机」→ 必要时点确认。
+   *
+   * 判据（docs/refs/autodl/console-selectors.md 第 1.5 节）：
+   * 菜单项文字是「无卡模式开机」，它不在行内按钮里，只在「更多」下拉里。
+   * 菜单项按可见弹层定位，弹层归属判定复用释放链的同一份实现，不另写一套。
+   */
+  const startNoGpuPowerOn = async (rowSelector: string): Promise<void> => {
+    const moreSelector = await locateButton(rowSelector, INSTANCE_BUTTON_TEXT.more)
+    let lastProbeKind = 'no-visible-popper'
+    for (let attempt = 1; attempt <= NO_GPU_MENU_TOGGLE_ATTEMPTS; attempt += 1) {
+      await channel.click(moreSelector)
+      const outcome = await pollUntil<LocatedMenuItemProbe>({
+        description: `「${INSTANCE_BUTTON_TEXT.more}」菜单出现可见的「${DROPDOWN_ITEM_TEXT.noGpuPowerOn}」`,
+        timeoutMs: NO_GPU_MENU_OPEN_WAIT_MS,
+        ...pollOptions(),
+        probe: async () => {
+          const probe = parseVisibleMenuItemProbe(
+            await channel.evaluate<unknown>(
+              buildLocateVisibleMenuItemScript({
+                rowSelector,
+                itemText: DROPDOWN_ITEM_TEXT.noGpuPowerOn,
+              }),
+            ),
+          )
+          lastProbeKind = probe.kind
+          return probe.kind === 'located' ? probe : undefined
+        },
+      })
+      if (outcome.status === 'matched') {
+        await channel.click(outcome.value.selector)
+        await confirmIfAsked(NO_GPU_POWER_ON_CONFIRM.questionPrefix, DROPDOWN_ITEM_TEXT.noGpuPowerOn)
+        return
+      }
+    }
+    throw new ConsoleParseError(
+      `点了 ${String(NO_GPU_MENU_TOGGLE_ATTEMPTS)} 次「${INSTANCE_BUTTON_TEXT.more}」后` +
+        `仍未看到可见的「${DROPDOWN_ITEM_TEXT.noGpuPowerOn}」菜单项（最后一次探测：${lastProbeKind}）。`,
+    )
   }
 
   /**

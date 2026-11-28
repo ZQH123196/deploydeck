@@ -180,6 +180,7 @@ function instance(instanceId: string, status: InstanceStatus, statusRaw: string)
     balanceWarning: null,
     timedShutdownAt: null,
     sshCommand: null,
+    noGpuMode: null,
   }
 }
 

@@ -9,6 +9,9 @@
   "regionPreference": [],
   "cloneDataDisk": true,
 
+  // 开机形态：有卡。生产要真算力，不能走无卡模式。
+  "powerOnMode": "gpu",
+
   // 克隆源实例：生产用的模板机，保持关机。
   "cloneSourceInstanceName": "trans-prod",
   "ttlMinutes": 480,

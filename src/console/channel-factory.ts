@@ -30,6 +30,10 @@ export interface ConsoleSessionOptions {
   readonly chromeProfileDir: string
   readonly chromeExecutablePath?: string
   readonly startupTimeoutMs?: number
+  /** 启动 Chrome 时不抢前台。默认 false。 */
+  readonly backgroundLaunch?: boolean
+  /** 是否由 WSL 启动 Windows Chrome。与 `environment` 同源；缺省按运行环境探测。 */
+  readonly wsl?: boolean
   readonly requestTimeoutMs?: number
   readonly navigationTimeoutMs?: number
   /** 外部边界。只给测试与特殊环境注入，正常运行不用传。 */
@@ -56,6 +60,8 @@ export async function openConsoleSession(options: ConsoleSessionOptions): Promis
     port: options.port,
     profileDir: options.chromeProfileDir,
     targetUrl: options.consoleUrl,
+    background: options.backgroundLaunch ?? false,
+    ...(options.wsl === undefined ? {} : { wsl: options.wsl }),
     ...(options.chromeExecutablePath === undefined
       ? {}
       : { executablePath: options.chromeExecutablePath }),

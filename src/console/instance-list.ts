@@ -10,7 +10,7 @@
 
 import { ConsoleInstanceSnapshotSchema } from '../domain/instance.js'
 import type { ConsoleInstanceSnapshot, InstanceStatus } from '../domain/instance.js'
-import { ConfigError, ConsoleParseError } from '../errors.js'
+import { ConfigError, ConsoleParseError, InstanceNotFoundError } from '../errors.js'
 import { systemClock } from '../util/clock.js'
 import {
   addMinutesIso,
@@ -58,6 +58,19 @@ export interface RawInstanceRow {
   readonly statusProgressText: string | null
   /** 第 2 列按结构位置取出的规格文本，不含「查看详情」按钮文字。 */
   readonly gpuSpecText: string
+  /**
+   * 第 1 列 `.gpuTips` 补充文字。已关机实例为空。
+   *
+   * 注意：它不承载形态标记。形态标记在 `modeMarkText`。
+   */
+  readonly gpuTipsText: string
+  /**
+   * 第 1 列形态标记文字（2026-11-26 真机实测）。
+   *
+   * 无卡模式实例写 `无卡模式`，有卡写 `GPU充足`，已关机为空。
+   * 它是 `.status` 的兄弟节点，与 `.gpuTips` 是两个不同的元素。
+   */
+  readonly modeMarkText: string
   /** 第 3 列两条盘占用原文，形如「系统盘 37.98%」。 */
   readonly diskLines: readonly string[]
   /** 第 5 列 `.chargeType` 原文。余额不足时告警文字跟在付费方式后面。 */
@@ -142,6 +155,8 @@ function buildReadInstanceRowsScript(): string {
     cellTextDivs: INSTANCE_CELL_TEXT_DIVS,
     statusText: INSTANCE_STATUS_CELL.statusText,
     progressText: INSTANCE_STATUS_CELL.progressText,
+    gpuTips: INSTANCE_STATUS_CELL.gpuTips,
+    modeIcon: INSTANCE_STATUS_CELL.modeIcon,
     billingText: INSTANCE_BILLING_CELL.billingText,
     billingWarning: INSTANCE_BILLING_CELL.warningText,
     releaseText: INSTANCE_RELEASE_CELL.releaseText,
@@ -183,6 +198,8 @@ function buildReadInstanceRowsScript(): string {
     const specDivs = textDivsOf(columns.gpuSpec)
     const diskDivs = textDivsOf(columns.disk)
     const statusCell = cellAt(columns.status)
+    // 形态标记（无卡模式 / GPU充足）在 .status 的兄弟节点里，不在 .gpuTips 里。
+    const modeMark = statusCell === null ? null : statusCell.querySelector(selectors.modeIcon)
     const billingCell = cellAt(columns.billing)
     const releaseCell = cellAt(columns.release)
     const releaseRoot = releaseCell === null ? null : releaseCell.querySelector(selectors.releaseText)
@@ -197,7 +214,9 @@ function buildReadInstanceRowsScript(): string {
       diskLines: diskDivs.map((element) => clean(element.innerText)),
       billingText: textOf(billingCell === null ? null : billingCell.querySelector(selectors.billingText)),
       billingWarning: textOf(billingCell === null ? null : billingCell.querySelector(selectors.billingWarning)),
-      releaseText: releaseRoot === null ? null : textOf(releaseRoot.querySelector('span')),
+      gpuTipsText: textOf(statusCell === null ? null : statusCell.querySelector(selectors.gpuTips)),
+    modeMarkText: textOf(modeMark === null ? null : modeMark.parentElement),
+    releaseText: releaseRoot === null ? null : textOf(releaseRoot.querySelector('span')),
       // 只取时刻那个 span：容器里还嵌着「修改」「关闭」两个操作文字。
       timedShutdownText:
         releaseRoot === null
@@ -269,7 +288,7 @@ function parseInstanceRow(
   }
   // 创建进度块不是状态词表，它表示「实例正在被创建」。实测词会变（创建中、克隆中），
   // 所以按结构判，不按词判。
-  const status: InstanceStatus = row.statusProgressText === null ? normalizeInstanceStatus(statusText) : 'cloning'
+  const status: InstanceStatus = row.statusProgressText === null ? normalizeStatusText(statusText) : 'cloning'
 
   const gpuSpec = row.gpuSpecText.trim()
   if (gpuSpec === '') {
@@ -294,6 +313,7 @@ function parseInstanceRow(
       balanceWarning: billing.balanceWarning,
       timedShutdownAt: parseTimedShutdownAt(row.timedShutdownText, row.rowIndex),
       sshCommand: emptyToNull(cellText(row, INSTANCE_LIST_COLUMN.sshLogin).trim()),
+      noGpuMode: detectNoGpuMode(`${row.gpuTipsText} ${row.modeMarkText}`),
     },
     row,
   )
@@ -313,9 +333,14 @@ function assertSnapshotContract(
   }
 }
 
-/** 状态原文归一成闭合枚举。前缀匹配，因为状态词后面可能跟补充文字。 */
-function normalizeInstanceStatus(statusText: string): InstanceStatus {
-  const matched = STATUS_BY_TEXT_PREFIX.find(([textPrefix]) => statusText.startsWith(textPrefix))
+/**
+ * 状态原文归一成闭合枚举。前缀匹配，因为状态词后面可能跟补充文字。
+ *
+ * 列表解析与 `readInstanceStatus` 共用这一处：状态词的识别规则只允许有一份。
+ */
+export function normalizeStatusText(statusText: string): InstanceStatus {
+  const trimmed = statusText.trim()
+  const matched = STATUS_BY_TEXT_PREFIX.find(([textPrefix]) => trimmed.startsWith(textPrefix))
   return matched === undefined ? 'unknown' : matched[1]
 }
 
@@ -491,4 +516,123 @@ export function createInstanceListActions(context: ConsoleActionContext): Instan
       })
     },
   }
+}
+
+/**
+ * 只看一个实例的状态，不解析整行。
+ *
+ * 判据：`shell` 连接前只要「实例在不在、是不是运行中」这一个事实。
+ * 走完整行解析会连带要求磁盘、计费、释放倒计时等字段全部合法：
+ * 那些字段与「能不能连 SSH」无关，它们解析失败不该挡住一条终端会话。
+ *
+ * 与完整解析共用状态列的取值路径（`.status` 与进度块），所以状态归一规则只有一份。
+ */
+export interface InstanceStatusProbe {
+  readonly instanceId: string
+  readonly status: InstanceStatus
+  /** 控制台原文状态。归一结果与人读不一致时，它是唯一线索。 */
+  readonly statusRaw: string
+}
+
+/** 页内读取脚本：按实例 ID 定位行，只取状态格的原文。 */
+function buildReadInstanceStatusScript(instanceId: string): string {
+  const selectors = {
+    row: INSTANCE_LIST.row,
+    cell: INSTANCE_LIST.cell,
+    cellTextDivs: INSTANCE_CELL_TEXT_DIVS,
+    statusText: INSTANCE_STATUS_CELL.statusText,
+    progressText: INSTANCE_STATUS_CELL.progressText,
+  }
+  const columns = {
+    identity: INSTANCE_LIST_COLUMN.identity,
+    status: INSTANCE_LIST_COLUMN.status,
+    instanceIdDivIndex: INSTANCE_IDENTITY_CELL.instanceIdDivIndex,
+  }
+  return `(() => {
+  const selectors = ${JSON.stringify(selectors)}
+  const columns = ${JSON.stringify(columns)}
+  const clean = (text) => (text === null || text === undefined ? '' : text.replace(/\\s+/g, ' ').trim())
+  const textOf = (element) => (element === null || element === undefined ? '' : clean(element.innerText))
+  const targetInstanceId = ${JSON.stringify(instanceId)}
+  const rows = [...document.querySelectorAll(selectors.row)]
+  for (const row of rows) {
+    const cells = [...row.querySelectorAll(selectors.cell)]
+    const identityDivs = cells.length > columns.identity
+      ? [...cells[columns.identity].querySelectorAll(selectors.cellTextDivs)]
+      : []
+    const rowInstanceId = textOf(identityDivs[columns.instanceIdDivIndex])
+    if (rowInstanceId !== targetInstanceId) continue
+    const statusCell = columns.status < cells.length ? cells[columns.status] : null
+    if (statusCell === null) return { found: true, statusText: '', progressText: '' }
+    const plain = statusCell.querySelector(selectors.statusText)
+    if (plain !== null) return { found: true, statusText: textOf(plain), progressText: '' }
+    // 创建过程中的实例没有 .status，只有进度块。
+    const progress = statusCell.querySelector(selectors.progressText)
+    return { found: true, statusText: '', progressText: progress === null ? '' : textOf(progress) }
+  }
+  return { found: false, statusText: '', progressText: '' }
+})()`
+}
+
+/**
+ * 读一个实例的状态。
+ *
+ * 实例不在列表里即抛 `InstanceNotFoundError`：没看到就是没看到，不猜「大概已开机」。
+ */
+export async function readInstanceStatus(
+  channel: ConsoleChannel,
+  instanceId: string,
+): Promise<InstanceStatusProbe> {
+  const raw = await channel.evaluate<unknown>(buildReadInstanceStatusScript(instanceId))
+  if (typeof raw !== 'object' || raw === null) {
+    throw new ConsoleParseError('读取实例状态失败：页内求值没有返回对象。')
+  }
+  const record = raw as Record<string, unknown>
+  if (record['found'] !== true) {
+    throw new InstanceNotFoundError(instanceId)
+  }
+  const statusText = record['statusText']
+  const progressText = record['progressText']
+  if (typeof statusText !== 'string' || typeof progressText !== 'string') {
+    throw new ConsoleParseError('读取实例状态失败：状态字段不是字符串。')
+  }
+  const statusRaw = statusText.length > 0 ? statusText : progressText
+  if (statusRaw.length === 0) {
+    throw new ConsoleParseError(
+      `实例 ${instanceId} 的状态格是空的：页面结构可能已变，不能把空状态当成运行中。`,
+    )
+  }
+  return { instanceId, status: normalizeStatusText(statusRaw), statusRaw }
+}
+
+/**
+ * 无卡模式的标记文字。
+ *
+ * 实测（2026-11-26 真机）：无卡模式实例的状态格 `.gpuTips` 写 `无卡模式`。
+ * 有卡实例写 `GPU充足`；已关机实例该元素存在但为空。
+ */
+export const NO_GPU_TIP_TEXT = '无卡模式'
+
+/** 有卡实例的标记文字。 */
+export const GPU_AVAILABLE_TIP_TEXT = 'GPU充足'
+
+/**
+ * 判定实例是否以无卡模式运行。
+ *
+ * 返回 `null` 表示本次页面事实不足以判定。两种情况：
+ * 1. `.gpuTips` 为空：已关机、创建中，或页面没给标记。不猜。
+ * 2. 标记既不是 `无卡模式` 也不是 `GPU充足`：认不出，不猜。
+ *
+ * 判据（实测）：看的是标记文字，不是状态词。无卡模式实例开机中的状态词是 `开机中`，
+ * 与有卡开机完全相同，所以「运行中」既不是必要条件也不是充分条件。
+ */
+export function detectNoGpuMode(gpuTipsText: string): boolean | null {
+  const tips = gpuTipsText.replace(/\s+/g, '')
+  if (tips.includes(NO_GPU_TIP_TEXT)) {
+    return true
+  }
+  if (tips.includes(GPU_AVAILABLE_TIP_TEXT)) {
+    return false
+  }
+  return null
 }

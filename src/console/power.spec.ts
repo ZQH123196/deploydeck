@@ -15,7 +15,10 @@ import {
   type PowerOnPageState,
 } from './power.js'
 import type { ConsoleChannel, ConsoleRuntimeContext, InstanceListPort } from './ports.js'
-import { INSTANCE_BUTTON_TEXT } from './selectors.js'
+import {
+  buildLocateVisibleMenuItemScript,
+} from './release.js'
+import { DROPDOWN_ITEM_TEXT, INSTANCE_BUTTON_TEXT } from './selectors.js'
 
 /**
  * 工单 04 的验收夹具。
@@ -58,6 +61,7 @@ function createSnapshot(status: InstanceStatus, instanceId: string = INSTANCE_ID
     balanceWarning: null,
     timedShutdownAt: null,
     sshCommand: null,
+    noGpuMode: null,
   }
 }
 
@@ -239,7 +243,7 @@ describe('powerOn', () => {
       }),
     )
 
-    const outcome = await power.powerOn(INSTANCE_ID)
+    const outcome = await power.powerOn(INSTANCE_ID, 'gpu')
 
     expect(outcome).toEqual({ ok: true, instanceId: INSTANCE_ID })
     expect(fake.clicks).toEqual([POWER_ON_BUTTON_SELECTOR])
@@ -263,7 +267,7 @@ describe('powerOn', () => {
       }),
     )
 
-    const outcome = await power.powerOn(INSTANCE_ID)
+    const outcome = await power.powerOn(INSTANCE_ID, 'gpu')
 
     if (outcome.ok) {
       throw new Error('预期开机失败，实际返回成功')
@@ -293,7 +297,7 @@ describe('powerOn', () => {
       }),
     )
 
-    const outcome = await power.powerOn(INSTANCE_ID)
+    const outcome = await power.powerOn(INSTANCE_ID, 'gpu')
 
     if (outcome.ok) {
       throw new Error('预期开机失败，实际返回成功')
@@ -317,8 +321,8 @@ describe('powerOn', () => {
       }),
     )
 
-    await expect(power.powerOn(INSTANCE_ID)).rejects.toBeInstanceOf(InstanceNotFoundError)
-    await expect(power.powerOn(INSTANCE_ID)).rejects.toThrow(INSTANCE_ID)
+    await expect(power.powerOn(INSTANCE_ID, 'gpu')).rejects.toBeInstanceOf(InstanceNotFoundError)
+    await expect(power.powerOn(INSTANCE_ID, 'gpu')).rejects.toThrow(INSTANCE_ID)
     expect(fake.clicks).toEqual([])
   })
 
@@ -337,7 +341,7 @@ describe('powerOn', () => {
       }),
     )
 
-    await power.powerOn(INSTANCE_ID)
+    await power.powerOn(INSTANCE_ID, 'gpu')
 
     expect(fake.scripts).toContain(buildLocateButtonScript(ROW_SELECTOR, INSTANCE_BUTTON_TEXT.powerOn))
     expect(fake.scripts.some((script) => script.includes('无卡'))).toBe(false)
@@ -365,7 +369,7 @@ describe('powerOn', () => {
       }),
     )
 
-    const outcome = await power.powerOn(INSTANCE_ID)
+    const outcome = await power.powerOn(INSTANCE_ID, 'gpu')
 
     expect(outcome).toEqual({ ok: true, instanceId: INSTANCE_ID })
     expect(fake.clicks).toEqual([POWER_ON_BUTTON_SELECTOR, confirmSelector])
@@ -387,7 +391,7 @@ describe('powerOn', () => {
       }),
     )
 
-    await expect(power.powerOn(INSTANCE_ID)).rejects.toBeInstanceOf(HumanRequiredError)
+    await expect(power.powerOn(INSTANCE_ID, 'gpu')).rejects.toBeInstanceOf(HumanRequiredError)
     // 只点了开机按钮，没有点任何确认框里的按钮。
     expect(fake.clicks).toEqual([POWER_ON_BUTTON_SELECTOR])
   })
@@ -487,5 +491,129 @@ describe('findNoGpuHint', () => {
         statusText: '已关机',
       }),
     ).toBeUndefined()
+  })
+})
+
+describe('powerOn：无卡模式', () => {
+  /**
+   * 复现真实页面：实例已关机时，行内没有「开机」按钮的替代路径，
+   * 无卡模式只能从「更多」→「无卡模式开机」进入。
+   */
+  function createNoGpuFake(options: {
+    readonly statuses: readonly InstanceStatus[]
+    readonly menuProbe: unknown
+  }): {
+    readonly context: ConsoleRuntimeContext
+    readonly clicks: string[]
+    readonly scripts: string[]
+  } {
+    const rowSelector = ROW_SELECTOR
+    const moreSelector = '.el-table__row:nth-of-type(1) > td:nth-of-type(10) > .el-dropdown > button'
+    const menuItemSelector = '.el-dropdown__popper > ul > li:nth-of-type(1)'
+    const clicks: string[] = []
+    const scripts: string[] = []
+    let statusIndex = 0
+    let menuProbeReads = 0
+
+    const locateRowScript = buildLocateRowScript(INSTANCE_ID)
+    const locateMoreScript = buildLocateButtonScript(rowSelector, INSTANCE_BUTTON_TEXT.more)
+    const readPageStateScript = buildReadPageStateScript(INSTANCE_ID)
+    const locateMenuScript = buildLocateVisibleMenuItemScript({
+      rowSelector,
+      itemText: DROPDOWN_ITEM_TEXT.noGpuPowerOn,
+    })
+
+    const channel: ConsoleChannel = {
+      goto: async () => {},
+      currentUrl: async () => 'https://www.autodl.com/console/instance/list',
+      evaluate: async <Result>(script: string): Promise<Result> => {
+        scripts.push(script)
+        if (script === locateRowScript) return rowSelector as unknown as Result
+        if (script === locateMoreScript) return moreSelector as unknown as Result
+        if (script === readPageStateScript) return EMPTY_PAGE_STATE as unknown as Result
+        if (script === locateMenuScript) {
+          menuProbeReads += 1
+          // 第一次探测还没弹层，第二次才看见菜单项。
+          return (menuProbeReads === 1 ? { kind: 'no-visible-popper' } : options.menuProbe) as unknown as Result
+        }
+        // 无卡模式开机的二次确认：本轮未实测控制台弹不弹，按「不弹」处理。
+        if (script === buildConfirmMessageBoxScript('确认')) {
+          return { kind: 'absent' } as unknown as Result
+        }
+        throw new Error(`未预期的页面脚本：${script}`)
+      },
+      click: async (selector: string) => {
+        clicks.push(selector)
+      },
+      type: async () => {},
+      waitFor: async () => {},
+      waitForGone: async () => {},
+      screenshot: async () => {},
+      close: async () => {},
+    }
+
+    const instances: InstanceListPort = {
+      listInstances: async () => {
+        const status = options.statuses[Math.min(statusIndex, options.statuses.length - 1)] ?? 'stopped'
+        statusIndex += 1
+        return [{ ...createSnapshot(status), noGpuMode: status === 'running' ? true : null }]
+      },
+    }
+
+    return {
+      context: createContext({ channel, instances, clock: createFakeClock() }),
+      clicks,
+      scripts,
+    }
+  }
+
+  it('走「更多」→「无卡模式开机」，不点行内「开机」按钮', async () => {
+    const fake = createNoGpuFake({
+      statuses: ['stopped', 'running'],
+      menuProbe: { kind: 'located', selector: '.el-dropdown__popper li', itemText: '无卡模式开机', matchedBy: 'aria-hint' },
+    })
+
+    const power = createPowerActions(fake.context)
+    const outcome = await power.powerOn(INSTANCE_ID, 'no-gpu')
+
+    expect(outcome).toEqual({ ok: true, instanceId: INSTANCE_ID })
+    expect(fake.clicks.some((selector) => selector === '.el-dropdown__popper li')).toBe(true)
+    // 行内「开机」按钮这条路径不能被走到：有卡开机与无卡开机是两个不同的菜单入口。
+    expect(
+      fake.clicks.some((selector) => selector === '.el-table__row:nth-of-type(1) > td:nth-of-type(10) > button'),
+    ).toBe(false)
+  })
+
+  it('无卡模式永远不返回 no-gpu 失败：主机没有空闲 GPU 与它无关', async () => {
+    const fake = createNoGpuFake({
+      statuses: ['stopped', 'stopped'],
+      menuProbe: { kind: 'located', selector: '.el-dropdown__popper li', itemText: '无卡模式开机', matchedBy: 'aria-hint' },
+    })
+
+    const power = createPowerActions(fake.context)
+    const outcome = await power.powerOn(INSTANCE_ID, 'no-gpu')
+
+    // 状态一直不变 → 超时，而不是 no-gpu。
+    expect(outcome.ok).toBe(false)
+    if (!outcome.ok) {
+      expect(outcome.reason).toBe('timeout')
+    }
+  })
+
+  it('实例已有卡运行时不自动关机重开，抛人工错误', async () => {
+    const fake = createNoGpuFake({
+      statuses: ['running'],
+      menuProbe: { kind: 'located', selector: '.el-dropdown__popper li', itemText: '无卡模式开机', matchedBy: 'aria-hint' },
+    })
+
+    const power = createPowerActions({
+      ...fake.context,
+      instances: {
+        listInstances: async () => [{ ...createSnapshot('running'), noGpuMode: false }],
+      },
+    })
+
+    await expect(power.powerOn(INSTANCE_ID, 'no-gpu')).rejects.toBeInstanceOf(HumanRequiredError)
+    expect(fake.clicks).toEqual([])
   })
 })

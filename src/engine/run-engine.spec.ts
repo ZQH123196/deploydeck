@@ -114,6 +114,7 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
     instanceNamePattern: 'trans-dev',
     gpuPreference: ['v-48g'],
     regionPreference: [],
+    powerOnMode: 'gpu',
     cloneDataDisk: true,
     ttlMinutes: 60,
     budgetCapYuan: 6,
@@ -150,6 +151,7 @@ function makeInstance(overrides: Partial<ConsoleInstanceSnapshot> = {}): Console
     balanceWarning: null,
     timedShutdownAt: null,
     sshCommand: null,
+    noGpuMode: null,
     ...overrides,
   }
 }

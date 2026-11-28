@@ -31,7 +31,7 @@
 │       └── *.png / *.jsonl    控制台动作的截图与动作日志（见 2.1）
 ├── ledger.jsonl               账本，一行一个实例生命周期，只追加
 ├── ssh-known-hosts.txt        SSH 主机密钥指纹，一行一个端点，可手工删行
-├── chrome-profile/            专用 Chrome 的 user-data-dir（登录态）
+├── chrome-profile/            非 WSL 时的专用 Chrome user-data-dir（WSL 下改落 Windows 本地磁盘）
 └── locks/                     锁文件，短生命周期，正常释放后消失
     └── <name>.lock
 ```
@@ -45,13 +45,21 @@
 | `runs/<runId>/screenshots/` | 预留目录；当前没有写入者（见 2.1） | — |
 | `ledger.jsonl` | 账本 | 账本存储（工单 11） |
 | `ssh-known-hosts.txt` | SSH 主机密钥指纹 | SSH 通道（工单 07） |
-| `chrome-profile/` | 专用 Chrome 的 user-data-dir：控制台登录态与浏览器缓存 | 专用 Chrome 进程 |
+| `chrome-profile/` | 专用 Chrome 的 user-data-dir：控制台登录态与浏览器缓存。仅非 WSL 时使用 | 专用 Chrome 进程 |
 | `locks/<name>.lock` | 锁 | 状态存储（工单 11） |
 
 判据：状态存储只接受相对路径。任何相对路径都落在状态目录内。上表是 Phase 2 的约定落点，新增落点必须在本表登记。
 
 `chrome-profile/` 不落配置目录：浏览器会往里写登录态与缓存，而配置目录由人写、机器只读。
-默认值见 `src/config/paths.ts` 的 `resolveChromeProfileDir`。
+
+**WSL 下调 Windows Chrome 时，profile 不落状态目录，改落 Windows 本地磁盘。**
+原因：Windows Chrome 无法给 `\\wsl.localhost\...` 上的 LevelDB 加锁。
+Local Storage 写不进磁盘，而 AutoDL 的登录态正在 Local Storage 里（`token` 与 `user` 两个键）。
+后果是每次启动都弹「打开您的个人资料时出了点问题」，且每次都要重新登录。
+
+默认位置 `%LOCALAPPDATA%\deploydeck\chrome-profile`，可用 `DEPLOYDECK_WINDOWS_PROFILE_ROOT` 改根目录。
+取值见 `src/config/paths.ts` 的 `resolveChromeProfileDirForChrome`。
+WSL 下启动 Chrome 前会校验路径，落 `\\wsl.localhost\` 或 `\\wsl$\` 直接报错。
 
 ### 2.1 控制台证据按 run 分目录
 

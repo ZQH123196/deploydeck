@@ -707,8 +707,8 @@ async function runOnce(
       const outcome = await runEngineStep({
         stepId: ENGINE_STEP_ID.powerOn,
         kind: 'console',
-        command: `powerOn(${instanceSnapshot.instanceId})`,
-        action: () => provider.powerOn(instanceSnapshot.instanceId),
+        command: `powerOn(${instanceSnapshot.instanceId}, ${profile.powerOnMode})`,
+        action: () => provider.powerOn(instanceSnapshot.instanceId, profile.powerOnMode),
         exitCodeOf: (powerOnOutcome) => (powerOnOutcome.ok ? 0 : 1),
         summaryOf: (powerOnOutcome) =>
           powerOnOutcome.ok

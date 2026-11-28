@@ -1,6 +1,10 @@
+import { execFile } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import { ConfigError } from '../errors.js'
+
+const execFileAsync = promisify(execFile)
 
 /**
  * 配置读取的唯一入口。
@@ -80,10 +84,131 @@ export function resolveCdpPort(env: NodeJS.ProcessEnv = process.env): number {
  *
  * 默认落状态目录，不落配置目录：机器会往这个目录写文件（登录态、缓存、锁），
  * 而配置目录由人写、机器只读。见 docs/state-layout.md 第 6 节。
+ *
+ * 该函数只负责「部署方自己的状态目录在哪」。WSL 调 Windows Chrome 时，
+ * 这个路径不能直接交给 Chrome：见 `resolveChromeProfileDirForChrome`。
  */
 export function resolveChromeProfileDir(env: NodeJS.ProcessEnv = process.env): string {
   const override = env['DEPLOYDECK_CHROME_PROFILE_DIR'] ?? ''
   return override.length > 0 ? override : join(resolveStateDir(env), 'chrome-profile')
+}
+
+/**
+ * 传给 Chrome 的 `--user-data-dir`。纯函数：外部给定的 Windows 根目录由调用方探测后传入。
+ *
+ * 跨 WSL 边界时必须落 Windows 本地磁盘，不能落 `\\wsl.localhost\...`。
+ * 实测（2026-11-26）：Chrome 在 9p 上无法完成 LevelDB 的 LockFile 加锁，
+ * Local Storage、Cookies 等库全部 0 字节，登录态写不进磁盘，且每次启动弹「个人资料错误」。
+ * AutoDL 的登录态就是 Local Storage 里的 `token` 与 `user` 键，落不了盘等于每次都要重新登录。
+ *
+ * 判据：显式覆盖值原样使用；WSL 下拿到 Windows 根目录时落 Windows 本地目录；其余情况用状态目录。
+ */
+export function resolveChromeProfileDirForChrome(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  windowsRoot: string | undefined = readWindowsProfileRoot(env),
+): string {
+  const override = env['DEPLOYDECK_CHROME_PROFILE_DIR'] ?? ''
+  if (override.length > 0) {
+    return override
+  }
+  if (platform === 'linux' && windowsRoot !== undefined) {
+    return `${windowsRoot}\\deploydeck\\${MAIN_CHROME_PROFILE_LEAF}`
+  }
+  return join(resolveStateDir(env), MAIN_CHROME_PROFILE_LEAF)
+}
+
+/**
+ * 主 profile 的叶子目录名。
+ *
+ * 缺省取值由它派生；显式覆盖 `DEPLOYDECK_CHROME_PROFILE_DIR` 时不看它。
+ */
+const MAIN_CHROME_PROFILE_LEAF = 'chrome-profile'
+
+/**
+ * 真机测试进程的开关。
+ *
+ * 只认 `DEPLOYDECK_E2E=1`：该变量同时是 `e2e/support/gate.ts` 的授权开关。
+ * 用它回答「这个进程是不是 e2e 测试进程」，不另写一份字面量。
+ */
+export function isE2eProcess(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (env['DEPLOYDECK_E2E'] ?? '').trim() === '1'
+}
+
+/**
+ * 真机测试 profile 副本的 Windows 落点。
+ *
+ * 判据：副本必须落 Windows 本地磁盘。Chrome 在 `\\wsl.localhost\\...` 上无法给 LevelDB 加锁，
+ * 登录态写不进磁盘（见 `assertLaunchableProfileDir`），副本放 WSL 文件系统就等于每次都要重新登录。
+ *
+ * 跑完即删，所以放 Windows 临时目录：`%LOCALAPPDATA%\Temp\deploydeck-e2e\<运行标识>`。
+ * 找不到 Windows 临时目录时返回 undefined，由调用方决定拒绝运行。
+ */
+export function resolveWindowsTempChromeProfileDir(
+  windowsRoot: string | undefined,
+  runStamp: string,
+): string | undefined {
+  if (windowsRoot === undefined || windowsRoot.trim().length === 0) {
+    return undefined
+  }
+  return `${windowsRoot}\\Temp\\deploydeck-e2e\\${runStamp}\\chrome-profile`
+}
+
+/**
+ * 后台启动开关。默认 false，即窗口像人平时一样出现在桌面上。
+ *
+ * 真机测试必须置 true：测试跑起来时人可能正在用同一个 Chrome 窗口做别的事，
+ * 不能把测试的窗口抢到前台。
+ */
+export function resolveChromeBackgroundLaunch(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env['DEPLOYDECK_CHROME_LAUNCH_BACKGROUND'] ?? '').trim()
+  if (raw.length === 0) {
+    return false
+  }
+  if (raw !== '1' && raw !== '0') {
+    throw new ConfigError(`DEPLOYDECK_CHROME_LAUNCH_BACKGROUND 只接受 1 或 0，当前值：${raw}`)
+  }
+  return raw === '1'
+}
+
+/**
+ * 从 WSL 向 Windows 询问 profile 根目录，取值是 `%LOCALAPPDATA%`。
+ *
+ * WSL 默认不把 Windows 环境变量注入 Linux 进程，`process.env.LOCALAPPDATA` 恒为空。
+ * 只能主动问一次 `cmd.exe`。问不到返回 undefined，由调用方回退状态目录。
+ *
+ * 不落 `%TEMP%`：临时目录会被系统清理，登录态随之丢失。
+ */
+export async function probeWindowsProfileRoot(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | undefined> {
+  const override = (env['DEPLOYDECK_WINDOWS_PROFILE_ROOT'] ?? '').trim()
+  if (override.length > 0) {
+    return override
+  }
+  try {
+    const { stdout } = await execFileAsync('cmd.exe', ['/c', 'echo %LOCALAPPDATA%'], {
+      timeout: 5_000,
+    })
+    const value = stdout.replace(/\r/g, '').trim()
+    return value.length > 0 && value.includes('\\') ? value : undefined
+  } catch {
+    // 探测失败是「拿不到 Windows 目录」这一事实，不是异常：由调用方回退到状态目录。
+    return undefined
+  }
+}
+
+/** 读 Windows 侧 profile 根目录。优先显式覆盖，其次进程环境里的 `%LOCALAPPDATA%`。 */
+function readWindowsProfileRoot(env: NodeJS.ProcessEnv): string | undefined {
+  const override = (env['DEPLOYDECK_WINDOWS_PROFILE_ROOT'] ?? '').trim()
+  if (override.length > 0) {
+    return override
+  }
+  const localAppData = (env['LOCALAPPDATA'] ?? '').trim()
+  if (localAppData.length > 0) {
+    return localAppData
+  }
+  return undefined
 }
 
 /**
